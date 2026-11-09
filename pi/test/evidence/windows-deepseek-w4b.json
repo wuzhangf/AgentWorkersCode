@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "nwf-pi-w4b/1",
+  "result": "PASS",
+  "engine": "@earendil-works/pi-coding-agent@1.4.0",
+  "node": "v24.16.0",
+  "platform": "win32",
+  "model": "deepseek-v4.1-flash",
+  "scenarios": {
+    "mcpBound": {
+      "taskId": "native-c9c3a628-afec-49fe-bb6b-9381c644fb0e",
+      "server": "fixsrv",
+      "tools": [
+        "mcp__fixsrv__echo",
+        "mcp__fixsrv__workspace_marker"
+      ],
+      "toolCallId": "call_549c73d3f20f4608997e8e24",
+      "markerInOutput": true
+    },
+    "resourceBindings": {
+      "skill": "4ce41d1d4bdc481df06a621b5b6575334c6db91e55ec8dffc19cd8b38e23bfc7",
+      "extension": "d08fd56eb37fe69c41479df82c513c709bda35a0cc074a16ec9009fefb89a00c"
+    },
+    "terminals": {
+      "created": 2,
+      "pty": false,
+      "markerCaptured": true,
+      "stopProof": [
+        {
+          "method": "WINDOWS_JOB_ACTIVE_ZERO",
+          "activeProcesses": 0
+        },
+        {
+          "method": "WINDOWS_JOB_ACTIVE_ZERO",
+          "activeProcesses": 0
+        }
+      ]
+    }
+  },
+  "taskIds": [
+    "native-c9c3a628-afec-49fe-bb6b-9381c644fb0e"
+  ],
+  "storeId": "690fcf67-30e6-4fe1-bd62-21c8aeef9c10"
+}

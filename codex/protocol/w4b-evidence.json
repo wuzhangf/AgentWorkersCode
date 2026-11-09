@@ -1,0 +1,73 @@
+{
+  "schemaVersion": "w4b-evidence/1",
+  "engine": "codex-cli 0.163.0-alpha.11.2",
+  "schemaSha256": "408e09849d5d4931992a4227a7f3eb80b15d24901f84aca0562e816634651a82",
+  "platform": "windows-x86_64",
+  "reproducer": "node workers/codex/tests/w4b.mjs <host.exe> <initialized-state-template> (22 checks, real pinned app-server + real model); cargo deterministic suite 41 passed / 1 ignored",
+  "terminals": {
+    "status": "IMPLEMENTED",
+    "nativeSurface": [
+      "command/exec (command, processId, cwd, tty, streamStdin, streamStdoutStderr, disableTimeout; response resolves only at process exit)",
+      "command/exec/write (deltaBase64 stdin)",
+      "command/exec/terminate (only supported signal; no POSIX vocabulary is claimed)",
+      "command/exec/outputDelta (stream, deltaBase64, capReached)",
+      "command/exec/resize (exists in pin; not exposed by the worker endpoints)"
+    ],
+    "observed": [
+      "piped session: streamed output bytes, raw stdin write consumed by child ReadLine, terminate settles EXITED/TERMINATED",
+      "tty:true session: real ConPTY escape bytes in streamed output",
+      "DELETE settles an open session",
+      "STOP: kill-on-close job empties; heartbeat terminal stops producing bytes (external stall proof); rows settle TERMINATED/STOP_JOB_TERMINATED and are named in stopProof.terminals",
+      "peer loss/host restart marks OPEN rows LOST (NATIVE_PROCESS_EXITED or HOST_RESTART), never claimed exited",
+      "schema user_version=4 terminals rows + audit projection kind=terminal; argv stripped from diagnostics"
+    ],
+    "limits": [
+      "output rings are bounded (128 KiB) and transient; overrun is reported via truncated/ringCapped, never replayed as contiguous bytes",
+      "sessions are connection-scoped to the owning peer generation; no cross-restart continuation is claimed"
+    ]
+  },
+  "mcp": {
+    "status": "IMPLEMENTED",
+    "nativeSurface": [
+      "[mcp_servers.<id>] managed config.toml tables (stdio command/args/env)",
+      "mcpServerStatus/list (runtimeStatus + tool catalog)",
+      "config/mcpServer/reload",
+      "mcpServer/tool/call (client-initiated; host does not expose it)",
+      "mcpServer/elicitation/request reused by the pin for tool-call approval (_meta.codex_approval_kind=mcp_tool_call)"
+    ],
+    "observed": [
+      "real model turn called nwffake:nwf_env_echo; output ECHO:<callText>|MARKER=<bound env>|KEY=ABSENT (model credential absent from the server process env)",
+      "approval request surfaced as durable input.requested; client accept mapped to pinned {action:accept}; mcp.bound and tool.completed(mcpToolCall) facts recorded with arguments stripped",
+      "secret-shaped env names (KEY/TOKEN/SECRET/PASSWORD) and secret-shaped values refused pre-dispatch"
+    ],
+    "limits": [
+      "structured-form elicitations that demand real user input cannot be truthfully auto-accepted (decline/cancel remain answerable)",
+      "remote/URL MCP servers and OAuth login are not exposed; only stdio descriptors are validated",
+      "mcpServer/elicitation requests for purposes other than tool-call approval and empty-schema forms are declined"
+    ]
+  },
+  "skillsAndHooks": {
+    "status": "IMPLEMENTED",
+    "nativeSurface": [
+      "CODEX_HOME user-scope skills (SKILL.md manifest) visible via skills/list",
+      "skills/extraRoots/set (absolute extra roots)",
+      "[features] hooks + hooks tables in managed config.toml; hooks/list reports trust status",
+      "hook/started + hook/completed notifications; skills/changed notification"
+    ],
+    "observed": [
+      "staged skill files land under the per-task managed home with per-file sha256 facts; skills/list reports user scope",
+      "sessionStart and userPromptSubmit command hooks executed in the task workspace with MODEL_API_KEY/LLM_HEADER_*/WORKER_* scrubbed from hook env (offline-trusted trustStatus=trusted via hooks/list)",
+      "hook.started/hook.completed and skill.bound/hook.bound durable events; failure variants recorded as *.bind.failed"
+    ],
+    "limits": [
+      "generic third-party plugin/extension loading is absent from the pinned surface; only skills and hooks are bound",
+      "hooks trust is asserted per-task through the offline trust path; a hook that is configured but never observed to run is not claimed as executed",
+      "AGENTS.md-style instruction injection beyond the managed home/project docs the engine already reads is not claimed"
+    ]
+  },
+  "unchangedGaps": [
+    "strict PAUSE/RESUME remains GAP (protocol/strict-pause-gap.json)",
+    "shell_environment_policy propagation gap unchanged (protocol/environment-binding-gap.json)",
+    "write scope enforcement posture unchanged (protocol/write-scope-gap.json)"
+  ]
+}

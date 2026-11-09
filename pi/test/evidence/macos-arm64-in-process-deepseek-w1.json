@@ -1,0 +1,50 @@
+{
+  "schemaVersion": "nwf-pi-smoke/1",
+  "result": "PASS",
+  "executionProfile": "macos-in-process-v1",
+  "engine": "@earendil-works/pi-coding-agent@1.4.0",
+  "node": "v24.22.1",
+  "platform": "darwin",
+  "model": "deepseek-v4.1-flash",
+  "taskId": "native-f72394d7-9e03-4d61-859b-e58a38fc420d",
+  "storeId": "5b2f7ffc-e777-4dcb-ac18-dff1aae3e5f6",
+  "artifact": {
+    "path": "result.txt",
+    "sha256": "a6e445dc38dd9b126e8c103d40dd01dfb53fd5f47558d8145f42e4df7fe5fb24",
+    "size": 13
+  },
+  "question": {
+    "method": "select",
+    "state": "ANSWERED",
+    "answerFile": "answer.txt"
+  },
+  "steer": {
+    "receipt": "ACKNOWLEDGED",
+    "artifact": "steer.txt",
+    "consumptionQualification": "No native input ID: queued ACK only; actual resultant file verified"
+  },
+  "reopen": {
+    "sameNativeSession": true,
+    "newGeneration": true,
+    "persistedSelectedValue": "GREEN",
+    "artifactSha256": "cd9fcbf0c0b40bf7cdb35b1bb9b377dfdb180e0c8aa602fa903c522f6eebcae7",
+    "oldArtifactStillImmutable": true
+  },
+  "stop": "APPLIED",
+  "stopProof": {
+    "ownerBootId": "b0688c2a-da00-4c6b-be58-212177101032",
+    "pid": 91329,
+    "method": "DARWIN_KQUEUE_NO_FORK_GROUP_ZERO",
+    "observedAt": "2026-10-25T06:17:54.271Z"
+  },
+  "metrics": {
+    "cost": null,
+    "costCoverage": "UNKNOWN",
+    "usageCoverage": "NATIVE_TASK_TOTAL",
+    "configuredModel": "deepseek-v4.1-flash",
+    "usage.input": "3565",
+    "usage.output": "721",
+    "usage.cacheRead": "24832",
+    "usage.cacheWrite": "0"
+  }
+}

@@ -1,0 +1,74 @@
+{
+  "schemaVersion": "nwf-pi-w4a/1",
+  "result": "PASS",
+  "engine": "@earendil-works/pi-coding-agent@1.4.0",
+  "node": "v24.18.0",
+  "platform": "win32",
+  "model": "deepseek-v4.1-flash",
+  "scenarios": {
+    "budgetExceedExtend": {
+      "taskId": "native-2cd8e0cc-2020-405b-99da-583f2cba0c81",
+      "exceeded": {
+        "field": "maxTotalTokens",
+        "cap": 1,
+        "observed": 1907
+      },
+      "usageAtExceed": {
+        "input": 1789,
+        "output": 275,
+        "cacheRead": 8576,
+        "cacheWrite": 0,
+        "ledgerSource": "ENGINE_REPORTED"
+      },
+      "extended": {
+        "caps": {
+          "maxTotalTokens": 500000
+        },
+        "via": "SESSION_REOPEN",
+        "sameNativeSession": true,
+        "newSegment": true
+      }
+    },
+    "writeScopeViolation": {
+      "taskId": "native-683f4287-2429-43eb-8be1-069062d06db8",
+      "event": {
+        "toolName": "write",
+        "scopeId": "wscope-cea18250",
+        "deniedPathHash": "cc6cbfb7214eaa0be68da97770b35f1dd2e0d9175dbb226ce21b3ddac033e0e2"
+      },
+      "outsideFileAbsent": true,
+      "runKeptAlive": true
+    },
+    "writeScopeAllowedExtra": {
+      "taskId": "native-683f4287-2429-43eb-8be1-069062d06db8",
+      "extraWriteAdmitted": true
+    },
+    "bindingUnavailable": {
+      "taskId": "native-db196c50-5264-43e0-9f2e-606ad872b470",
+      "state": "BINDING_UNAVAILABLE",
+      "missing": [
+        {
+          "kind": "command",
+          "name": "nwf-w4-definitely-missing-cmd"
+        }
+      ],
+      "noModelCall": true
+    },
+    "queueRelease": {
+      "taskId": "native-b904c8c9-66df-44a1-ada6-f117135c31ab",
+      "queuedOrdinal": 1,
+      "position": 1,
+      "releasedBy": "STOP",
+      "firstState": "PREPARING",
+      "dispatchedOnce": true
+    }
+  },
+  "taskIds": [
+    "native-2cd8e0cc-2020-405b-99da-583f2cba0c81",
+    "native-683f4287-2429-43eb-8be1-069062d06db8",
+    "native-db196c50-5264-43e0-9f2e-606ad872b470",
+    "native-1dfd3813-5ba0-4052-b759-0984fbd4f2c5",
+    "native-b904c8c9-66df-44a1-ada6-f117135c31ab"
+  ],
+  "storeId": "cec94e53-7768-4318-bebe-bbbe9894c33d"
+}

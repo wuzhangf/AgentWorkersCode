@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "environment-binding-gap/1",
+  "engine": "codex-cli 0.163.0-alpha.11.2",
+  "status": "PARTIAL",
+  "reasonCode": "SHELL_ENV_PROPAGATION_UNSUPPORTED",
+  "hostEnforcementImplemented": [
+    "requiresCommands entries are resolved through where.exe at launch admission; a miss is terminal BINDING_UNAVAILABLE with a durable binding.unavailable fact and no peer spawn.",
+    "requiresDirs entries must exist and be readable at the same gate; failure is terminal with no fallback to the ambient environment.",
+    "envAllowlist accepts only UPPER_SNAKE names; any name containing KEY/TOKEN/SECRET/PASSWORD or prefixed LLM_/MODEL_/WORKER_/ACS_/PAC_/PERSONAL_ is refused (ENV_ALLOWLIST_DENIED), malformed shapes are INVALID_ENV_NAME.",
+    "Admitted allowlist names are forwarded into the managed app-server process environment only when already present in the worker's own environment; the host never reads, logs or persists their values, and names absent from the worker environment are simply not forwarded."
+  ],
+  "gap": [
+    "The pinned app-server rejects shell_environment_policy.include as an unknown strict-config field and shell_environment_policy.set would require writing ambient variable values into the per-task config on disk; neither path is safe or supported.",
+    "With the profile's inherit=\"core\" shell policy, allowlisted names reach the managed process but are not propagated into tool-invoked shell environments; a command run by the engine does not observe JAVA_HOME-style allowlisted variables. Only ambient-name admission to the managed process is claimed."
+  ],
+  "currentBehavior": "Missing bindings terminate BINDING_UNAVAILABLE before any dispatch mark or peer exists. envAllowlist is validated and applied at the process-environment layer; shell-level propagation is honestly not claimed rather than silently attempted through an unsupported config field.",
+  "scope": "Environment binding covers command/dir prerequisites and managed-process environment admission. It does not alter the ambient worker environment, the registered profile, or any other task's managed environment."
+}

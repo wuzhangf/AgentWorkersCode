@@ -1,0 +1,66 @@
+{
+  "schemaVersion": "nwf-pi-w3/1",
+  "result": "PASS",
+  "engine": "@earendil-works/pi-coding-agent@1.4.0",
+  "node": "v24.16.0",
+  "platform": "win32",
+  "model": "deepseek-v4.1-flash",
+  "semantics": {
+    "pause": "BOUNDARY_CHECKPOINT",
+    "resumeInPlace": "BOUNDARY_CHECKPOINT_RELEASE",
+    "resumeAfterRestart": "INTERRUPT_CONTINUATION"
+  },
+  "scenarios": {
+    "pauseResumeInPlace": {
+      "taskId": "native-f17d7db7-c972-4765-8d73-f42404b451ef",
+      "boundary": "TOOL_ADMISSION",
+      "pausedEventSeq": 11,
+      "dwellSeconds": 15,
+      "dwellNewEvents": 0,
+      "resumeVia": "HELD_GATE",
+      "sameNativeSession": true,
+      "newSegment": true,
+      "artifacts": {
+        "a1.txt": {
+          "sha256": "f8aa4b45b1257adae6b47e7c11ad03776232b2bcc9e476e3e84f170d393b1605",
+          "size": 12
+        },
+        "a2.txt": {
+          "sha256": "051c4f1f5d0f5e0fd1b102916deaef011461aa53bf34e7512e12cf5b976b1551",
+          "size": 12
+        },
+        "a3.txt": {
+          "sha256": "e7ce4cf484f2bc1db3595ea21ae81d5ddce1bae6a06821d2abb88811257fef70",
+          "size": 12
+        }
+      }
+    },
+    "pauseRestartResume": {
+      "taskId": "native-a84a110f-d5f7-43bb-a0fa-cf36c9e836cf",
+      "boundary": "TOOL_ADMISSION",
+      "checkpointSurvivedRestart": true,
+      "resumeVia": "SESSION_REOPEN",
+      "sameNativeSession": true,
+      "newSegment": true,
+      "artifacts": {
+        "b1.txt": {
+          "sha256": "01fdf151196fb1763ae13356dc80d37508be1e6f1ac6e04e4be1570ee46d547d",
+          "size": 12
+        },
+        "b2.txt": {
+          "sha256": "e66704fa38e788794649f56a4703e88d16057eedc517acce71a46987dfd14f2f",
+          "size": 12
+        },
+        "b3.txt": {
+          "sha256": "c5eca42b3a70c4569b4ed2698033173f8fa8b2bec6eb8b1ef17b97daef196ddd",
+          "size": 12
+        }
+      }
+    }
+  },
+  "taskIds": [
+    "native-f17d7db7-c972-4765-8d73-f42404b451ef",
+    "native-a84a110f-d5f7-43bb-a0fa-cf36c9e836cf"
+  ],
+  "storeId": "064e19ff-c89e-4fa1-9296-61b37200ff17"
+}

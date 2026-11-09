@@ -1,0 +1,49 @@
+{
+  "schemaVersion": "nwf-pi-smoke/1",
+  "result": "PASS",
+  "engine": "@earendil-works/pi-coding-agent@1.4.0",
+  "node": "v24.16.0",
+  "platform": "win32",
+  "model": "deepseek-v4.1-flash",
+  "taskId": "native-57ea8b98-9ac5-43f7-b3e4-718db22b3a8f",
+  "storeId": "b34ef338-aa18-4bbc-88c2-d73adbf691de",
+  "artifact": {
+    "path": "result.txt",
+    "sha256": "a6e445dc38dd9b126e8c103d40dd01dfb53fd5f47558d8145f42e4df7fe5fb24",
+    "size": 13
+  },
+  "question": {
+    "method": "select",
+    "state": "ANSWERED",
+    "answerFile": "answer.txt"
+  },
+  "steer": {
+    "receipt": "ACKNOWLEDGED",
+    "artifact": "steer.txt",
+    "consumptionQualification": "No native input ID: queued ACK only; actual resultant file verified"
+  },
+  "reopen": {
+    "sameNativeSession": true,
+    "newGeneration": true,
+    "persistedSelectedValue": "GREEN",
+    "artifactSha256": "cd9fcbf0c0b40bf7cdb35b1bb9b377dfdb180e0c8aa602fa903c522f6eebcae7",
+    "oldArtifactStillImmutable": true
+  },
+  "stop": "APPLIED",
+  "stopProof": {
+    "ownerBootId": "88bcc2ef-2ef8-49fe-9377-9bcd7478bbeb",
+    "pid": 19432,
+    "method": "WINDOWS_JOB_ACTIVE_ZERO",
+    "observedAt": "2026-10-23T16:48:24.925Z"
+  },
+  "metrics": {
+    "cost": null,
+    "costCoverage": "UNKNOWN",
+    "usageCoverage": "NATIVE_TASK_TOTAL",
+    "configuredModel": "deepseek-v4.1-flash",
+    "usage.input": "2558",
+    "usage.output": "542",
+    "usage.cacheRead": "22400",
+    "usage.cacheWrite": "0"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "codex-dynamic-runner-profile/1",
+  "profile": "macos-runner-v1",
+  "wireProfileId": "MANAGED",
+  "engineVersion": "codex-cli 0.163.0-alpha.11.2",
+  "defaultSchemaSha256": "408e09849d5d4931992a4227a7f3eb80b15d24901f84aca0562e816634651a82",
+  "experimentalSchemaSha256": "af491b61b83ff04943f2207268d2539d09b6e4bea7aef9972adb9eda2026d1be",
+  "schemaCommand": ["app-server", "generate-json-schema", "--experimental", "--out", "OWNED_SCHEMA_DIRECTORY"],
+  "initialization": {"capabilities": {"experimentalApi": true}},
+  "threadStartField": "dynamicTools",
+  "toolSpec": {"type": "function", "name": "run_command", "description": "Host command runner", "inputSchema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"], "additionalProperties": false}},
+  "callbackMethod": "item/tool/call",
+  "callbackRequired": ["arguments", "callId", "threadId", "tool", "turnId"],
+  "callbackResponse": {"contentItems": [{"type": "inputText", "text": "JSON command DTO with actual output and exitCode"}], "success": true},
+  "tools": ["run_command", "run_build", "run_tests"],
+  "effects": "Observed native dynamicToolCall item id equals callback callId; only a bound Runner terminal DTO with registered-group exit proof settles its durable native effect.",
+  "responseLoss": "Exactly one command POST; only original-key GET lookup after loss. UNKNOWN is not retried or replayed.",
+  "modelProcess": "Native apply_patch; native shell/apps/multi-agent disabled; Darwin process-fork denied.",
+  "commandScope": "REGISTERED_PROCESS_GROUP",
+  "arbitraryEscapedProcesses": "NOT_PROVEN",
+  "remoteEffects": "NOT_PROVEN",
+  "qualification": "Real pinned app-server callback and response consumption, real shared Runner, plus DeepSeek v4.1 Flash through OpenCode Go. No pin or model slug upgrade."
+}
