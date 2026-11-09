@@ -1,0 +1,97 @@
+{
+  "schemaVersion": "pi-macos-qualification/1",
+  "qualifiedOn": "2026-10-25",
+  "baseline": "cd2fa1948b06e2f9796ad8de5d38d54224e9d0cc",
+  "platform": "darwin",
+  "arch": "arm64",
+  "node": "v24.22.1",
+  "qualification": "PARTIAL",
+  "deterministic": {
+    "command": "npm test",
+    "total": 38,
+    "passed": 36,
+    "failed": 0,
+    "skipped": 2,
+    "skipScope": "Windows Job-specific cases only"
+  },
+  "sdkLocalStream": "PASS: actual shell credential isolation, builtin file tools, byte seal tamper rejection, persisted prior messages, immutable old artifacts",
+  "realModel": {
+    "model": "deepseek-v4.1-flash",
+    "baseUrl": "https://opencode.ai/zen/go/v1",
+    "w1": "PASS",
+    "w3": "PASS after one intermediate SDK Connection error",
+    "w4": "A complete builtin-only run PASS; subsequent runs PARTIAL because the model additionally called bash and STOP truthfully returned UNKNOWN",
+    "evidenceFiles": [
+      "macos-arm64-deepseek-w1.json",
+      "macos-arm64-deepseek-w3.json",
+      "macos-arm64-deepseek-w4a.json"
+    ],
+    "additionalObservedAttempts": [
+      {
+        "suite": "W4",
+        "observation": "Earlier queue smoke stopped a task during Git preparation; UNKNOWN retained the slot. Smoke now waits for first native task completion before testing queue release."
+      },
+      {
+        "suite": "W3",
+        "observation": "Intermediate restart continuation failed MODEL_REQUEST_FAILED with SDK errorMessage Connection error.; a new isolated full run then passed."
+      },
+      {
+        "suite": "W4",
+        "observation": "An additional budget-extension run failed MODEL_REQUEST_FAILED with SDK errorMessage Connection error."
+      },
+      {
+        "suite": "W4",
+        "observation": "A queue task called bash after write; kernel fork was observed, group cleanup completed, STOP UNKNOWN and quiescent=false."
+      },
+      {
+        "suite": "W4",
+        "observation": "A later scope task called bash despite a no-bash prompt; kernel fork was observed, group cleanup completed, STOP UNKNOWN and quiescent=false."
+      }
+    ]
+  },
+  "macosProof": {
+    "method": "DARWIN_KQUEUE_NO_FORK_GROUP_ZERO",
+    "requires": [
+      "guardian armed before initial configuration",
+      "no NOTE_FORK observed for root",
+      "root NOTE_EXIT observed",
+      "original process group absent"
+    ],
+    "forkOrObservationLoss": "UNKNOWN; quiescent=false; artifacts and completed-session reopen unavailable; slot retained",
+    "abruptHostCrash": "guardian performs cleanup, but missing durable proof keeps restart UNKNOWN",
+    "orderlyNoForkClose": "PAUSED resume and completed-session follow-up verified"
+  },
+  "resources": {
+    "ownedProcesses": "terminated after tests; escaped fixture writers explicitly killed by their owning test",
+    "state": "isolated raw model state retained under ignored .local; temporary deterministic fixtures retained in OS temp",
+    "secrets": "only approved in-memory process injection; no credential values in checked-in evidence"
+  },
+  "nativeImplementationDeterministic": {
+    "command": "npm test",
+    "total": 35,
+    "passed": 33,
+    "failed": 0,
+    "skipped": 2,
+    "skipScope": "Windows Job-specific cases only"
+  },
+  "inProcessProfile": {
+    "name": "macos-in-process-v1",
+    "selection": "explicit --execution-profile on init and serve; default direct host remains native",
+    "wireProfileId": "MANAGED",
+    "storeBinding": "immutable; legacy native stores and opposite profile rejected with EXECUTION_PROFILE_CHANGED",
+    "executionTools": [
+      "read",
+      "write",
+      "edit",
+      "ask_user"
+    ],
+    "kernelPolicy": "sandbox-exec fixed allow-default / deny process-fork; actual Node spawn EPERM observed, marker file absent",
+    "proof": "existing guardian no-fork root exit/group-zero proof retained",
+    "binding": "sandbox executable bytes + fixed policy hash + selected profile included in engine digest; task/checkpoint/preflight also bind selected profile",
+    "actualSdkLocalStream": "PASS: exact tool list, immutable artifact hash, prior message replay after restart",
+    "realModelW1": "PASS on first isolated DeepSeek Go run: file tools, follow-up, ask_user GREEN, steer file, STOP seal, same-session restart recalls GREEN, old artifact unchanged",
+    "evidence": "macos-arm64-in-process-deepseek-w1.json",
+    "limits": "No shell, spawn-based grep/find or build tools; filesystem and network retain HOST identity, with existing file-tool writeScope admission",
+    "additionalDeterministicObservation": "One intermediate all-file run timed out in an existing native PAUSE fixture after resume. The isolated pause suite and next full suite passed with unchanged source."
+  }
+}

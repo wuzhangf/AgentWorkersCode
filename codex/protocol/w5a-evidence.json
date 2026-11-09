@@ -1,0 +1,79 @@
+{
+  "schemaVersion": "w5a-evidence/1",
+  "engine": "codex-cli 0.163.0-alpha.11.2",
+  "schemaSha256": "408e09849d5d4931992a4227a7f3eb80b15d24901f84aca0562e816634651a82",
+  "platform": "windows-x86_64",
+  "storeSchema": "user_version=5 (v4 stores migrate in place)",
+  "reproducer": "node workers/codex/tests/w5a.mjs <host.exe> <initialized-state-template> (38 checks, real pinned app-server + real model); cargo deterministic suite 47 passed / 1 ignored",
+  "contextPackages": {
+    "status": "IMPLEMENTED",
+    "surface": [
+      "POST /local/v1/tasks/{id}/context-packages {requestKey,name?,sources:[{kind:file,path}|{kind:text,text}|{kind:summary,text}]} -> 200 {packageId,name,digest,size,sourceCount,fileCount,sources[{kind,path?,sha256,size}]}",
+      "GET /local/v1/tasks/{id}/context-packages (list; source bytes withheld)",
+      "GET /local/v1/tasks/{id}/context-packages/{pid} (detail; file sources carry base64 `content`, text/summary carry `text`; digestVerified + coverage=FROZEN_AT_CREATION)"
+    ],
+    "observed": [
+      "file source bytes are copied at creation into context_package_sources; a later workspace rewrite of the same file leaves the package bytes and digest bit-identical (freeze proof)",
+      "digest is sha256 over the canonical source set; every source row carries kind/path/sha256/size; detail re-verifies each recorded sha256 against the stored bytes (corruption -> PACKAGE_SOURCE_CHANGED); SQL spot-check confirms durable rows",
+      "lexical + realpath checks confine file sources to the task workspace and apply the writeScope denyPaths prefix rule: ../ escapes, absolute outside paths and deny-prefixed paths all refused PACKAGE_SOURCE_OUT_OF_SCOPE; missing or non-file sources -> PACKAGE_SOURCE_UNAVAILABLE",
+      "bounds enforced at intake: 20 sources/package (20 file-kind max), 256 KiB/source, 64 KiB/text source, 1 MiB/package, 32 packages/task -> all PACKAGE_SOURCE_TOO_LARGE / INVALID_PACKAGE_SOURCES / PACKAGE_LIMIT",
+      "same requestKey+body replays the stored package; same key + different body -> 409 IDEMPOTENCY_CONFLICT; context-package.created event durable"
+    ],
+    "limits": [
+      "packages are immutable once created: no update/append surface is exposed",
+      "file sources resolve through the task workspace only; nothing outside it can be packaged"
+    ]
+  },
+  "auxiliarySessions": {
+    "status": "IMPLEMENTED",
+    "nativeSurface": [
+      "separate managed codex app-server peer per session on its own CODEX_HOME (task MCP/skills/hooks NOT replicated)",
+      "thread/start model=<frozen> cwd=<workspace snapshot> approvalPolicy=never sandbox=read-only",
+      "one bounded turn/start per session; turn/interrupt + job-kill stop",
+      "thread/tokenUsage/updated feeds an independent usage ledger"
+    ],
+    "observed": [
+      "real model Q&A answered correctly using ONLY inlined frozen package content (marker token present nowhere else on the aux thread); aux thread id != main thread id",
+      "workspace snapshot copied at intake under <state>/auxiliary/<task>/<aux>/workspace (.git and symlinks skipped, bounded 4096 files / 32 MiB -> AUX_SNAPSHOT_TOO_LARGE); aux writes cannot touch the main workspace; snapshot content verified byte-identical while main file diverged afterwards",
+      "stop kills only the aux peer; parent task untouched (still SUCCEEDED); durable 4-session cap -> 409 AUX_SESSION_LIMIT; host-wide live cap NWF_CODEX_MAX_ACTIVE_AUX -> 409 AUX_SESSION_BUSY",
+      "deliver injects the answer into the MAIN task via the existing follow-up path: same thread, new native turn, generation preserved on live path, currentCommandId=deliver key; aux-session.delivered + turn.bound(requestKey) facts; one-shot atomic deliveredAt mark: second deliver -> 409 AUX_ALREADY_DELIVERED, unfinished session -> AUX_NOT_FINISHED; no aux output enters the main session before delivery",
+      "optional budget {maxTotalTokens} enforced SOFT/post-hoc like the parent: a counting prompt with cap 150 settled FAILED with reasonCode BUDGET_EXCEEDED and independent usage; parent usageTotals unchanged",
+      "durable deadlineEpochMillis + 1s sweep: an overdue RUNNING session settles CANCELLED with reasonCode AUX_DEADLINE and its peer is released",
+      "host restart or HOST_CLOSE: in-flight sessions reconcile CANCELLED with reasonCode HOST_RESTART_JOB_CLOSED / HOST_CLOSE; terminal rows (SUCCEEDED/deliveredAt) survive; no continuation claimed"
+    ],
+    "limits": [
+      "usage events can arrive before OR after the turn's completion notification on this pin; a crossed cap settles FAILED/BUDGET_EXCEEDED at whichever accounting boundary observes it — the cap can never preempt a model request",
+      "aux sessions hold no task-concurrency slot; each is a single bounded turn with no follow-up/steer surface",
+      "no aux output reaches the main session except through an explicit deliver",
+      "sandbox=read-only is a protocol-level request, not an OS guarantee — isolation is proven by the workspace copy, not claimed as sandbox enforcement (COPY_ISOLATION_NOT_OS_READONLY)"
+    ]
+  },
+  "transitions": {
+    "status": "IMPLEMENTED",
+    "nativeSurface": [
+      "existing STOP machinery for owner quiescence (turn/interrupt, job-kill drain, terminal settlement, question expiry, effects UNKNOWN) — the pinned protocol has no boundary pause/checkpoint",
+      "thread/resume on the same stored nativeSessionId, then turn/start with the fixed continuation",
+      "fresh generation + segment + ownerEpoch+1 admitted atomically with the durable transition row, request and both facts; transition ids are tr-*"
+    ],
+    "observed": [
+      "transition on a LIVE task: host quiesced the owner itself (transition.quiesced method=MANAGED_STOP_QUIESCE alreadyQuiescent=false) then reopened the same native thread under new generation/segmentId/ownerEpoch 1->2; task returned SUCCEEDED",
+      "an already-quiesced completed session takes the Path-C route (method=COMPLETED_SESSION) gated by reopen_blockers: SUCCEEDED + quiescent + completedSessionSeal + completed turn seal + no open effects/questions",
+      "events transition.quiesced + transition.admitted; the durable transitions listing carries the full compatibility object {engineId,sameEngine:true,crossEngine:false,sameNativeSession:true,method}",
+      "incompatible targets refused BEFORE any state change (engineId!=codex, model!=frozen, toolAllowlist set) -> 409 INCOMPATIBLE_TRANSITION; task state and transitions table untouched",
+      "stale-owner fencing: a follow-up bound to the pre-transition generation/turn/command -> 409 NATIVE_TARGET_CHANGED",
+      "post-restart transitions on an UNKNOWN task -> 409 TRANSITION_STATE_INCOMPATIBLE"
+    ],
+    "limits": [
+      "same-engine/same-thread only: engineId must be codex and model must equal the task's frozen model",
+      "no cross-engine migration — advertised as explicit GAP capability execution.crossEngineTransition",
+      "no tool-allowlist change (the pin has no per-turn tool allowlist knob); a requested restriction is refused rather than silently ignored",
+      "a live-session quiesce is interrupt+stop, not a quiet boundary checkpoint — the transition.quiesced method names which proof was used (MANAGED_STOP_QUIESCE vs COMPLETED_SESSION)"
+    ]
+  },
+  "unchangedGaps": [
+    "strict PAUSE/RESUME remains GAP (protocol/strict-pause-gap.json)",
+    "shell_environment_policy propagation gap unchanged (protocol/environment-binding-gap.json)",
+    "write scope enforcement posture unchanged (protocol/write-scope-gap.json)",
+    "cross-engine thread migration is an explicit GAP by design in W5a"
+  ]
+}

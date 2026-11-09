@@ -1,0 +1,16 @@
+{
+  "title": "The Office — three real agents walk in and work",
+  "beats": [
+    { "type": "narrate", "text": "A small intranet repo was just prepared on this machine. I'll dispatch three agents to it — each one becomes a character in the office." },
+    { "type": "dispatch", "key": "demo-inventory", "label": "inventory", "instruction": "List the files with ls, read README.md, then create INVENTORY.md at repo root listing every file you found, one per line." },
+    { "type": "wait", "seconds": 4 },
+    { "type": "dispatch", "key": "demo-hunt", "label": "treasure hunt", "instruction": "Use grep to find which file mentions the word 'quasar', then create FOUND.md at repo root with the file path and the matching line." },
+    { "type": "wait", "seconds": 4 },
+    { "type": "dispatch", "key": "demo-docs", "label": "doc writer", "instruction": "Read the files under docs/, then create DOCS-SUMMARY.md at repo root with a 3-line summary of the internal guides." },
+    { "type": "narrate", "text": "All three are working — watch the labels on the characters: those are the real commands they're running." },
+    { "type": "wait-tasks", "timeoutSeconds": 300 },
+    { "type": "narrate", "text": "Done. Notice: the work happened in a task-owned clone — your real repo was never touched. That's writeScope." },
+    { "type": "show-outputs", "text": "And here's what they actually produced:", "pattern": ".md" },
+    { "type": "interactive" }
+  ]
+}

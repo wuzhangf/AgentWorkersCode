@@ -1,0 +1,142 @@
+{
+  "schemaVersion": "nwf-pi-runner-model/1",
+  "result": "PASS",
+  "executionProfile": "macos-runner-v1",
+  "platform": "darwin",
+  "arch": "arm64",
+  "node": "v24.22.1",
+  "model": "deepseek-v4.1-flash",
+  "actualModel": "deepseek-v4.1-flash",
+  "engineBindingDigest": "d42009b34693cf6c907ff622a4d7900f9e8e03c0ac0aa0bc6858b86824336c0e",
+  "provider": "OpenCode Go",
+  "command": {
+    "stdoutVerified": true,
+    "stderrVerified": true,
+    "failureExitCode": 7
+  },
+  "build": {
+    "succeeded": true
+  },
+  "tests": {
+    "baseline": {
+      "evidence": "NODE_TAP_SUMMARY",
+      "executed": 1,
+      "passed": 0,
+      "failed": 1,
+      "nonzeroExecuted": true,
+      "passedWithTests": false
+    },
+    "repaired": {
+      "evidence": "NODE_TAP_SUMMARY",
+      "executed": 1,
+      "passed": 1,
+      "failed": 0,
+      "nonzeroExecuted": true,
+      "passedWithTests": true
+    },
+    "repairedExitCode": 0,
+    "testSourceUnchanged": true
+  },
+  "modelNoFork": true,
+  "reopen": {
+    "sameNativeSession": true,
+    "rememberedWord": true,
+    "originalCommandReceiptsImmutable": true,
+    "realRunnerCommand": true
+  },
+  "crash": {
+    "hostSignal": "SIGKILL",
+    "ownerLeaseCleanup": true,
+    "heartbeatStopped": true,
+    "taskState": "UNKNOWN",
+    "originalTaskKeyReceiptRecovered": true,
+    "commandReplayCount": 0,
+    "runnerCommandStatus": "UNKNOWN",
+    "originalRunnerCommandKeyLookup": true
+  },
+  "usage": {
+    "input": 10050,
+    "output": 1634,
+    "cacheRead": 69760,
+    "cacheWrite": 0
+  },
+  "stopProof": {
+    "method": "MODEL_NO_FORK_AND_REGISTERED_PROCESS_GROUP_ZERO",
+    "scope": "MODEL_NO_FORK_AND_REGISTERED_PROCESS_GROUPS",
+    "arbitraryEscapedProcesses": "NOT_PROVEN",
+    "contexts": [
+      {
+        "closed": true,
+        "quiescent": true,
+        "activeCommands": 0,
+        "unknownCommands": 0,
+        "stopProof": {
+          "scope": "REGISTERED_PROCESS_GROUP",
+          "groupExited": true,
+          "arbitraryEscapedProcesses": "NOT_PROVEN"
+        }
+      },
+      {
+        "closed": true,
+        "quiescent": true,
+        "activeCommands": 0,
+        "unknownCommands": 0,
+        "stopProof": {
+          "scope": "REGISTERED_PROCESS_GROUP",
+          "groupExited": true,
+          "arbitraryEscapedProcesses": "NOT_PROVEN"
+        }
+      },
+      {
+        "closed": true,
+        "quiescent": true,
+        "activeCommands": 0,
+        "unknownCommands": 0,
+        "stopProof": {
+          "scope": "REGISTERED_PROCESS_GROUP",
+          "groupExited": true,
+          "arbitraryEscapedProcesses": "NOT_PROVEN"
+        }
+      }
+    ]
+  },
+  "longStop": {
+    "receipt": "APPLIED",
+    "heartbeatStopped": true,
+    "commandStatus": "CANCELLED",
+    "proof": {
+      "method": "MODEL_NO_FORK_AND_REGISTERED_PROCESS_GROUP_ZERO",
+      "scope": "MODEL_NO_FORK_AND_REGISTERED_PROCESS_GROUPS",
+      "arbitraryEscapedProcesses": "NOT_PROVEN",
+      "contexts": [
+        {
+          "closed": true,
+          "quiescent": true,
+          "activeCommands": 0,
+          "unknownCommands": 0,
+          "stopProof": {
+            "scope": "REGISTERED_PROCESS_GROUP",
+            "groupExited": true,
+            "arbitraryEscapedProcesses": "NOT_PROVEN"
+          }
+        }
+      ]
+    }
+  },
+  "deterministic": {
+    "tests": 43,
+    "passed": 41,
+    "windowsOnlySkipped": 2,
+    "failed": 0
+  },
+  "runnerSnapshot": {
+    "sourceRevision": "09007798f1791c07b1861f2093148f2ace3b6d2f",
+    "runtimeFileSha256": {
+      "guardian.mjs": "1495a776b716c18aaee06789932ec0aa5ff78dd05d13e37c28a6bac8045bccfe",
+      "main.mjs": "a5735b687238ec00940cde7cdd1582cb4a7af63a52ab1ad5cdff16c5b145eee0",
+      "runner.mjs": "bf4eefa0e8a581d6ae320c60acb8f28c3a7c395558d180966e2912e7adee3c6f"
+    }
+  },
+  "rawEvidenceSha256": "6a10a5c81cef75bafdf5219c7789939c6f3ab574af8bb21f1b0c9c03787e2ead",
+  "qualification": "Real SDK, real shared Runner, OpenCode Go; trusted development registered-group scope, not arbitrary process or filesystem isolation."
+}

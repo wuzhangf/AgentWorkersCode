@@ -1,0 +1,24 @@
+{
+  "adapterVersion": "0.1.0",
+  "version": "codex-cli 0.163.0-alpha.11.2",
+  "schemaVersion": "codex-native-pin/1",
+  "platforms": {
+    "windows-x86_64": {
+      "executableSha256": "3b4f5aeb66f35273f046e4e2baf0143832286a0dcba9db8e1a26dbcd92c90876",
+      "provenance": "npm @openai/codex 0.163.0-alpha.11.2-win32-x64 vendor binary; byte-identical to github.com/openai/codex release codex-x86_64-pc-windows-msvc.exe; generate-json-schema output reproduces schemaSha256 exactly"
+    },
+    "macos-arm64": {
+      "executableSha256": "a7aba95ba28ace5b6721ab1494b9a228cbff9fa4afd650bac931c32201e9900d",
+      "provenance": "Official npm @openai/codex 0.163.0-alpha.11.2-darwin-arm64 vendor/aarch64-apple-darwin/bin/codex; tarball sha512 integrity verified against registry metadata; app-server generate-json-schema reproduces schemaSha256 exactly",
+      "packageUrl": "https://registry.npmjs.org/@openai/codex/-/codex-0.163.0-alpha.11.2-darwin-arm64.tgz",
+      "packageIntegrity": "sha512-qArmfaehfiKiaAhrfnWAZa8isQXugnF3zM8slDW8b1KorVUPN+P4soueqiQ3AfGyeI2wyxjFJRUOyOR1pH/Qvg=="
+    },
+    "linux-x86_64": {
+      "executableSha256": "6158fe2d6aeb4e25764927da8ca475b6af75cb1355b40260ee847a6f389b9611",
+      "provenance": "Official npm @openai/codex 0.163.0-alpha.11.2-linux-x64 vendor binary; registry tarball SHA-512 verified; schema is checked by host init. Linux container qualification is bounded by distribution/native-linux/README.md.",
+      "packageUrl": "https://registry.npmjs.org/@openai/codex/-/codex-0.163.0-alpha.11.2-linux-x64.tgz",
+      "packageIntegrity": "sha512-ajWbw0djoKNtGSxSC0+46aTUdXLPXM6jPJUZ9Mp5RuB2HRLw97w8ZFwhnQqq3LOnK4Epz7r0b13aZhXkyDsGkw=="
+    }
+  },
+  "schemaSha256": "408e09849d5d4931992a4227a7f3eb80b15d24901f84aca0562e816634651a82"
+}

@@ -1,0 +1,31 @@
+{
+  "name": "@sage/worker-pi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.16.0 <25"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/host/main.js",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "test:model": "npm run build && node test/model-smoke.mjs",
+    "test:model:pause": "npm run build && node test/model-pause.mjs",
+    "test:model:w4": "npm run build && node test/model-w4.mjs",
+    "test:model:runner": "npm run build && node test/model-runner.mjs",
+    "test:model:w4b": "npm run build && node test/model-w4b.mjs",
+    "test:model:w5a": "npm run build && node test/model-w5a.mjs",
+    "test:model:w5b": "npm run build && node test/model-w5b.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "koffi": "3.3.3",
+    "typebox": "1.3.27"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "typescript": "5.9.3"
+  }
+}
