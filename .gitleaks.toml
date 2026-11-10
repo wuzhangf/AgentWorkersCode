@@ -24,6 +24,7 @@ paths = [
   '''.*(test|tests|Test|Tests|it|IT|fixture|Fixture|golden|vector|e2e|spec)[/\\._-].*''',
   '''.*Cargo\.lock''',
   '''.*service-dependency\.lock\.json''',
+  '''.*\.gitleaks-baseline\.json''',
   '''.*seatbelt.*\.sbpl''',
 ]
 regexTarget = "secret"
