@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "codex-macos-runner-qualification/1",
+  "testedAt": "2026-10-25T08:17:57.247Z",
+  "platform": "darwin",
+  "arch": "arm64",
+  "node": "v24.22.1",
+  "hostExecutableSha256": "6c107d673b83b522e3b6c724b201f7034f1c04dc5a1d145a9b3f776ba9232418",
+  "runnerSourceHashes": {
+    "guardian.mjs": "1495a776b716c18aaee06789932ec0aa5ff78dd05d13e37c28a6bac8045bccfe",
+    "main.mjs": "a5735b687238ec00940cde7cdd1582cb4a7af63a52ab1ad5cdff16c5b145eee0",
+    "runner.mjs": "bf4eefa0e8a581d6ae320c60acb8f28c3a7c395558d180966e2912e7adee3c6f"
+  },
+  "result": "PASS",
+  "mode": "pinned-app-server-loopback-fixture",
+  "checks": 31,
+  "model": "deepseek-v4.1-flash",
+  "pin": "0.163.0-alpha.11.2",
+  "profile": "macos-runner-v1",
+  "repairCommands": [
+    {
+      "kind": "command",
+      "status": "FAILED",
+      "exitCode": 7,
+      "stdoutSha256": "b1b6b36a94552e05d856db04a5204bdb0419a55a4d9b7a44125df5f5538ae3a5",
+      "stderrSha256": "2bfcf7426f57122a634ce791805082dce464207e949ddc5a4148361ecf2c7c2d"
+    },
+    {
+      "kind": "test",
+      "status": "FAILED",
+      "exitCode": 1,
+      "stdoutSha256": "998629d3044a35565146d686c697d07177784660cf76534bd0b05b5ac78867cc",
+      "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "kind": "build",
+      "status": "SUCCEEDED",
+      "exitCode": 0,
+      "stdoutSha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7",
+      "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "kind": "test",
+      "status": "SUCCEEDED",
+      "exitCode": 0,
+      "stdoutSha256": "46c3d9691dc96f7b9d6df491427e687d0977c70cd1dfd5190ed3e371790bf843",
+      "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "scope": "native no-fork apply_patch; dynamic host command/build/test; actual failing and passing tests; original-key response-loss lookup without POST retry; same-thread reopen and all-context STOP; registered process groups, arbitrary escaped processes and remote effects not proven",
+  "lifecycle": "STOP heartbeat ceased; host SIGKILL owner EOF cleanup; original runner key UNKNOWN, no replay or artifacts"
+}

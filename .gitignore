@@ -1,0 +1,20 @@
+# Build outputs
+node_modules/
+dist/
+target/
+build/
+DerivedData/
+
+# Local run state and evidence scratch
+.local/
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Packaged binaries / archives
+*.nupkg
+*.zip
+*.tar
+*.tar.gz

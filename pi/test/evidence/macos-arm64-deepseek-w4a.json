@@ -1,0 +1,75 @@
+{
+  "schemaVersion": "nwf-pi-w4a/1",
+  "result": "PASS",
+  "engine": "@earendil-works/pi-coding-agent@1.4.0",
+  "node": "v24.22.1",
+  "platform": "darwin",
+  "model": "deepseek-v4.1-flash",
+  "scenarios": {
+    "budgetExceedExtend": {
+      "taskId": "native-4c9a56ce-73a4-483a-8865-60db69b6d343",
+      "exceeded": {
+        "field": "maxTotalTokens",
+        "cap": 1,
+        "observed": 1941
+      },
+      "usageAtExceed": {
+        "input": 1625,
+        "output": 60,
+        "cacheRead": 256,
+        "cacheWrite": 0,
+        "ledgerSource": "ENGINE_REPORTED"
+      },
+      "extended": {
+        "caps": {
+          "maxTotalTokens": 500000
+        },
+        "via": "SESSION_REOPEN",
+        "sameNativeSession": true,
+        "newSegment": true
+      },
+      "captureNote": "Usage corrected from this successful run's durable first-response usageLedger (total 1941). The earlier script sampled this field after extension; assertions and result are unchanged."
+    },
+    "writeScopeViolation": {
+      "taskId": "native-4b0f02ec-39bd-416a-a2eb-b8c1577c4aeb",
+      "event": {
+        "toolName": "write",
+        "scopeId": "wscope-7fd9a818",
+        "deniedPathHash": "1efd45b97f6d8753b1b89e7ea7ba957012c9f94b5d7d29068ed4a9a0e8722b48"
+      },
+      "outsideFileAbsent": true,
+      "runKeptAlive": true
+    },
+    "writeScopeAllowedExtra": {
+      "taskId": "native-4b0f02ec-39bd-416a-a2eb-b8c1577c4aeb",
+      "extraWriteAdmitted": true
+    },
+    "bindingUnavailable": {
+      "taskId": "native-ef7c6824-1e1d-4067-8aad-0a95cd5f5fcb",
+      "state": "BINDING_UNAVAILABLE",
+      "missing": [
+        {
+          "kind": "command",
+          "name": "nwf-w4-definitely-missing-cmd"
+        }
+      ],
+      "noModelCall": true
+    },
+    "queueRelease": {
+      "taskId": "native-eec5fade-0302-4c10-8a99-438f01bba5d2",
+      "queuedOrdinal": 1,
+      "position": 1,
+      "releasedBy": "STOP",
+      "firstState": "SUCCEEDED",
+      "dispatchedOnce": true
+    }
+  },
+  "taskIds": [
+    "native-4c9a56ce-73a4-483a-8865-60db69b6d343",
+    "native-4b0f02ec-39bd-416a-a2eb-b8c1577c4aeb",
+    "native-ef7c6824-1e1d-4067-8aad-0a95cd5f5fcb",
+    "native-762f3f70-33de-4cf4-933b-5465262b9255",
+    "native-eec5fade-0302-4c10-8a99-438f01bba5d2"
+  ],
+  "storeId": "d0e86a7e-285d-4ff9-9d4d-5c14bba812d3"
+}
