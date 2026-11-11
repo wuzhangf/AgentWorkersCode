@@ -18,8 +18,8 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
+import { join, resolve, relative, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const args = process.argv.slice(2);
@@ -234,6 +234,73 @@ const receipt = (r) => ({
 
 const digest = (v) => createHash('sha256').update(JSON.stringify(v)).digest('hex');
 
+// ---- artifacts --------------------------------------------------------------
+// Mirrors the pi host's seal-on-quiescent contract without git: a bounded
+// inventory snapshot at task creation is diffed against the current tree.
+const ART_DIR = join(STATE_DIR, 'artifacts');
+const SKIP_DIRS = new Set(['.git', 'node_modules', '.idea', '.vscode', 'target', 'dist', 'build', '__pycache__', '.next', '.cache', '.Trash']);
+const SECRET_RE = /(?:sk-[A-Za-z0-9_-]{20,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|(?:api[_-]?key|password|access[_-]?token)\s*[:=]\s*["']?[^\s"']{8,})/i;
+const knownSecrets = Object.entries(process.env).filter(([k, v]) => /(?:KEY|PASSWORD|TOKEN|SECRET)$/.test(k) && v && v.length >= 8).map(([, v]) => v);
+
+const inventory = () => {
+  const root = realpathSync(PROJECT_DIR);
+  const map = new Map();
+  const walk = (dir, depth) => {
+    if (depth > 6 || map.size > 2000) return;
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      const rel = relative(root, p);
+      if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) walk(p, depth + 1); continue; }
+      if (!e.isFile()) continue;
+      try { const s = lstatSync(p); map.set(rel, { s: s.size, m: s.mtimeMs }); } catch {}
+    }
+  };
+  try { walk(root, 0); } catch {}
+  return map;
+};
+
+const hashBytes = (b) => createHash('sha256').update(b).digest('hex');
+
+const sealArtifacts = (t) => {
+  if (t.artifactManifest) return t.artifactManifest;
+  if (!t.quiescent) return { items: [], reasonCode: 'STOP_TO_SEAL_RESULTS' };
+  const root = realpathSync(PROJECT_DIR);
+  const current = inventory();
+  const before = new Map((t.baseline ?? []).map((r) => [r.p, r]));
+  const names = new Map();
+  for (const [rel, cur] of current) {
+    const old = before.get(rel);
+    if (!old || old.s !== cur.s || Math.abs(old.m - cur.m) > 0.001) names.set(rel, old ? 'M' : 'A');
+  }
+  for (const rel of before.keys()) if (!current.has(rel)) names.set(rel, 'D');
+  const items = []; let total = 0;
+  for (const [rel, status] of [...names.entries()].sort().slice(0, 100)) {
+    const row = { artifactId: 'file-' + hashBytes(rel + '\0' + t.segmentId), path: rel };
+    items.push(row);
+    if (/[\x00-\x1f\x7f]/.test(rel)) { row.status = 'WITHHELD_PATH'; continue; }
+    if (status === 'D') { row.status = 'DELETED'; continue; }
+    const candidate = resolve(root, rel);
+    const relCheck = relative(root, candidate);
+    if (relCheck === '..' || relCheck.startsWith('..' + sep) || relCheck === '') { row.status = 'WITHHELD_PATH'; continue; }
+    try {
+      const s = lstatSync(candidate);
+      if (!s.isFile() || s.isSymbolicLink() || !realpathSync(candidate).startsWith(root + sep)) { row.status = 'WITHHELD_PATH'; continue; }
+      if (s.size > 524288 || total + s.size > 4194304) { row.status = 'WITHHELD_SIZE'; continue; }
+      const bytes = readFileSync(candidate);
+      const after = lstatSync(candidate);
+      if (after.mtimeMs !== s.mtimeMs || after.size !== s.size || after.ino !== s.ino) { row.status = 'WITHHELD_CHANGED'; continue; }
+      const text = bytes.toString('utf8');
+      if (knownSecrets.some((x) => text.includes(x)) || SECRET_RE.test(text)) { row.status = 'WITHHELD_SECRET'; continue; }
+      total += bytes.length;
+      row.status = 'AVAILABLE'; row.size = bytes.length; row.sha256 = hashBytes(bytes); row.mediaType = 'application/octet-stream';
+      mkdirSync(join(ART_DIR, t.taskId), { recursive: true });
+      writeFileSync(join(ART_DIR, t.taskId, row.artifactId), bytes);
+    } catch { row.status = 'WITHHELD_UNREADABLE'; }
+  }
+  const manifest = { items, bounded: names.size > items.length, coverage: 'CHANGED_OWNED_FILES', segmentId: t.segmentId };
+  t.artifactManifest = manifest; save(); return manifest;
+};
+
 const preflight = () => ({
   schemaVersion: 'worker-local-preflight/1',
   projectId: PROJECT_ID, engineId: ENGINE, engineVersion,
@@ -313,6 +380,7 @@ const routes = (method, seg, taskId, body, query) => {
       nativeSessionId: null, nativeTurnId: null, currentCommandId: body.requestKey,
       createdAt: now(), updatedAt: now(),
       instruction: body.instruction, output: '', publicMessages: [], inputRequests: {},
+      baseline: [...inventory()].map(([p, v]) => ({ p, s: v.s, m: v.m })),
     };
     ledger.tasks[t.taskId] = t;
     ledger.requests[body.requestKey] = {
@@ -349,10 +417,20 @@ const routes = (method, seg, taskId, body, query) => {
           cursor: hasMore ? String(nextSeq) : null };
       }
       if (sub === 'input-requests') return { items: Object.values(t.inputRequests ?? {}) };
-      if (sub === 'artifacts') return { items: [] };
+      if (sub === 'artifacts') return sealArtifacts(t);
       if (sub === 'events') return { items: [], nextCursor: null };
       if (sub === 'metrics') return { cost: null, costCoverage: 'UNKNOWN', usageCoverage: 'NATIVE_TASK_TOTAL', configuredModel: 'vendor-cli' };
       fail('NOT_FOUND', 404);
+    }
+    if (method === 'GET' && rest.length === 4 && sub === 'artifacts') {
+      const manifest = sealArtifacts(t);
+      const row = (manifest.items ?? []).find((r) => r.artifactId === rest[3] && r.status === 'AVAILABLE');
+      if (!row) fail('ARTIFACT_NOT_AVAILABLE', 404);
+      const staged = join(ART_DIR, t.taskId, row.artifactId);
+      if (!existsSync(staged)) fail('ARTIFACT_NOT_AVAILABLE', 404);
+      const bytes = readFileSync(staged);
+      if (hashBytes(bytes) !== row.sha256) fail('ARTIFACT_CHANGED', 409);
+      return { artifactId: row.artifactId, path: row.path, sha256: row.sha256, encoding: 'base64', bytes: bytes.toString('base64') };
     }
     if (method === 'GET' && rest.length === 3 && sub === 'commands') fail('NOT_FOUND', 404);
     if (method === 'GET' && rest.length === 3 && sub === 'interaction-requests') fail('NOT_FOUND', 404);
