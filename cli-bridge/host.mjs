@@ -19,7 +19,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
-import { join, resolve, relative, sep } from 'node:path';
+import { join, resolve, relative, sep, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const args = process.argv.slice(2);
@@ -41,11 +41,35 @@ const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED']);
 
 const fail = (code, status) => { const e = new Error(code); e.code = code; e.status = status; throw e; };
 
+/** Resolve a logical CLI name to an executable command + fixed arg prefix.
+ * POSIX shims and real executables run directly; npm ".cmd" shims on Windows
+ * are unwrapped to `node <entry.js>` so spawn keeps a clean argv and never
+ * needs a shell — instruction text cannot break out through cmd quoting. */
+const resolveBin = (name) => {
+  try { execFileSync(name, ['--version'], { stdio: 'ignore' }); return { cmd: name, pre: [] }; } catch {}
+  if (process.platform === 'win32') {
+    const pathDirs = (process.env.PATH ?? process.env.Path ?? '')
+      .split(';').map((s) => s.trim()).filter(Boolean);
+    const candidates = [
+      ...(process.env.APPDATA ? [join(process.env.APPDATA, 'npm', name + '.cmd')] : []),
+      ...pathDirs.map((d) => join(d, name + '.cmd')),
+    ];
+    for (const shim of candidates) {
+      try {
+        const src = readFileSync(shim, 'utf8');
+        const m = src.match(/"%~?dp0%?\\([^"\r\n]+?\.js)"/i);
+        if (m) return { cmd: process.execPath, pre: [join(dirname(shim), m[1])] };
+        return { cmd: 'cmd.exe', pre: ['/d', '/s', '/c', shim] };
+      } catch {}
+    }
+  }
+  return { cmd: name, pre: [] };
+};
+
 // ---- stock-CLI engine adapters -------------------------------------------------
 
 const ENGINES = {
   claude: {
-    version: () => execFileSync('claude', ['--version'], { encoding: 'utf8' }).trim(),
     argv: (instruction, sessionId) => [
       '-p', instruction, '--output-format', 'stream-json', '--verbose',
       '--dangerously-skip-permissions',
@@ -74,7 +98,6 @@ const ENGINES = {
     },
   },
   codex: {
-    version: () => execFileSync('codex', ['--version'], { encoding: 'utf8' }).trim(),
     argv: (instruction, sessionId) => sessionId
       ? ['exec', 'resume', sessionId, instruction, '--json', '--skip-git-repo-check',
          ...(MODEL ? ['--model', MODEL] : [])]
@@ -100,6 +123,29 @@ const ENGINES = {
       return null;
     },
   },
+  pi: {
+    argv: (instruction, sessionId) => [
+      '-p', instruction, '--mode', 'json',
+      '--session-dir', join(STATE_DIR, 'pi-sessions'),
+      ...(sessionId ? ['--session', sessionId] : []),
+      ...(MODEL ? ['--model', MODEL] : [])],
+    bin: 'pi',
+    /** pi -p --mode json: `session` carries the id; assistant message_end rows
+     * carry completed text blocks; agent_settled ends the turn. */
+    onEvent: (row, task, addMessage) => {
+      if (row.type === 'session' && typeof row.id === 'string') {
+        task.nativeSessionId = row.id;
+      }
+      if (row.type === 'message_end' && row.message?.role === 'assistant') {
+        const text = (row.message.content ?? [])
+          .filter((b) => b.type === 'text' && typeof b.text === 'string' && b.text.trim())
+          .map((b) => b.text).join('\n');
+        if (text.trim()) addMessage('assistant', text);
+      }
+      if (row.type === 'agent_settled') return row.aborted ? 'FAILED' : 'SUCCEEDED';
+      return null;
+    },
+  },
 };
 
 if (!ENGINES[ENGINE]) { console.error(`unknown --engine ${ENGINE}`); process.exit(2); }
@@ -108,8 +154,11 @@ if (TOKEN.length < 24) { console.error('WORKER_LOCAL_TOKEN must be at least 24 c
 if (cmd !== 'serve') { console.error('usage: host.mjs serve ...'); process.exit(2); }
 
 const engine = ENGINES[ENGINE];
+const resolved = resolveBin(engine.bin);
 let engineVersion = 'unknown';
-try { engineVersion = engine.version(); } catch { console.error(`${engine.bin} not on PATH`); process.exit(2); }
+try {
+  engineVersion = execFileSync(resolved.cmd, [...resolved.pre, '--version'], { encoding: 'utf8' }).trim();
+} catch { console.error(`${engine.bin} not on PATH`); process.exit(2); }
 
 // ---- durable ledger ------------------------------------------------------------
 
@@ -149,7 +198,7 @@ const addMessage = (t, role, text) => {
 /** Spawn the stock CLI for one turn; stream its events into the task row. */
 const dispatch = (t, instruction, requestKey) => {
   const argv = engine.argv(instruction, t.nativeSessionId);
-  const child = spawn(engine.bin, argv, {
+  const child = spawn(resolved.cmd, [...resolved.pre, ...argv], {
     cwd: PROJECT_DIR,
     env: { ...process.env },
     stdio: ['ignore', 'pipe', 'pipe'],
