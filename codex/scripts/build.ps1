@@ -11,7 +11,13 @@ $arguments = @()
 if ($LlvmMingwHome) {
     $toolchain = '1.99.1-x86_64-pc-windows-gnu'
     $rustup = Join-Path (Split-Path $cargoPath) 'rustup.exe'
-    $sysroot = (& $rustup run $toolchain rustc --print sysroot).Trim()
+    $previousOutputEncoding = [Console]::OutputEncoding
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    try {
+        $sysroot = (& $rustup run $toolchain rustc --print sysroot).Trim()
+    } finally {
+        [Console]::OutputEncoding = $previousOutputEncoding
+    }
     if ($LASTEXITCODE -ne 0) { throw 'PINNED_GNU_TOOLCHAIN_REQUIRED' }
     $env:PATH = (Join-Path $LlvmMingwHome 'bin') + ';' + $env:PATH
     $env:CC = 'x86_64-w64-mingw32-clang'

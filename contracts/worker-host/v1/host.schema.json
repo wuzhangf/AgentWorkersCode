@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:enterprise-agent:worker-host:1",
+  "oneOf": [
+    {"$ref": "#/$defs/manifest"},
+    {"$ref": "#/$defs/capabilities"}
+  ],
+  "$defs": {
+    "identity": {"type":"string","minLength":1,"maxLength":256},
+    "decimal": {"type":"string","pattern":"^(0|[1-9][0-9]*)$"},
+    "commandIntent": {"enum":["STOP","PAUSE","RESUME","EXTEND_BUDGET"]},
+    "budgetSpec": {
+      "type":"object",
+      "required":["enforcement"],
+      "properties":{
+        "maxTotalTokens":{"$ref":"#/$defs/decimal"},
+        "maxInputTokens":{"$ref":"#/$defs/decimal"},
+        "maxOutputTokens":{"$ref":"#/$defs/decimal"},
+        "maxCostMicroUsd":{"$ref":"#/$defs/decimal"},
+        "enforcement":{"const":"SOFT"}
+      },
+      "additionalProperties":false
+    },
+    "writeScopeSpec": {
+      "type":"object",
+      "properties":{
+        "extraWriteDirs":{"type":"array","items":{"type":"string","minLength":1}},
+        "denyPaths":{"type":"array","items":{"type":"string","minLength":1}}
+      },
+      "additionalProperties":false
+    },
+    "environmentBinding": {
+      "type":"object",
+      "properties":{
+        "requiresCommands":{"type":"array","items":{"type":"string","minLength":1}},
+        "requiresDirs":{"type":"array","items":{"type":"string","minLength":1}},
+        "envAllowlist":{"type":"array","items":{"type":"string","pattern":"^[A-Z][A-Z0-9_]{0,63}$"}}
+      },
+      "additionalProperties":false
+    },
+    "mcpServerSpec": {
+      "type":"object","required":["id","command"],
+      "properties":{
+        "id":{"$ref":"#/$defs/identity"},
+        "command":{"type":"string","minLength":1},
+        "args":{"type":"array","items":{"type":"string","maxLength":512}},
+        "env":{"type":"object","additionalProperties":{"type":"string","maxLength":512}}
+      },
+      "additionalProperties":false
+    },
+    "resourceSourceSpec": {
+      "type":"object","required":["name","sourcePath"],
+      "properties":{"name":{"type":"string","minLength":1,"maxLength":64},"sourcePath":{"type":"string","minLength":1}},
+      "additionalProperties":false
+    },
+    "terminalSpec": {
+      "type":"object",
+      "required":["argv"],
+      "properties":{
+        "argv":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"string","minLength":1,"maxLength":1024}},
+        "cols":{"type":"integer","minimum":1,"maximum":1024},
+        "rows":{"type":"integer","minimum":1,"maximum":1024}
+      },
+      "additionalProperties":false
+    },
+    "contextPackageSource": {
+      "type":"object",
+      "required":["kind"],
+      "properties":{
+        "kind":{"enum":["file","text","summary"]},
+        "path":{"type":"string","minLength":1},
+        "text":{"type":"string","minLength":1,"maxLength":262144}
+      },
+      "additionalProperties":false
+    },
+    "contextPackageRequest": {
+      "type":"object",
+      "required":["requestKey","sources"],
+      "properties":{
+        "requestKey":{"$ref":"#/$defs/identity"},
+        "name":{"type":"string","minLength":1,"maxLength":64},
+        "sources":{"type":"array","minItems":1,"maxItems":20,"items":{"$ref":"#/$defs/contextPackageSource"}}
+      },
+      "additionalProperties":false
+    },
+    "auxiliarySessionRequest": {
+      "type":"object",
+      "required":["requestKey","question"],
+      "properties":{
+        "requestKey":{"$ref":"#/$defs/identity"},
+        "question":{"type":"string","minLength":1,"maxLength":8192},
+        "contextPackageIds":{"type":"array","maxItems":8,"items":{"$ref":"#/$defs/identity"}},
+        "budget":{"$ref":"#/$defs/budgetSpec"}
+      },
+      "additionalProperties":false
+    },
+    "transitionRequest": {
+      "type":"object",
+      "required":["requestKey"],
+      "properties":{
+        "requestKey":{"$ref":"#/$defs/identity"},
+        "targetProfile":{"type":"object","properties":{"engineId":{"enum":["acs","pi","codex"]},"model":{"type":"string","minLength":1},"toolAllowlist":{"type":"array","items":{"type":"string","minLength":1}}},"additionalProperties":false}
+      },
+      "additionalProperties":false
+    },
+    "collaborationChild": {
+      "type":"object",
+      "required":["childId","goal"],
+      "properties":{
+        "childId":{"type":"string","pattern":"^[a-z0-9-]{1,64}$"},
+        "goal":{"type":"string","minLength":1,"maxLength":8192},
+        "dependsOn":{"type":"array","maxItems":8,"items":{"type":"string","pattern":"^[a-z0-9-]{1,64}$"}},
+        "contextPackageIds":{"type":"array","maxItems":8,"items":{"$ref":"#/$defs/identity"}},
+        "writeScope":{"$ref":"#/$defs/writeScopeSpec"},
+        "budget":{"$ref":"#/$defs/budgetSpec"}
+      },
+      "additionalProperties":false
+    },
+    "collaborationRequest": {
+      "type":"object",
+      "required":["requestKey","children"],
+      "properties":{
+        "requestKey":{"$ref":"#/$defs/identity"},
+        "name":{"type":"string","minLength":1,"maxLength":64},
+        "children":{"type":"array","minItems":1,"maxItems":8,"items":{"$ref":"#/$defs/collaborationChild"}}
+      },
+      "additionalProperties":false
+    },
+    "adoptionRequest": {
+      "type":"object",
+      "required":["requestKey","childId"],
+      "properties":{
+        "requestKey":{"$ref":"#/$defs/identity"},
+        "childId":{"type":"string","pattern":"^[a-z0-9-]{1,64}$"},
+        "mode":{"enum":["ALL","FILES"]},
+        "paths":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":1024}}
+      },
+      "additionalProperties":false
+    },
+    "checkpointManifest": {
+      "type":"object",
+      "required":["schemaVersion","checkpointId","taskId","segmentId","generation","sealedAt","engineBindingDigest","modelBindingDigest","nativeSessionId","sessionFileSha256","pendingEffects","pendingInputs","lastEventSequence","ownerEpoch","boundaryState"],
+      "properties":{
+        "schemaVersion":{"const":"worker-checkpoint/1"},
+        "checkpointId":{"$ref":"#/$defs/identity"},
+        "taskId":{"$ref":"#/$defs/identity"},
+        "segmentId":{"$ref":"#/$defs/identity"},
+        "generation":{"$ref":"#/$defs/identity"},
+        "sealedAt":{"type":"string","format":"date-time"},
+        "engineBindingDigest":{"type":"string"},
+        "modelBindingDigest":{"type":"string"},
+        "nativeSessionId":{"type":["string","null"]},
+        "sessionFileSha256":{"type":["string","null"]},
+        "pendingEffects":{"type":"array","items":{"type":"object"}},
+        "pendingInputs":{"type":"array","items":{"type":"object"}},
+        "usage":{"type":"object"},
+        "workspaceManifest":{"type":"object"},
+        "lastEventSequence":{"$ref":"#/$defs/decimal"},
+        "ownerEpoch":{"$ref":"#/$defs/decimal"},
+        "boundaryState":{"type":"string","minLength":1},
+        "limits":{"type":"object"}
+      },
+      "additionalProperties":true
+    },
+    "capability": {
+      "type":"object",
+      "required":["id","implementation","qualification","availability","semantics"],
+      "properties": {
+        "id":{"type":"string","minLength":1},
+        "implementation":{"enum":["PLANNED","GAP","IMPLEMENTED"]},
+        "qualification":{"enum":["NOT_RUN","PARTIAL","VERIFIED","FAILED"]},
+        "availability":{"enum":["AVAILABLE","UNAVAILABLE","UNCONFIGURED","OFFLINE","DENIED","BUSY"]},
+        "semantics":{"type":"string","minLength":1},
+        "evidenceRef":{"type":["string","null"]},
+        "reasonCode":{"type":["string","null"]},
+        "limits":{"type":"object"}
+      }
+    },
+    "manifest": {
+      "type":"object",
+      "required":["schemaVersion","authorityId","storeId","workerId","bootId","engine","contracts","supportedPaths","capabilities"],
+      "properties": {
+        "schemaVersion":{"const":"worker-host/1"},
+        "authorityId":{"$ref":"#/$defs/identity"},"storeId":{"$ref":"#/$defs/identity"},
+        "workerId":{"$ref":"#/$defs/identity"},"bootId":{"$ref":"#/$defs/identity"},
+        "engine":{"type":"object","required":["id","version"],"properties":{"id":{"enum":["acs","pi","codex"]},"version":{"type":"string","minLength":1}}},
+        "contracts":{"type":"array","minItems":1,"uniqueItems":true,"contains":{"const":"worker-host/1"},"items":{"type":"string"}},
+        "supportedPaths":{"type":"array","uniqueItems":true,"items":{"type":"string","pattern":"^/"}},
+        "capabilities":{"type":"array","items":{"$ref":"#/$defs/capability"}}
+      }
+    },
+    "capabilities": {
+      "type":"object","required":["schemaVersion","items"],
+      "properties":{"schemaVersion":{"const":"worker-capabilities/1"},"items":{"type":"array","items":{"$ref":"#/$defs/capability"}}}
+    }
+  }
+}

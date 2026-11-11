@@ -1,0 +1,210 @@
+{
+ "schemaVersion": "worker-host-golden/1",
+ "canonicalRule": "EDC-CANONICAL-JSON-V1",
+ "items": [
+  {
+   "id": "ordering",
+   "input": {
+    "z": 1,
+    "a": "中文",
+    "nested": {
+     "b": true,
+     "a": null
+    }
+   },
+   "canonical": "{\"a\":\"中文\",\"nested\":{\"a\":null,\"b\":true},\"z\":1}",
+   "sha256": "5cdb5085e3d65f55f9f9c7f44abe92fc38096ecbf1bab90933b04cc7cb89e54a"
+  },
+  {
+   "id": "astral",
+   "input": {
+    "2": "two",
+    "10": "ten",
+    "𐀀": "astral",
+    "": "bmp"
+   },
+   "canonical": "{\"10\":\"ten\",\"2\":\"two\",\"\":\"bmp\",\"𐀀\":\"astral\"}",
+   "sha256": "4303708ba5debd5e9f9a9998d61ba919958ee1ce79fa0f4aeabfd29155fe8c37"
+  },
+  {
+   "id": "large-versions",
+   "input": {
+    "sequence": "18446744073709551615",
+    "stateVersion": "9007199254740993",
+    "ownerEpoch": "2"
+   },
+   "canonical": "{\"ownerEpoch\":\"2\",\"sequence\":\"18446744073709551615\",\"stateVersion\":\"9007199254740993\"}",
+   "sha256": "d94bedda170ac3c653a9be23723778ca16fc1d033a0342416946468a6427a632"
+  },
+  {
+   "id": "escapes",
+   "input": {
+    "text": "quote\" backslash\\ tab\t newline\n\u0001"
+   },
+   "canonical": "{\"text\":\"quote\\\" backslash\\\\ tab\\t newline\\n\\u0001\"}",
+   "sha256": "8a845a9e81454cb62e5557bc7078035d9e8dfbb6dc0810ef16f8b02324383842"
+  },
+  {
+   "id": "guard-before",
+   "input": {
+    "requestKey": "original-key",
+    "generation": "g1",
+    "nativeSessionId": "s1",
+    "nativeTurnId": "t1",
+    "targetCommandId": "c1"
+   },
+   "canonical": "{\"generation\":\"g1\",\"nativeSessionId\":\"s1\",\"nativeTurnId\":\"t1\",\"requestKey\":\"original-key\",\"targetCommandId\":\"c1\"}",
+   "sha256": "0564ea4cecf15a0f947066c6e5532878997af5344539e1358a1bcf7edd8365f9"
+  },
+  {
+   "id": "guard-after",
+   "input": {
+    "requestKey": "original-key",
+    "generation": "g2",
+    "nativeSessionId": "s1",
+    "nativeTurnId": "t1",
+    "targetCommandId": "c1"
+   },
+   "canonical": "{\"generation\":\"g2\",\"nativeSessionId\":\"s1\",\"nativeTurnId\":\"t1\",\"requestKey\":\"original-key\",\"targetCommandId\":\"c1\"}",
+   "sha256": "dec8f9a057868922a51203b900ec47b75e3cda824b0215ac5b6bf5f88e9caaed"
+  },
+  {
+   "id": "command-pause",
+   "input": {
+    "requestKey": "pause-key",
+    "intent": "PAUSE",
+    "generation": "g1",
+    "nativeSessionId": "s1",
+    "nativeTurnId": "t1",
+    "targetCommandId": "c1"
+   },
+   "canonical": "{\"generation\":\"g1\",\"intent\":\"PAUSE\",\"nativeSessionId\":\"s1\",\"nativeTurnId\":\"t1\",\"requestKey\":\"pause-key\",\"targetCommandId\":\"c1\"}",
+   "sha256": "611ed8b3930357dec6342d5c030009e9d3f080939e6e4a3777236a43891bd628"
+  },
+  {
+   "id": "task-create-w4",
+   "input": {
+    "requestKey": "create-w4",
+    "projectId": "p1",
+    "engineId": "pi",
+    "instruction": "do work",
+    "optionsRevision": "1",
+    "budget": {
+     "maxTotalTokens": "5000",
+     "maxCostMicroUsd": "20000",
+     "enforcement": "SOFT"
+    },
+    "writeScope": {
+     "extraWriteDirs": [
+      "D:/tmp/extra"
+     ],
+     "denyPaths": [
+      "secrets"
+     ]
+    },
+    "environment": {
+     "requiresCommands": [
+      "node"
+     ],
+     "requiresDirs": [
+      "D:/data"
+     ],
+     "envAllowlist": [
+      "JAVA_HOME"
+     ]
+    }
+   },
+   "canonical": "{\"budget\":{\"enforcement\":\"SOFT\",\"maxCostMicroUsd\":\"20000\",\"maxTotalTokens\":\"5000\"},\"engineId\":\"pi\",\"environment\":{\"envAllowlist\":[\"JAVA_HOME\"],\"requiresCommands\":[\"node\"],\"requiresDirs\":[\"D:/data\"]},\"instruction\":\"do work\",\"optionsRevision\":\"1\",\"projectId\":\"p1\",\"requestKey\":\"create-w4\",\"writeScope\":{\"denyPaths\":[\"secrets\"],\"extraWriteDirs\":[\"D:/tmp/extra\"]}}",
+   "sha256": "75c9a91f4b50d798e7a274070abd3d695b11479ac0d96187b82e5acbf7626479"
+  },
+  {
+   "id": "task-create-w4b",
+   "input": {
+    "requestKey": "create-w4b",
+    "projectId": "p1",
+    "engineId": "pi",
+    "instruction": "do work",
+    "optionsRevision": "1",
+    "mcpServers": [
+     {
+      "id": "fs",
+      "command": "npx",
+      "args": [
+       "-y",
+       "@modelcontextprotocol/server-filesystem",
+       "D:/data"
+      ]
+     }
+    ],
+    "skills": [
+     {
+      "name": "release-notes",
+      "sourcePath": "D:/skills/release-notes"
+     }
+    ],
+    "extensions": [
+     {
+      "name": "nwf-ext",
+      "sourcePath": "D:/extensions/nwf-ext"
+     }
+    ],
+    "terminal": {
+     "argv": [
+      "cmd.exe",
+      "/c",
+      "echo hi"
+     ]
+    }
+   },
+   "canonical": "{\"engineId\":\"pi\",\"extensions\":[{\"name\":\"nwf-ext\",\"sourcePath\":\"D:/extensions/nwf-ext\"}],\"instruction\":\"do work\",\"mcpServers\":[{\"args\":[\"-y\",\"@modelcontextprotocol/server-filesystem\",\"D:/data\"],\"command\":\"npx\",\"id\":\"fs\"}],\"optionsRevision\":\"1\",\"projectId\":\"p1\",\"requestKey\":\"create-w4b\",\"skills\":[{\"name\":\"release-notes\",\"sourcePath\":\"D:/skills/release-notes\"}],\"terminal\":{\"argv\":[\"cmd.exe\",\"/c\",\"echo hi\"]}}",
+   "sha256": "f8fd443d547e4a2a75d1634d75987ec0ac59973888a3ae91de3156965f9ca82e"
+  },
+  {
+   "id": "context-package-create-w5a",
+   "input": {
+    "requestKey": "cpkg-w5a",
+    "name": "baseline-docs",
+    "sources": [
+     {
+      "kind": "file",
+      "path": "docs/spec.md"
+     },
+     {
+      "kind": "summary",
+      "text": "prior run summary"
+     }
+    ]
+   },
+   "canonical": "{\"name\":\"baseline-docs\",\"requestKey\":\"cpkg-w5a\",\"sources\":[{\"kind\":\"file\",\"path\":\"docs/spec.md\"},{\"kind\":\"summary\",\"text\":\"prior run summary\"}]}",
+   "sha256": "2839e9714ab43af393e5d9571ab285e464cffaa28bbdf312556ed629f50ab5f4"
+  },
+  {
+   "id": "collaboration-create-w5b",
+   "input": {
+    "requestKey": "collab-w5b",
+    "name": "feature-split",
+    "children": [
+     {
+      "childId": "scan",
+      "goal": "scan the module",
+      "contextPackageIds": [
+       "cpkg-1"
+      ]
+     },
+     {
+      "childId": "impl",
+      "goal": "implement the change",
+      "dependsOn": [
+       "scan"
+      ],
+      "budget": {
+       "maxTotalTokens": "5000"
+      }
+     }
+    ]
+   },
+   "canonical": "{\"children\":[{\"childId\":\"scan\",\"contextPackageIds\":[\"cpkg-1\"],\"goal\":\"scan the module\"},{\"budget\":{\"maxTotalTokens\":\"5000\"},\"childId\":\"impl\",\"dependsOn\":[\"scan\"],\"goal\":\"implement the change\"}],\"name\":\"feature-split\",\"requestKey\":\"collab-w5b\"}",
+   "sha256": "b40fa7a8002b1d60cc893bf4670a2ec0c3556aab682ab7267f823ecde852880d"
+  }
+ ]
+}

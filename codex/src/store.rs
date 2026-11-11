@@ -4652,7 +4652,7 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../contracts/worker-host/v1/golden-vectors.json")
+                    .join("../contracts/worker-host/v1/golden-vectors.json")
             });
         let vectors: Value = serde_json::from_slice(
             &std::fs::read(path).expect("shared worker-host golden vectors"),

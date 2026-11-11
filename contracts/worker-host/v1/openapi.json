@@ -1,0 +1,12 @@
+{
+  "openapi":"3.1.0",
+  "info":{"title":"Worker host first-slice discovery and original-key lookup","version":"1.0.0"},
+  "servers":[{"url":"/worker-host/v1"}],
+  "security":[{"bearer":[]}],
+  "paths":{
+    "/manifest":{"get":{"operationId":"workerManifest","responses":{"200":{"description":"Authenticated source identity and published implemented routes","content":{"application/json":{"schema":{"$ref":"./host.schema.json#/$defs/manifest"}}}},"401":{"description":"Authentication required"},"409":{"description":"Source store changed"}}}},
+    "/capabilities":{"get":{"operationId":"workerCapabilities","responses":{"200":{"description":"Implementation, qualification and current availability","content":{"application/json":{"schema":{"$ref":"./host.schema.json#/$defs/capabilities"}}}}}}},
+    "/operations/lookup":{"post":{"operationId":"lookupOriginalWorkerOperation","description":"Read-only. Native payload below; ACS advertises business-codeagent-v2 and uses its original lookup payload/registration guards.","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","required":["requestKey"],"additionalProperties":false,"properties":{"requestKey":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,128}$"},"taskId":{"type":"string","pattern":"^native-[A-Za-z0-9-]+$"}}}}}},"responses":{"200":{"description":"Original durable receipt, including UNKNOWN"},"404":{"description":"Original receipt absent; does not authorize a new dispatch"},"409":{"description":"Identity/scope mismatch"}}}}
+  },
+  "components":{"securitySchemes":{"bearer":{"type":"http","scheme":"bearer"}},"parameters":{"storeGuard":{"name":"X-Worker-Local-Store","in":"header","schema":{"type":"string"},"description":"Original durable source store guard"}}}
+}
