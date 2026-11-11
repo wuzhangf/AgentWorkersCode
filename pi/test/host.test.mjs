@@ -19,7 +19,7 @@ const guard = t => ({ generation: t.generation, nativeSessionId: t.nativeSession
 function confirmGolden(vectors) { assert.equal(vectors.schemaVersion, 'worker-host-golden/1'); assert.ok(vectors.items.length > 0); const ids = new Set(); for (const vector of vectors.items) { assert.ok(!ids.has(vector.id), `duplicate golden vector id: ${vector.id}`); ids.add(vector.id); assert.equal(canonical(vector.input), vector.canonical, vector.id); assert.equal(hash(canonical(vector.input)), vector.sha256, vector.id); } }
 
 test('canonical Unicode code point order, integer-only values', () => { assert.equal(canonical({ '\ue000': 1, '𐀀': 2, '10': 'ten', '2': 'two' }), '{"10":"ten","2":"two","":1,"𐀀":2}'); assert.throws(() => canonical({ value: 1.1 })); });
-test('shared EDC canonical golden vectors', () => { const vectors = JSON.parse(readFileSync(new URL('../../../contracts/worker-host/v1/golden-vectors.json', import.meta.url), 'utf8')); confirmGolden(vectors); });
+test('shared EDC canonical golden vectors', () => { const vectors = JSON.parse(readFileSync(new URL('../../contracts/worker-host/v1/golden-vectors.json', import.meta.url), 'utf8')); confirmGolden(vectors); });
 test('project aliases cannot rebind and execution is UNCONFIGURED while ledger reads remain available', async () => {
   const state = mkdtempSync(join(tmpdir(), 'nwf-pi-config-')); const p = project(); const other = project();
   const names = ['MODEL_DEFAULT_MODEL', 'MODEL_BASE_URL', 'MODEL_API_KEY', 'LLM_HEADER_x_opencode_session']; const saved = Object.fromEntries(names.map(k => [k, process.env[k]])); for (const key of names) delete process.env[key];
