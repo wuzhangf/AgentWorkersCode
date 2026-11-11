@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "native-worker-upstream/1",
+  "verifiedOn": "2026-10-24",
+  "node": "24.16.0",
+  "sdk": {
+    "name": "@earendil-works/pi-coding-agent",
+    "version": "1.4.0",
+    "source": "https://github.com/earendil-works/pi/tree/main/packages/coding-agent",
+    "tarball": "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-1.4.0.tgz",
+    "integrity": "sha512-Z41LpZ3yYHSC/UUps6Mr39UMFPwH8elhJBG9DY1P7kuzsE5qSK/6eMj2EHzO5evJRQWLbKSqUMw+4nCNtIyiQg==",
+    "sourceCommit": null,
+    "sourceCommitReason": "The registry did not return gitHead. The exact published tarball, integrity, exported declarations and full npm lock are authoritative for this build.",
+    "license": "MIT",
+    "integration": "Direct createAgentSession in a managed Node child, no CLI or RPC adapter"
+  },
+  "processOwnership": {
+    "name": "koffi",
+    "version": "3.3.3",
+    "integrity": "sha512-XWNI4eyxJJzR2MakPZzR3QeZ06JOklLbxglin0dHhx/qIQCby8lqHs9Acq4Q7CpCKnOrBSj+6b9J5y69wfr2ZA==",
+    "license": "MIT",
+    "windowsAbi": "x64; KILL_ON_JOB_CLOSE; retained Job handle; ActiveProcesses==0",
+    "macosAbi": "arm64; existing koffi binding to Darwin kevent64; independent IPC guardian; NOTE_FORK permanently vetoes quiescence; no-fork root NOTE_EXIT + absent process group only",
+    "macosInProcessProfile": "optional macos-in-process-v1: sandbox-exec fixed deny process-fork policy, wrapper/policy byte binding, read/write/edit/ask_user only; wire profileId remains MANAGED"
+  },
+  "protocol": {
+    "neutral": "worker-host/1",
+    "compatibility": "worker-local/1",
+    "pinnedBehavior": "Pi prompt, steer, finalized message events, settled-idle, custom ask_user, SessionManager persistence"
+  },
+  "nodeQualification": {
+    "windowsX64": "24.16.0",
+    "macosArm64": "24.22.1",
+    "engineRange": ">=24.16.0 <25"
+  }
+}

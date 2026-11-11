@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "write-scope-gap/1",
+  "engine": "codex-cli 0.163.0-alpha.11.2",
+  "status": "PARTIAL",
+  "reasonCode": "DENY_PATH_HOST_OBSERVED_ONLY",
+  "nativeEnforcementAvailable": "The pinned app-server accepts turn/start params.sandboxPolicy of type workspaceWrite with a writableRoots array. Writes outside the task workspace plus the listed roots are denied natively before they land; fileChange items declined by that policy report status declined.",
+  "hostEnforcementImplemented": [
+    "Task creation binds extraWriteDirs (canonicalized absolute paths, must exist) and denyPaths (workspace-relative prefixes, no .. or absolute roots) into the durable task record.",
+    "turn/start carries sandboxPolicy {type:workspaceWrite,writableRoots:[workspace,...extraWriteDirs]} whenever extraWriteDirs is bound, so extra roots are enforced by the native sandbox itself.",
+    "Every fileChange item reports its touched paths; each path is checked against workspace+extraWriteDirs+denyPaths and a durable write.scope.violation fact (kind OUT_OF_SCOPE or DENIED_PATH) is emitted per (path,kind) once.",
+    "Native rejections surface as facts: a declined fileChange/commandExecution item records NATIVE_FILE_REJECTED/NATIVE_EXEC_REJECTED; a failed commandExecution whose output mentions sandbox/denied/permission/outside-the-workspace records NATIVE_SANDBOX_REJECTED.",
+    "At each turn boundary a git diff --name-only + untracked-files sweep of the workspace verifies every touched name against denyPaths and emits DENIED_PATH violations for matches."
+  ],
+  "gap": [
+    "denyPaths inside the workspace are not preemptively enforced: writableRoots grants the whole workspace to the native sandbox, so a model or command can write under a denied prefix during the turn and the violation is only detected at item completion or the turn boundary. The fact is honest and durable but the write already landed.",
+    "commandExecution items do not enumerate the paths a process wrote; out-of-scope writes through shell commands are caught only by the native writableRoots sandbox (outside workspace+extra roots) or by the turn-end git sweep (deny paths inside the workspace). A command that writes into a deny path and deletes its own tracks before the sweep would evade detection.",
+    "Violations are recorded, not rolled back: no content restore, file removal, or turn rewind is attempted on a detected violation."
+  ],
+  "currentBehavior": "writeScope defaults to the task workspace. extraWriteDirs extend the native writableRoots policy; denyPaths are host-observed at item completion and at the turn seal. Every check writes a durable write.scope.violation event and a bounded writeScopeViolations projection on the task. enforcement reports APP_SERVER_WRITABLE_ROOTS+HOST_OBSERVED_DENYLIST; nothing is claimed as a preemptive deny-path gate.",
+  "scope": "Verification is limited to paths the engine reports on fileChange items plus the workspace-visible git diff at a real boundary. Remote tool/service writes outside the local filesystem are not in scope."
+}

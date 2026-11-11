@@ -1,0 +1,31 @@
+{
+  "schemaVersion": "nwf-pi-w5b/1",
+  "result": "PASS",
+  "engine": "@earendil-works/pi-coding-agent@1.4.0",
+  "node": "v24.16.0",
+  "platform": "win32",
+  "model": "deepseek-v4.1-flash",
+  "scenarios": {
+    "dag": {
+      "collaborationId": "collab-17d43424-e3a6-43c8-9ddf-9e7903a0cacb",
+      "orderingProof": true,
+      "childANativeSession": "01a16ce3-f39a-728f-86cb-8e17c5339a72",
+      "parentNativeSession": "01a16ce3-c627-75bc-9be9-be8fd344c728",
+      "childAWroteInCheckout": true,
+      "parentUntouchedUntilAdopt": true
+    },
+    "adoption": {
+      "outcome": "ADOPTED",
+      "file": "collab-out-a.txt",
+      "sha256": "82256236d00a780757c9fb9e143cc0128b49ba64a109bd9c6c41da0e07ca0802",
+      "byteIdentical": true,
+      "sameKeyReplay": true,
+      "secondAdoptionNoChanges": true
+    }
+  },
+  "taskIds": [
+    "native-e5cf15de-f175-48ad-b618-e728c422b3f4"
+  ],
+  "collaborationId": "collab-17d43424-e3a6-43c8-9ddf-9e7903a0cacb",
+  "storeId": "d33b7ef9-8c90-4019-ad6b-e2f81792feee"
+}

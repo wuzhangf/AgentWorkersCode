@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "native-session-reopen-gap/1",
+  "engine": "codex-cli 0.163.0-alpha.11.2",
+  "status": "PARTIAL",
+  "reasonCode": "EFFECT_RECONCILIATION_REQUIRED",
+  "nativePrerequisiteAvailable": "Pinned thread/resume and the original per-task CODEX_HOME can reference the same persisted thread without a new prompt.",
+  "nativeGranularityObserved": "The pinned generated schema emits item/started and item/completed notifications carrying {threadId, turnId, item}; effect-kind items (commandExecution, fileChange, mcpToolCall, dynamicToolCall, collabAgentToolCall, webSearch, imageGeneration) are inventoried between those two events.",
+  "hostPrerequisitesMissing": [
+    "A durable complete inventory of native started/completed effects and authoritative resolution of every unknown external effect; local Job Object exit does not prove remote service outcomes.",
+    "A frozen successful native-turn completion fact distinct from the logical task's later STOP state, bound to its exact generation, segment and native thread/turn.",
+    "Versioned per-segment artifact manifests and opaque IDs; current immutable task/path snapshots must remain readable after a later segment changes the workspace.",
+    "One atomic new-intent admission transaction with fresh generation/segment/owner epoch, frozen pin/model/environment checks, no unresolved pending questions and no replay of prior DISPATCHING/UNKNOWN requests."
+  ],
+  "hostPrerequisitesImplemented": [
+    "native_effects ledger records item/started as STARTED and item/completed as SETTLED with the native status; STOP, transport exit and recover() leave unsettled rows UNKNOWN. Rows with an unproven remote outcome keep blocking admission; this is an inventory, not a claim that remote effects were undone.",
+    "Windows STOP with active current-generation command effects first retains and verifies handles for children in its private Job, excluding the app-server root, terminates those children, and waits at most one second for their exits and one second for native item completion facts. The live producer can report actual command termination before turn/interrupt. An acknowledged interrupt then allows at most two seconds for bound native turn/item facts to drain before the final full-Job STOP. Optional staging failure always falls back to the full-Job STOP. This never settles UNKNOWN effects or infers remote outcomes from process exit. turn_seals freezes {commandId, nativeTurnId, generation, segmentId, status, sealedAt} at turn/completed and is never overwritten.",
+    "artifact_manifests re-keyed to (task, segment_id) with segment-scoped opaque ids file-<sha256(path+segmentId)>; schema user_version 1 migrates to 2 and artifact_read resolves across all sealed segment manifests.",
+    "admit_reopen commits request ACCEPTED + fresh generation + new segmentId + ownerEpoch+1 + launchState RESTORING + state UNKNOWN in one transaction; prior segment manifests are sealed first if missing and never removed."
+  ],
+  "currentBehavior": "An explicit NATIVE_FOLLOW_UP may admit a peerless, quiescent SUCCEEDED, CANCELLED or FAILED task. SUCCEEDED requires the existing completed-session proof; CANCELLED/FAILED require an owned STOP proof and a matching interrupted/failed native-turn seal. Existing generation/segment/command binding, settled-effect, consumed-question, engine/model/environment and capacity gates remain mandatory. The atomic admission records the current ownerBootId with new generation/segment/ownerEpoch; the new peer must resume the exact persisted native thread before starting the new turn. UNKNOWN effects or a crash in admission never trigger replay.",
+  "scope": "Explicit new-turn continuation of a proved stopped native session, not strict checkpoint resume or automatic restart recovery. Strict PAUSE/RESUME remains GAP. Historical platform qualifications keep their original scope; the 2026-10-29 Windows real-phone chain covering interrupted execution and ownership rebinding is still incomplete (RMT-001 R27-N13/R28-N14/R28-N17)."
+}

@@ -1,0 +1,134 @@
+{
+  "schemaVersion": "mac-command-runner-integration/1",
+  "testedAt": "2026-10-25",
+  "codeRevision": "09007798f1791c07b1861f2093148f2ace3b6d2f",
+  "platform": {
+    "os": "macOS",
+    "arch": "arm64",
+    "node": "24.22.1",
+    "rust": "1.99.1",
+    "jdk": "21.0.13.0.2",
+    "swift": "6.4",
+    "maven": "3.9.11"
+  },
+  "profile": "macos-runner-v1",
+  "runtimeFileSha256": {
+    "guardian.mjs": "1495a776b716c18aaee06789932ec0aa5ff78dd05d13e37c28a6bac8045bccfe",
+    "main.mjs": "a5735b687238ec00940cde7cdd1582cb4a7af63a52ab1ad5cdff16c5b145eee0",
+    "runner.mjs": "bf4eefa0e8a581d6ae320c60acb8f28c3a7c395558d180966e2912e7adee3c6f"
+  },
+  "deterministic": {
+    "sharedRunner": {
+      "passed": 12,
+      "failed": 0,
+      "skipped": 0,
+      "includesToolchains": 4
+    },
+    "launcherAndContracts": {
+      "passed": 12,
+      "failed": 0,
+      "skipped": 0
+    },
+    "pi": {
+      "passed": 41,
+      "windowsOnlySkipped": 2,
+      "failed": 0
+    },
+    "codex": {
+      "passed": 40,
+      "defaultIgnored": 3,
+      "ignoredActuallyRunPassed": 3,
+      "failed": 0
+    },
+    "codexRealAppServerFixture": {
+      "passedChecks": 31,
+      "failed": 0
+    }
+  },
+  "realModel": {
+    "provider": "OpenCode Go",
+    "baseUrl": "https://opencode.ai/zen/go/v1",
+    "model": "deepseek-v4.1-flash",
+    "pi": {
+      "result": "PASS",
+      "shellExitCode": 7,
+      "buildExitCode": 0,
+      "testsBefore": {
+        "executed": 1,
+        "failed": 1
+      },
+      "testsAfter": {
+        "executed": 1,
+        "failed": 0
+      },
+      "testSourceUnchanged": true,
+      "stopHeartbeatStopped": true,
+      "hostSigkillOriginalKeyUnknownNoReplay": true
+    },
+    "codex": {
+      "result": "PASS",
+      "checks": 19,
+      "shellExitCode": 7,
+      "buildExitCode": 0,
+      "testsBefore": {
+        "executed": 2,
+        "failedAtLeast": 1
+      },
+      "testsAfter": {
+        "executed": 2,
+        "failed": 0
+      },
+      "testSourceUnchanged": true,
+      "sameThreadReopen": true
+    }
+  },
+  "toolchains": [
+    {
+      "name": "Node/npm",
+      "result": "PASS",
+      "evidence": "Worker model repair fixtures and actual output/nonzero TAP counts"
+    },
+    {
+      "name": "Cargo/Rust",
+      "result": "PASS",
+      "buildExitCode": 0,
+      "failedTestsBefore": 1,
+      "passedTestsAfter": 1
+    },
+    {
+      "name": "JDK",
+      "result": "PASS",
+      "compileExitCode": 0,
+      "assertions": 2
+    },
+    {
+      "name": "Maven/JUnit",
+      "result": "PASS",
+      "packageExitCode": 0,
+      "failedTestsBefore": 1,
+      "passedTestsAfter": 1,
+      "evidence": "Surefire XML"
+    },
+    {
+      "name": "Swift/XCTest",
+      "result": "PASS",
+      "buildExitCode": 0,
+      "executedTests": 1,
+      "failures": 0
+    }
+  ],
+  "lifecycle": {
+    "stop": "Admission closed; actual heartbeat stopped; registered groups gone",
+    "hostCrash": "SIGKILL; owner lease EOF group cleanup; original keys UNKNOWN, no replay or artifact",
+    "runnerCrash": "SIGKILL; independent guardian cleanup; durable UNKNOWN and unchanged execution count",
+    "responseLoss": "One POST; original-key GET only",
+    "observedDetachedWriter": "UNKNOWN; no full containment claim"
+  },
+  "limits": [
+    "Registered process groups only; arbitrary escaped processes and remote effects NOT_PROVEN",
+    "Commands run under the host user; filesystem/network isolation NOT_PROVEN",
+    "No interactive PTY or daemon/service qualification",
+    "Codex strict checkpoint pause/resume remains GAP",
+    "No Swift Mac Agent, ACS/PAC or existing UI production integration qualification"
+  ]
+}

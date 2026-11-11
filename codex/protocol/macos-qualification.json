@@ -1,0 +1,104 @@
+{
+  "schemaVersion": "native-worker-qualification/1",
+  "recordedAt": "2026-10-25",
+  "platform": {
+    "os": "macOS",
+    "version": "27.0.1",
+    "build": "26A434",
+    "arch": "arm64"
+  },
+  "toolchain": {
+    "rust": "1.99.1",
+    "hostBuild": "release",
+    "dependencies": "Cargo.lock --locked"
+  },
+  "engine": {
+    "version": "codex-cli 0.163.0-alpha.11.2",
+    "executableSha256": "a7aba95ba28ace5b6721ab1494b9a228cbff9fa4afd650bac931c32201e9900d",
+    "schemaSha256": "408e09849d5d4931992a4227a7f3eb80b15d24901f84aca0562e816634651a82",
+    "schemaMatchesExistingPin": true
+  },
+  "toolProfile": "macos-in-process-v1",
+  "checks": [
+    {
+      "suite": "cargo test --locked with canonical vectors",
+      "result": "PASS",
+      "passed": 34,
+      "ignored": 3
+    },
+    {
+      "suite": "cargo test --locked -- --ignored --nocapture",
+      "result": "PASS",
+      "passed": 3,
+      "coverage": [
+        "real pinned initialization and turn/pause rejection -32600",
+        "Darwin pre-arm pipe EOF cleanup",
+        "no-fork seal",
+        "kernel fork and posix_spawn denial",
+        "setsid escape remains unproven",
+        "deleted marker retains sticky taint",
+        "monitor failure cannot seal"
+      ]
+    },
+    {
+      "suite": "tests/restart.mjs",
+      "result": "PASS",
+      "checks": 33
+    },
+    {
+      "suite": "tests/macos.mjs",
+      "result": "PASS",
+      "provider": "loopback deterministic Responses fixture",
+      "requests": 5,
+      "coverage": [
+        "native apply_patch exact bytes",
+        "same-thread reopen with new generation and segment",
+        "two immutable artifact manifests",
+        "live host SIGKILL managed group cleanup",
+        "durable UNKNOWN without replay or artifact",
+        "catalog tamper refused"
+      ]
+    },
+    {
+      "suite": "tests/stopped-resume.mjs",
+      "result": "PASS",
+      "checks": 30,
+      "provider": "OpenCode Go",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "model": "deepseek-v4.1-flash",
+      "nativeEffects": {
+        "SETTLED": 2
+      },
+      "credentialHandling": "Environment injection only; no values retained",
+      "coverage": [
+        "two actual model turns using native apply_patch",
+        "bound original file-change approval",
+        "STOP quiescence",
+        "same native thread across stopped-session reopen",
+        "new generation, segment and owner epoch",
+        "exact artifact bytes in both immutable segment manifests"
+      ]
+    },
+    {
+      "suite": "tests/macos-preparation.mjs",
+      "result": "PASS",
+      "coverage": [
+        "real host fixed Git preparation command path",
+        "actual forked heartbeat writer",
+        "STOP drains preparation and fences native dispatch",
+        "real local clone completes on release",
+        "host SIGKILL clears owned preparation group and stops heartbeat",
+        "restart UNKNOWN without clone replay or artifact"
+      ]
+    }
+  ],
+  "limits": [
+    "Strict boundary pause/resume remains a native protocol GAP",
+    "Arbitrary escaped process cleanup is not proven",
+    "Forked native profile stays UNKNOWN and cannot seal new artifacts/reopen",
+    "Remote service effects remain unproven",
+    "Uncertain crash recovery never redispatches",
+    "Mac W4a model qualification is recorded separately",
+    "Production ACS/PAC/UI wiring, Linux and full ACS parity are outside this evidence"
+  ]
+}

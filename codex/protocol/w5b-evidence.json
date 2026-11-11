@@ -1,0 +1,82 @@
+{
+  "schemaVersion": "w5b-evidence/1",
+  "engine": "codex-cli 0.163.0-alpha.11.2",
+  "schemaSha256": "5eaffbd688f0690e86e09c9c0470580b8101c389e63e3eabf453a64ad0e9b50d",
+  "platform": "windows-x86_64",
+  "storeSchema": "user_version=6 (v5 stores migrate in place)",
+  "reproducer": "node workers/codex/tests/w5b.mjs <host.exe> <initialized-state-template> (25 checks, real pinned app-server + real model); cargo deterministic suite 56 passed / 1 ignored via pwsh -File workers/codex/scripts/build.ps1 -LlvmMingwHome <llvm-mingw> -Test; worker-testkit parity: node worker-testkit/parity/launch.mjs codex -> PASS_SUBSET with N19 COLLABORATION_DAG_ISOLATED PASS and N20 ADOPTION_EXPLICIT_GUARDED PASS",
+  "collaborations": {
+    "status": "IMPLEMENTED",
+    "qualification": "PARTIAL",
+    "surface": [
+      "POST /local/v1/tasks/{id}/collaborations {requestKey,name?,children:[{childId,goal,dependsOn?,contextPackageIds?,writeScope?,budget?}]} -> 202 {collaborationId,state} (max 8 children, goal <= 8192 chars)",
+      "GET /local/v1/tasks/{id}/collaborations -> {items:[{collaborationId,name,state,reasonCode,result,children:[{childId,state,reasonCode,workspace,nativeSessionId,startedAt,finishedAt,candidateFiles,adoptions,toolCalls,output}]}],coverage:ISOLATED_CHECKOUT_DAG}",
+      "GET /local/v1/tasks/{id}/collaborations/{cid} -> same row shape",
+      "POST /local/v1/tasks/{id}/collaborations/{cid}/stop {requestKey} -> 202 {kind:WORKER_LOCAL,state:APPLIED}; pending children settle BLOCKED, running children are peer-killed and settle CANCELLED, collaboration seals CANCELLED",
+      "task detail embeds collaborations[]; audit projection includes kind=collaboration and kind=collaboration.child (metadata only)"
+    ],
+    "nativeSurface": [
+      "separate managed codex app-server peer per child on its own CODEX_HOME under <state>/collab/{collaborationId}/{childId}/home (task MCP servers, skills and hooks NOT replicated)",
+      "isolated writable checkout per child at <state>/collab/{collaborationId}/{childId}/workspace: parent template files copied, .git skipped, baseline sha256 manifest recorded before the turn",
+      "thread/start model=<frozen> modelProvider=nwf cwd=<child checkout> approvalPolicy=on-request sandbox=workspace-write; turn/start carries sandboxPolicy {type:workspaceWrite,writableRoots:[checkout + declared extraWriteDirs]}",
+      "on Windows the pinned sandbox cannot auto-approve commands under approvalPolicy=never (every exec is refused blocked-by-policy), so children run on-request and the host itself answers each item/commandExecution/requestApproval / item/fileChange/requestApproval: granted iff the declared cwd (commands) or every reported path (file changes) is inside the child's own write scope; out-of-scope approvals decline and record a durable collaboration.child.scope_violation fact; requestUserInput/elicitation still refuse outright (autonomous child has no answer channel)",
+      "one bounded turn per child; durable deadlineEpochMillis + 1s sweep -> CANCELLED/COLLABORATION_DEADLINE; independent usage ledger + toolCalls counter per child"
+    ],
+    "dag": [
+      "dependsOn edges validated at intake: cycle or self-dependency -> 409 COLLABORATION_DEPENDENCY_CYCLE, unknown dependency -> 409 COLLABORATION_DEPENDENCY_UNKNOWN, invalid or duplicate childId -> 409 INVALID_COLLABORATION_CHILD_ID, 0 or >8 children -> 409 INVALID_COLLABORATION_CHILDREN, blank or >8192 goal -> 409 INVALID_COLLABORATION_GOAL, name >64 -> 409 INVALID_COLLABORATION_NAME, missing context package -> 404 PACKAGE_NOT_FOUND",
+      "durable pump: a dependency that ends FAILED/CANCELLED/BLOCKED marks its dependents BLOCKED with failedDeps recorded; a child launches only when every dependency is SUCCEEDED; observed after.startedAt >= writer.finishedAt on a real-model run",
+      "shared active-child pool bound NWF_CODEX_MAX_ACTIVE_COLLAB_CHILDREN (default 4) enforced across all tasks per host; per-collaboration cap COLLAB_MAX_PER_TASK",
+      "collaboration seals COMPLETED/FAILED/CANCELLED when all children reach terminal states; result_json counts {succeeded,failed,cancelled,blocked}"
+    ],
+    "isolation": [
+      "child writes land only in the child checkout: parent workspace stayed byte-clean while the child file existed under collab/.../writer/workspace (no leak observed on real run; parity N19 CHILD_OUTPUT_LEAKED_TO_PARENT guard passes)",
+      "child nativeSessionId differs from the parent thread id; child output/toolCalls never enter the parent record",
+      "frozen context packages named at intake are re-materialized as fixed prompt material for the child turn only",
+      "isolation is proven by the checkout copy + adoption boundary, not claimed as OS sandbox enforcement (COPY_ISOLATION_NOT_OS_READONLY; workspace-write is attempted, approvals are scope-checked grants)"
+    ],
+    "durability": [
+      "accept_collaboration writes request row + collaboration row + child rows + request.accepted + collaboration.created in ONE sqlite transaction (all-or-nothing intake)",
+      "same requestKey+body replays the stored acceptance (same collaborationId); same key + different body -> 409 IDEMPOTENCY_CONFLICT",
+      "events durable: collaboration.created, collaboration.child.started, collaboration.child.bound, collaboration.child.completed, collaboration.child.failed, collaboration.child.blocked, collaboration.child.budget_exceeded, collaboration.child.scope_violation, collaboration.completed, collaboration.stopped, collaboration.adopted, collaboration.adoption.conflict",
+      "host restart reconciles honestly: RUNNING children -> CANCELLED(HOST_RESTART_JOB_CLOSED), PENDING children -> BLOCKED, collaboration -> CANCELLED; verified by killing the host mid-turn and re-reading the rows after restart",
+      "graceful HOST_CLOSE settles running children CANCELLED + pending BLOCKED before exit; parent task STOP drains every live collaboration child first"
+    ],
+    "limits": [
+      "children are single bounded turns: no steer/follow-up/pause surface; STOP and deadline are the only mid-turn controls",
+      "budget is SOFT (post-hoc, like the parent): a crossed cap settles FAILED/BUDGET_EXCEEDED at the accounting boundary, never preempts a model request",
+      "command executions with a declared cwd inside the checkout are granted; an exec that escapes the checkout via absolute paths inside the command text is not separately gated (same exposure as the Pi host's unrestricted child bash) — containment evidence is the diff capture, never silent writes",
+      "child peers are in-memory; a restart never resumes an in-flight child (it settles CANCELLED) rather than claiming continued execution"
+    ]
+  },
+  "adoptions": {
+    "status": "IMPLEMENTED",
+    "qualification": "PARTIAL",
+    "surface": [
+      "POST /local/v1/tasks/{id}/collaborations/{cid}/adoptions {requestKey,childId,mode:ALL|FILES,paths?} -> 202 {outcome:ADOPTED|NO_CHANGES,adopted:[{path,sha256,size}],skipped?:[...],adoptionId} or 409 {outcome:CONFLICT,code,conflicts:[...]}",
+      "same requestKey+body replays the stored adoption result (with replayed:true); the durable collab_children.adoptions list accumulates every attempt with outcome and hashes"
+    ],
+    "guards": [
+      "candidate capture: on SUCCEEDED the child's checkout diff vs its spawn-time baseline becomes the durable candidate set (path -> sha256,size); only SUCCEEDED children adopt (other states -> 409 COLLABORATION_CHILD_NOT_FINISHED)",
+      "mode FILES requires paths[] all present in the candidate set -> otherwise 409 ADOPTION_PATH_NOT_CANDIDATE; lexical discipline refuses ../, absolute and non-normalized paths -> 409 INVALID_ADOPTION_PATHS",
+      "parent drift: every adopted path's parent file hash is compared against the recorded baseline/adoption hash; a divergence -> 409 CONFLICT with per-file material and ZERO writes",
+      "candidate bytes are preloaded + sha256-verified before the first parent write, and all conflict/path/scope checks re-run immediately before writes (double-guard, closes the TOCTOU window); a verification failure leaves the parent untouched",
+      "repeat adoption of identical content -> NO_CHANGES (idempotent); observed drift conflict kept the modified parent file intact byte-for-byte"
+    ],
+    "observed": [
+      "real model: writer child produced the marker file in its isolated checkout; mode:FILES adoption copied it into the parent workspace byte-identical; repeat ALL adoption returned NO_CHANGES; after manual parent edit the next adoption returned HTTP 409 CONFLICT and the drifted content survived untouched",
+      "adoption records are durable on the child row (>=3 records observed incl. CONFLICT) and emit collaboration.adopted / collaboration.adoption.conflict events",
+      "audit projection carries adoption metadata (outcome, path hashes, counts) — never file contents"
+    ],
+    "limits": [
+      "adoption is byte-copy of selected candidate files only — no git merge, no force overwrite, no directory-tree semantics",
+      "deletions are surfaced in the candidate (deletionCount/deletions) but not applied to the parent in this slice",
+      "conflict material identifies paths and hashes; it does not expose contents"
+    ]
+  },
+  "unchangedGaps": [
+    "strict PAUSE/RESUME remains GAP (protocol/strict-pause-gap.json)",
+    "shell_environment_policy propagation gap unchanged (protocol/environment-binding-gap.json)",
+    "write scope enforcement posture unchanged for task turns (protocol/write-scope-gap.json); child write scope is additionally enforced by the host-scoped approval grant and the adoption boundary",
+    "cross-engine thread migration remains an explicit GAP"
+  ]
+}

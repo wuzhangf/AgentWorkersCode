@@ -1,0 +1,55 @@
+{
+  "schemaVersion": "nwf-pi-w5a/1",
+  "result": "PASS",
+  "engine": "@earendil-works/pi-coding-agent@1.4.0",
+  "node": "v24.16.0",
+  "platform": "win32",
+  "model": "deepseek-v4.1-flash",
+  "scenarios": {
+    "contextPackage": {
+      "packageId": "pkg-4d8e4bb1-99f4-4140-9d30-3e6144e0482e",
+      "digest": "db3f3307556aac1ab639ca1ea978d5c5a5c3a7522bd3cf316b00b5460ea1a36d",
+      "digestVerified": true,
+      "capabilities": {
+        "contextPackages": true,
+        "auxiliarySessions": true,
+        "transitions": {
+          "sameEngine": true,
+          "crossEngine": false
+        }
+      }
+    },
+    "auxResearch": {
+      "auxSessionId": "aux-c0cc683c-c888-4bcb-8c7d-1b8574fd8b63",
+      "auxNativeSessionId": "01a16c97-cb8b-7028-97f8-0afc77fa0ba3",
+      "parentNativeSessionId": "01a16c97-bcff-7751-9c1c-6fb404315003",
+      "markerInAnswer": true,
+      "parentWorkspaceUnchanged": true,
+      "parentLedgerUntouched": true,
+      "auxUsage": {
+        "input": 1642,
+        "output": 103,
+        "cacheRead": 2688,
+        "cacheWrite": 0
+      }
+    },
+    "deliver": {
+      "followUpAccepted": true,
+      "newOutputBytes": 24,
+      "event": "aux-session.delivered"
+    },
+    "transition": {
+      "transitionId": "tr-9b18eb22-3999-4894-b76d-b5e8eda102a8",
+      "fromEpoch": "1",
+      "toEpoch": "2",
+      "sameNativeSession": true,
+      "method": "BOUNDARY_CHECKPOINT",
+      "staleEpochFenced": true,
+      "crossEngineRefused": "INCOMPATIBLE_TRANSITION"
+    }
+  },
+  "taskIds": [
+    "native-7ac0cba3-7f76-4811-85c4-8141348da032"
+  ],
+  "storeId": "11006a01-4aad-4912-9996-3465a15f601f"
+}
