@@ -32,6 +32,8 @@ const STATE_DIR = opt.state ?? '';
 const PORT = Number(opt.port ?? 0);
 const PROJECT_DIR = opt.project ? resolve(opt.project) : '';
 const PROJECT_ID = opt['project-id'] ?? 'workspace';
+const PROJECT_NAME = opt['project-name'] ?? PROJECT_ID;
+const BINARY = opt.executable;
 const TOKEN = process.env.WORKER_LOCAL_TOKEN ?? '';
 // Stock CLIs carry account-bound defaults that may not exist on the signed-in
 // plan — an explicit --model overrides the vendor config for spawned turns.
@@ -45,10 +47,9 @@ const fail = (code, status) => { const e = new Error(code); e.code = code; e.sta
 
 const ENGINES = {
   claude: {
-    version: () => execFileSync('claude', ['--version'], { encoding: 'utf8' }).trim(),
-    argv: (instruction, sessionId) => [
-      '-p', instruction, '--output-format', 'stream-json', '--verbose',
-      '--dangerously-skip-permissions',
+    argv: (sessionId) => [
+      '--print', '--output-format', 'stream-json', '--verbose',
+      '--permission-mode', 'default',
       ...(MODEL ? ['--model', MODEL] : []),
       ...(sessionId ? ['--resume', sessionId] : []),
     ],
@@ -74,13 +75,11 @@ const ENGINES = {
     },
   },
   codex: {
-    version: () => execFileSync('codex', ['--version'], { encoding: 'utf8' }).trim(),
-    argv: (instruction, sessionId) => sessionId
-      ? ['exec', 'resume', sessionId, instruction, '--json', '--skip-git-repo-check',
-         ...(MODEL ? ['--model', MODEL] : [])]
-      : ['exec', instruction, '--json', '-C', PROJECT_DIR,
-         '-s', 'workspace-write', '--skip-git-repo-check',
-         ...(MODEL ? ['--model', MODEL] : [])],
+    argv: (sessionId) => [
+      '--ask-for-approval', 'never', 'exec', '--sandbox', 'workspace-write',
+      '--json', '--skip-git-repo-check', ...(MODEL ? ['--model', MODEL] : []),
+      ...(sessionId ? ['resume', sessionId] : []), '-',
+    ],
     bin: 'codex',
     /** codex exec --json: thread.started carries thread_id; item.completed rows
      * carry agent_message text; turn.completed finishes the turn. */
@@ -108,8 +107,12 @@ if (TOKEN.length < 24) { console.error('WORKER_LOCAL_TOKEN must be at least 24 c
 if (cmd !== 'serve') { console.error('usage: host.mjs serve ...'); process.exit(2); }
 
 const engine = ENGINES[ENGINE];
+const executable = BINARY ?? engine.bin;
+const childEnvironment = { ...process.env };
+delete childEnvironment.WORKER_LOCAL_TOKEN;
+delete childEnvironment.CLI_BRIDGE_MODEL;
 let engineVersion = 'unknown';
-try { engineVersion = engine.version(); } catch { console.error(`${engine.bin} not on PATH`); process.exit(2); }
+try { engineVersion = execFileSync(executable, ['--version'], { encoding: 'utf8', timeout: 8000, env: childEnvironment }).trim(); } catch { console.error(`${engine.bin} not on PATH`); process.exit(2); }
 
 // ---- durable ledger ------------------------------------------------------------
 
@@ -124,14 +127,14 @@ if (!ledger.requests) ledger.requests = {};
 
 const save = () => {
   const tmp = LEDGER + '.tmp';
-  writeFileSync(tmp, JSON.stringify(ledger));
+  writeFileSync(tmp, JSON.stringify(ledger), { mode: 0o600 });
   renameSync(tmp, LEDGER);
 };
 
 // A task left RUNNING by a dead process is unrecoverable — mark it so the
 // phone sees a terminal verdict instead of a frozen spinner.
 for (const t of Object.values(ledger.tasks)) {
-  if (!TERMINAL.has(t.state)) { t.state = 'FAILED'; t.reasonCode = 'HOST_RESTARTED'; t.quiescent = true; }
+  if (!TERMINAL.has(t.state)) { t.state = 'FAILED'; t.reasonCode = 'HOST_RESTARTED_UNCONFIRMED'; t.quiescent = false; }
 }
 save();
 
@@ -139,7 +142,7 @@ const live = new Map(); // taskId -> ChildProcess
 const now = () => new Date().toISOString();
 const msgId = () => 'msg-' + randomUUID();
 
-const task = (id) => ledger.tasks[id] ?? fail('REQUEST_NOT_FOUND', 404);
+const task = (id) => Object.hasOwn(ledger.tasks, id) ? ledger.tasks[id] : fail('REQUEST_NOT_FOUND', 404);
 
 const addMessage = (t, role, text) => {
   const seq = t.publicMessages.length;
@@ -148,13 +151,22 @@ const addMessage = (t, role, text) => {
 
 /** Spawn the stock CLI for one turn; stream its events into the task row. */
 const dispatch = (t, instruction, requestKey) => {
-  const argv = engine.argv(instruction, t.nativeSessionId);
-  const child = spawn(engine.bin, argv, {
+  const child = spawn(executable, engine.argv(t.nativeSessionId), {
     cwd: PROJECT_DIR,
-    env: { ...process.env },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    env: childEnvironment,
+    detached: process.platform !== 'win32',
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
-  live.set(t.taskId, child);
+  const run = { child, stopKeys: [], timeout: undefined, spawnFailed: false };
+  live.set(t.taskId, run);
+  child.on('error', () => { run.spawnFailed = true; });
+  child.stdin.on('error', () => { /* Early CLI exit is handled by close. */ });
+  child.stdin.end(instruction);
+  const firstMessage = t.publicMessages.length;
+  t.output = '';
+  t.pendingVerdict = undefined;
+  t.artifactManifest = undefined;
+  t.segmentId = randomUUID();
   t.state = 'RUNNING';
   t.launchState = 'RUNNING';
   t.quiescent = false;
@@ -162,11 +174,11 @@ const dispatch = (t, instruction, requestKey) => {
   t.currentCommandId = requestKey;
   t.updatedAt = now();
   addMessage(t, 'user', instruction);
-  let stderr = '';
-  child.stderr.on('data', (d) => { stderr += d; if (stderr.length > 8192) stderr = stderr.slice(-8192); });
+  child.stderr.resume();
   let buf = '';
+  child.stdout.setEncoding('utf8');
   child.stdout.on('data', (d) => {
-    buf += d.toString();
+    buf += d;
     let i;
     while ((i = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, i); buf = buf.slice(i + 1);
@@ -179,38 +191,87 @@ const dispatch = (t, instruction, requestKey) => {
     }
     if (buf.length > (1 << 20)) buf = buf.slice(-(1 << 20));
   });
-  child.on('close', (code) => {
-    live.delete(t.taskId);
-    t.quiescent = true;
-    t.updatedAt = now();
-    if (t.state === 'CANCELLED') { save(); return; }
-    if (!t.output) {
-      t.output = t.publicMessages.filter((m) => m.role === 'assistant').map((m) => m.text).join('\n');
+  child.on('close', async (code) => {
+    if (run.stopKeys.length || shuttingDown) signalRun(run, 'SIGKILL');
+    clearTimeout(run.timeout);
+    // The CLI can exit before descendants have released the process group.
+    for (let attempt = 0; attempt < 30 && groupAlive(run); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    if (t.pendingVerdict === 'SUCCEEDED' || (code === 0 && t.pendingVerdict !== 'FAILED')) {
+    t.quiescent = !groupAlive(run);
+    t.updatedAt = now();
+    if (!t.output) {
+      t.output = t.publicMessages.slice(firstMessage)
+        .filter((m) => m.role === 'assistant').map((m) => m.text).join('\n');
+    }
+    if (!t.quiescent) {
+      t.state = 'FAILED'; t.reasonCode = 'PROCESS_EXIT_UNCONFIRMED';
+    } else if (run.stopKeys.length || shuttingDown) {
+      t.state = 'CANCELLED'; t.reasonCode = 'STOPPED_BY_OWNER';
+    } else if (code === 0 && (t.pendingVerdict === 'SUCCEEDED'
+        || (t.pendingVerdict !== 'FAILED' && t.output))) {
       t.state = 'SUCCEEDED'; t.reasonCode = '';
     } else {
       t.state = 'FAILED';
-      t.reasonCode = t.pendingVerdict === 'FAILED' ? 'ENGINE_FAILED' : 'ENGINE_EXIT_' + code;
-      if (stderr.trim() && !t.output) t.output = stderr.trim().split('\n').slice(-20).join('\n');
+      t.reasonCode = run.spawnFailed ? 'ENGINE_SPAWN_FAILED'
+        : t.pendingVerdict === 'FAILED' ? 'ENGINE_FAILED' : 'ENGINE_EXIT_' + code;
     }
+    // Keep stderr on the host side. Vendor diagnostics can contain account data.
     t.pendingVerdict = undefined;
+    for (const key of run.stopKeys) {
+      const row = ledger.requests[key];
+      row.state = t.quiescent ? 'APPLIED' : 'FAILED';
+      row.result = { taskId: t.taskId, state: t.state, quiescent: t.quiescent };
+      if (!t.quiescent) row.code = t.reasonCode;
+    }
+    live.delete(t.taskId);
     save();
+    if (shuttingDown && live.size === 0) process.exit(0);
   });
   save();
 };
 
-const stopTask = (t) => {
-  const child = live.get(t.taskId);
-  if (child) { try { child.kill('SIGTERM'); } catch {} setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 3000).unref(); }
-  if (!TERMINAL.has(t.state)) { t.state = 'CANCELLED'; t.reasonCode = 'STOPPED_BY_OWNER'; t.quiescent = true; }
-  t.updatedAt = now();
-};
+function groupAlive({ child }) {
+  if (!child.pid) return false;
+  if (process.platform === 'win32') return child.exitCode === null && child.signalCode === null;
+  try { process.kill(-child.pid, 0); return true; }
+  catch (error) { return error.code !== 'ESRCH'; }
+}
+
+function signalRun({ child }, signal) {
+  if (!child.pid) return;
+  try {
+    if (process.platform === 'win32') child.kill(signal);
+    else process.kill(-child.pid, signal);
+  } catch { /* The process may have already exited. */ }
+}
+
+function requestStop(run) {
+  if (run.timeout) return;
+  signalRun(run, 'SIGTERM');
+  run.timeout = setTimeout(() => signalRun(run, 'SIGKILL'), 3000);
+}
+
+let shuttingDown = false;
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    shuttingDown = true;
+    if (live.size === 0) process.exit(0);
+    for (const run of live.values()) requestStop(run);
+  });
+}
+
+function checkTarget(t, body) {
+  for (const [bf, tf] of [['generation', 'generation'], ['nativeSessionId', 'nativeSessionId'],
+                         ['nativeTurnId', 'nativeTurnId'], ['targetCommandId', 'currentCommandId']]) {
+    if ((body[bf] ?? null) !== (t[tf] ?? null)) fail('NATIVE_TARGET_CHANGED', 409);
+  }
+}
 
 const facts = (t) => ({
   schemaVersion: 'worker-local/1',
   taskId: t.taskId, projectId: t.projectId, engineId: t.engineId, engineVersion,
-  profileId: 'MANAGED', storeId: ledger.storeId,
+  profileId: 'USER_PROFILE', storeId: ledger.storeId,
   state: t.state, launchState: t.launchState ?? t.state, reasonCode: t.reasonCode ?? '',
   quiescent: t.quiescent === true,
   generation: t.generation, segmentId: t.segmentId,
@@ -222,13 +283,14 @@ const facts = (t) => ({
   output: t.output ?? '',
   result: t.output ?? '',
   capabilities: { stop: live.has(t.taskId), pause: false, resume: false,
-                  steer: live.has(t.taskId), followUp: t.quiescent === true || TERMINAL.has(t.state) },
+                  steer: false, followUp: t.quiescent === true && !!t.nativeSessionId },
   configuredModel: 'vendor-cli',
 });
 
 const receipt = (r) => ({
   schemaVersion: 'worker-local-op/1',
   requestKey: r.requestKey, taskId: r.taskId ?? null, operation: r.operation ?? 'LAUNCH',
+  ...(r.operation === 'NATIVE_FOLLOW_UP' || r.operation === 'STOP' ? { kind: r.operation } : {}),
   state: r.state, result: r.result ?? null, code: r.code ?? null,
 });
 
@@ -304,10 +366,10 @@ const sealArtifacts = (t) => {
 const preflight = () => ({
   schemaVersion: 'worker-local-preflight/1',
   projectId: PROJECT_ID, engineId: ENGINE, engineVersion,
-  optionsRevision: digest([PROJECT_ID, ENGINE, engineVersion]),
-  profileId: 'MANAGED', executionProfile: 'vendor-cli-v1',
-  loadsUserExtensions: false, headRevision: null, hasUncommittedChanges: false,
-  workingCopyPolicy: 'COMMITTED_BASE_ONLY',
+  optionsRevision: digest([PROJECT_ID, ENGINE, engineVersion, PROJECT_DIR, 'REGISTERED_TARGET_ONLY']),
+  profileId: 'USER_PROFILE', executionProfile: 'vendor-cli-v1',
+  loadsUserExtensions: true, headRevision: null, hasUncommittedChanges: null,
+  workingCopyPolicy: 'REGISTERED_TARGET_ONLY',
   executionModes: ['WORKSPACE_TASK'], policyPreset: null,
 });
 
@@ -334,13 +396,13 @@ const routes = (method, seg, taskId, body, query) => {
   const rest = seg.slice(2);
   if (method === 'GET' && rest[0] === 'identity') return identity();
   if (method === 'GET' && rest[0] === 'projects' && rest.length === 1) {
-    return { ...identity(), items: [{ projectId: PROJECT_ID, displayName: PROJECT_ID,
-      availability: 'AVAILABLE', headRevision: null, hasUncommittedChanges: false, kind: 'WORKSPACE' }] };
+    return { ...identity(), items: [{ projectId: PROJECT_ID, displayName: PROJECT_NAME,
+      availability: 'AVAILABLE', headRevision: null, hasUncommittedChanges: null, kind: 'WORKSPACE' }] };
   }
   if (method === 'GET' && rest[0] === 'engines' && rest.length === 1) {
     return { ...identity(), items: [{ engineId: ENGINE, engineVersion, version: engineVersion,
-      availability: 'AVAILABLE', profileId: 'MANAGED',
-      capabilities: { executionModes: ['WORKSPACE_TASK'], steer: true, followUp: true,
+      availability: 'AVAILABLE', profileId: 'USER_PROFILE',
+      capabilities: { executionModes: ['WORKSPACE_TASK'], steer: false, followUp: true,
                       stop: true, pause: false, resume: false } }] };
   }
   if (method === 'GET' && rest[0] === 'tasks' && rest.length === 1) {
@@ -349,7 +411,7 @@ const routes = (method, seg, taskId, body, query) => {
       engineVersion, state: t.state })) };
   }
   if (method === 'GET' && rest[0] === 'task-requests' && rest.length === 2) {
-    const r = ledger.requests[rest[1]];
+    const r = Object.hasOwn(ledger.requests, rest[1]) ? ledger.requests[rest[1]] : undefined;
     if (!r || r.operation !== 'LAUNCH') fail('REQUEST_NOT_FOUND', 404);
     return receipt(r);
   }
@@ -435,13 +497,13 @@ const routes = (method, seg, taskId, body, query) => {
     if (method === 'GET' && rest.length === 3 && sub === 'commands') fail('NOT_FOUND', 404);
     if (method === 'GET' && rest.length === 3 && sub === 'interaction-requests') fail('NOT_FOUND', 404);
     if (method === 'GET' && rest.length === 4 && sub === 'interaction-requests') {
-      const r = ledger.requests[rest[3]];
+      const r = Object.hasOwn(ledger.requests, rest[3]) ? ledger.requests[rest[3]] : undefined;
       if (!r || r.taskId !== t.taskId) fail('REQUEST_NOT_FOUND', 404);
       return receipt(r);
     }
     if (method === 'POST' && rest.length === 3 && sub === 'messages') {
       if (!body || typeof body.requestKey !== 'string') fail('INVALID_REQUEST', 400);
-      if (!['NATIVE_FOLLOW_UP', 'NATIVE_STEER'].includes(body.kind)) fail('OPERATION_NOT_ALLOWED', 403);
+      if (body.kind !== 'NATIVE_FOLLOW_UP') fail('OPERATION_NOT_ALLOWED', 403);
       if (typeof body.content !== 'string' || !body.content.trim()) fail('INVALID_REQUEST', 400);
       const prior = ledger.requests[body.requestKey];
       if (prior) {
@@ -450,17 +512,12 @@ const routes = (method, seg, taskId, body, query) => {
         }
         return receipt(prior);
       }
-      // Target pins: the gateway already verified these against facts; the host
-      // rechecks so a stale phone target never silently steers a live CLI.
-      for (const [bf, tf] of [['generation', 'generation'], ['nativeSessionId', 'nativeSessionId'],
-                             ['nativeTurnId', 'nativeTurnId'], ['targetCommandId', 'currentCommandId']]) {
-        const bv = body[bf] ?? null, tv = t[tf] ?? null;
-        if (bv !== tv) fail('NATIVE_TARGET_CHANGED', 409);
-      }
+      checkTarget(t, body);
       if (live.has(t.taskId)) fail('TASK_BUSY', 409);
+      if (!t.quiescent || !t.nativeSessionId) fail('NATIVE_SESSION_UNAVAILABLE', 409);
       ledger.requests[body.requestKey] = {
         requestKey: body.requestKey, taskId: t.taskId, operation: body.kind,
-        state: 'ACCEPTED', hash: digest({ c: body.content, k: body.kind }),
+        state: 'DISPATCHING', hash: digest({ c: body.content, k: body.kind }),
       };
       save();
       dispatch(t, body.content, body.requestKey);
@@ -476,11 +533,15 @@ const routes = (method, seg, taskId, body, query) => {
         if (prior.taskId !== t.taskId || prior.hash !== 'stop') fail('IDEMPOTENCY_PAYLOAD_MISMATCH', 409);
         return receipt(prior);
       }
-      stopTask(t);
+      checkTarget(t, body);
+      const run = live.get(t.taskId);
+      if (!run) fail('NATIVE_ACTION_UNSUPPORTED', 409);
       ledger.requests[body.requestKey] = {
         requestKey: body.requestKey, taskId: t.taskId, operation: 'STOP',
-        state: 'SUCCEEDED', result: { taskId: t.taskId, state: t.state }, hash: 'stop',
+        state: 'DISPATCHING', hash: 'stop',
       };
+      run.stopKeys.push(body.requestKey);
+      requestStop(run);
       save();
       return receipt(ledger.requests[body.requestKey]);
     }
@@ -504,13 +565,17 @@ http.createServer((req, res) => {
     const isIdentity = seg.join('/') === 'local/v1/identity';
     if (!isIdentity) {
       const store = req.headers['x-worker-local-store'];
-      if (store !== undefined && store !== ledger.storeId) return send(409, { code: 'LOCAL_SOURCE_IDENTITY_CHANGED' });
+      if (store !== ledger.storeId && seg[0] === 'local') return send(409, { code: 'LOCAL_SOURCE_IDENTITY_CHANGED' });
     }
     let body;
     if (req.method === 'POST') {
       let raw = '';
       for await (const c of req) { raw += c; if (raw.length > MAX_BODY) return send(413, { code: 'REQUEST_TOO_LARGE' }); }
       try { body = raw ? JSON.parse(raw) : {}; } catch { return send(422, { code: 'INVALID_REQUEST' }); }
+      if (shuttingDown) return send(503, { code: 'HOST_STOPPING' });
+      if (body && 'requestKey' in Object(body)
+          && (typeof body.requestKey !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(body.requestKey)
+              || Object.hasOwn(Object.prototype, body.requestKey))) return send(400, { code: 'INVALID_REQUEST' });
       const key = req.headers['idempotency-key'];
       if (key !== undefined && body.requestKey !== undefined && key !== body.requestKey) {
         return send(400, { code: 'IDEMPOTENCY_KEY_MISMATCH' });
