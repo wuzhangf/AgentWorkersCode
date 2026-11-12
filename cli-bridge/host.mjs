@@ -19,7 +19,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
-import { join, resolve, relative, sep } from 'node:path';
+import { join, resolve, relative, sep, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const args = process.argv.slice(2);
@@ -32,8 +32,6 @@ const STATE_DIR = opt.state ?? '';
 const PORT = Number(opt.port ?? 0);
 const PROJECT_DIR = opt.project ? resolve(opt.project) : '';
 const PROJECT_ID = opt['project-id'] ?? 'workspace';
-const PROJECT_NAME = opt['project-name'] ?? PROJECT_ID;
-const BINARY = opt.executable;
 const TOKEN = process.env.WORKER_LOCAL_TOKEN ?? '';
 // Stock CLIs carry account-bound defaults that may not exist on the signed-in
 // plan — an explicit --model overrides the vendor config for spawned turns.
@@ -43,13 +41,63 @@ const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED']);
 
 const fail = (code, status) => { const e = new Error(code); e.code = code; e.status = status; throw e; };
 
+/** Vendor installer locations that never land on PATH or npm's shim dir —
+ * OpenAI Codex: %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe;
+ * Anthropic Claude native: %USERPROFILE%\.local\bin\claude.exe. */
+const wellKnownCliPaths = (name) => {
+  if (process.platform !== 'win32') return [];
+  const out = [];
+  if (name === 'codex' && process.env.LOCALAPPDATA) {
+    const root = join(process.env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin');
+    try {
+      for (const e of readdirSync(root, { withFileTypes: true })) {
+        const p = join(root, e.name, 'codex.exe');
+        if (e.isDirectory() && existsSync(p)) out.push(p);
+      }
+    } catch {}
+  }
+  if (name === 'claude' && process.env.USERPROFILE) {
+    const p = join(process.env.USERPROFILE, '.local', 'bin', 'claude.exe');
+    if (existsSync(p)) out.push(p);
+  }
+  return out;
+};
+
+/** Resolve a logical CLI name to an executable command + fixed arg prefix.
+ * POSIX shims and real executables run directly; npm ".cmd" shims on Windows
+ * are unwrapped to `node <entry.js>` so spawn keeps a clean argv and never
+ * needs a shell — instruction text cannot break out through cmd quoting. */
+const resolveBin = (name) => {
+  try { execFileSync(name, ['--version'], { stdio: 'ignore' }); return { cmd: name, pre: [] }; } catch {}
+  for (const p of wellKnownCliPaths(name)) {
+    try { execFileSync(p, ['--version'], { stdio: 'ignore' }); return { cmd: p, pre: [] }; } catch {}
+  }
+  if (process.platform === 'win32') {
+    const pathDirs = (process.env.PATH ?? process.env.Path ?? '')
+      .split(';').map((s) => s.trim()).filter(Boolean);
+    const candidates = [
+      ...(process.env.APPDATA ? [join(process.env.APPDATA, 'npm', name + '.cmd')] : []),
+      ...pathDirs.map((d) => join(d, name + '.cmd')),
+    ];
+    for (const shim of candidates) {
+      try {
+        const src = readFileSync(shim, 'utf8');
+        const m = src.match(/"%~?dp0%?\\([^"\r\n]+?\.js)"/i);
+        if (m) return { cmd: process.execPath, pre: [join(dirname(shim), m[1])] };
+        return { cmd: 'cmd.exe', pre: ['/d', '/s', '/c', shim] };
+      } catch {}
+    }
+  }
+  return { cmd: name, pre: [] };
+};
+
 // ---- stock-CLI engine adapters -------------------------------------------------
 
 const ENGINES = {
   claude: {
-    argv: (sessionId) => [
-      '--print', '--output-format', 'stream-json', '--verbose',
-      '--permission-mode', 'default',
+    argv: (instruction, sessionId) => [
+      '-p', instruction, '--output-format', 'stream-json', '--verbose',
+      '--dangerously-skip-permissions',
       ...(MODEL ? ['--model', MODEL] : []),
       ...(sessionId ? ['--resume', sessionId] : []),
     ],
@@ -75,11 +123,12 @@ const ENGINES = {
     },
   },
   codex: {
-    argv: (sessionId) => [
-      '--ask-for-approval', 'never', 'exec', '--sandbox', 'workspace-write',
-      '--json', '--skip-git-repo-check', ...(MODEL ? ['--model', MODEL] : []),
-      ...(sessionId ? ['resume', sessionId] : []), '-',
-    ],
+    argv: (instruction, sessionId) => sessionId
+      ? ['exec', 'resume', sessionId, instruction, '--json', '--skip-git-repo-check',
+         ...(MODEL ? ['--model', MODEL] : [])]
+      : ['exec', instruction, '--json', '-C', PROJECT_DIR,
+         '-s', 'workspace-write', '--skip-git-repo-check',
+         ...(MODEL ? ['--model', MODEL] : [])],
     bin: 'codex',
     /** codex exec --json: thread.started carries thread_id; item.completed rows
      * carry agent_message text; turn.completed finishes the turn. */
@@ -99,6 +148,38 @@ const ENGINES = {
       return null;
     },
   },
+  pi: {
+    argv: (instruction, sessionId) => [
+      '-p', instruction, '--mode', 'json',
+      '--session-dir', join(STATE_DIR, 'pi-sessions'),
+      ...(sessionId ? ['--session', sessionId] : []),
+      ...(MODEL ? ['--model', MODEL] : [])],
+    bin: 'pi',
+    /** pi -p --mode json: `session` carries the id; assistant message_end rows
+     * carry completed text blocks; agent_settled ends the turn. */
+    onEvent: (row, task, addMessage) => {
+      if (row.type === 'session' && typeof row.id === 'string') {
+        task.nativeSessionId = row.id;
+      }
+      if ((row.type === 'message_end' || row.type === 'message') && row.message?.role === 'assistant') {
+        // Provider/auth errors end the turn with an empty assistant message —
+        // surface the reason and fail honestly instead of a blank SUCCEEDED.
+        if (row.message.stopReason === 'error') {
+          if (!task.engineError) {
+            task.engineError = true;
+            addMessage('assistant', row.message.errorMessage ?? 'provider error', 'FAILED');
+          }
+          return 'FAILED';
+        }
+        const text = (row.message.content ?? [])
+          .filter((b) => b.type === 'text' && typeof b.text === 'string' && b.text.trim())
+          .map((b) => b.text).join('\n');
+        if (text.trim() && row.type === 'message_end') addMessage('assistant', text);
+      }
+      if (row.type === 'agent_settled') return row.aborted ? 'FAILED' : 'SUCCEEDED';
+      return null;
+    },
+  },
 };
 
 if (!ENGINES[ENGINE]) { console.error(`unknown --engine ${ENGINE}`); process.exit(2); }
@@ -107,12 +188,11 @@ if (TOKEN.length < 24) { console.error('WORKER_LOCAL_TOKEN must be at least 24 c
 if (cmd !== 'serve') { console.error('usage: host.mjs serve ...'); process.exit(2); }
 
 const engine = ENGINES[ENGINE];
-const executable = BINARY ?? engine.bin;
-const childEnvironment = { ...process.env };
-delete childEnvironment.WORKER_LOCAL_TOKEN;
-delete childEnvironment.CLI_BRIDGE_MODEL;
+const resolved = resolveBin(engine.bin);
 let engineVersion = 'unknown';
-try { engineVersion = execFileSync(executable, ['--version'], { encoding: 'utf8', timeout: 8000, env: childEnvironment }).trim(); } catch { console.error(`${engine.bin} not on PATH`); process.exit(2); }
+try {
+  engineVersion = execFileSync(resolved.cmd, [...resolved.pre, '--version'], { encoding: 'utf8' }).trim();
+} catch { console.error(`${engine.bin} not on PATH`); process.exit(2); }
 
 // ---- durable ledger ------------------------------------------------------------
 
@@ -127,14 +207,14 @@ if (!ledger.requests) ledger.requests = {};
 
 const save = () => {
   const tmp = LEDGER + '.tmp';
-  writeFileSync(tmp, JSON.stringify(ledger), { mode: 0o600 });
+  writeFileSync(tmp, JSON.stringify(ledger));
   renameSync(tmp, LEDGER);
 };
 
 // A task left RUNNING by a dead process is unrecoverable — mark it so the
 // phone sees a terminal verdict instead of a frozen spinner.
 for (const t of Object.values(ledger.tasks)) {
-  if (!TERMINAL.has(t.state)) { t.state = 'FAILED'; t.reasonCode = 'HOST_RESTARTED_UNCONFIRMED'; t.quiescent = false; }
+  if (!TERMINAL.has(t.state)) { t.state = 'FAILED'; t.reasonCode = 'HOST_RESTARTED'; t.quiescent = true; }
 }
 save();
 
@@ -142,136 +222,86 @@ const live = new Map(); // taskId -> ChildProcess
 const now = () => new Date().toISOString();
 const msgId = () => 'msg-' + randomUUID();
 
-const task = (id) => Object.hasOwn(ledger.tasks, id) ? ledger.tasks[id] : fail('REQUEST_NOT_FOUND', 404);
+const task = (id) => ledger.tasks[id] ?? fail('REQUEST_NOT_FOUND', 404);
 
-const addMessage = (t, role, text) => {
-  const seq = t.publicMessages.length;
-  t.publicMessages.push({ role, text, messageId: msgId(), seq, occurredAt: now(), textComplete: true });
+const addMessage = (t, role, text, requestKey, status) => {
+  const at = now();
+  t.publicMessages.push({
+    messageId: msgId(), sequence: String(t.publicMessages.length + 1), revision: '0',
+    role, text, textTruncated: false,
+    status: status ?? (role === 'user' ? 'CONSUMED' : 'COMPLETED'),
+    occurredAt: at, updatedAt: at,
+    ...(requestKey ? { sourceRequestKey: requestKey } : {}),
+    ...(t.nativeTurnId ? { nativeTurnId: t.nativeTurnId } : {}),
+    textComplete: true,
+  });
 };
 
 /** Spawn the stock CLI for one turn; stream its events into the task row. */
 const dispatch = (t, instruction, requestKey) => {
-  const child = spawn(executable, engine.argv(t.nativeSessionId), {
+  const argv = engine.argv(instruction, t.nativeSessionId);
+  const child = spawn(resolved.cmd, [...resolved.pre, ...argv], {
     cwd: PROJECT_DIR,
-    env: childEnvironment,
-    detached: process.platform !== 'win32',
-    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const run = { child, stopKeys: [], timeout: undefined, spawnFailed: false };
-  live.set(t.taskId, run);
-  child.on('error', () => { run.spawnFailed = true; });
-  child.stdin.on('error', () => { /* Early CLI exit is handled by close. */ });
-  child.stdin.end(instruction);
-  const firstMessage = t.publicMessages.length;
-  t.output = '';
-  t.pendingVerdict = undefined;
-  t.artifactManifest = undefined;
-  t.segmentId = randomUUID();
+  live.set(t.taskId, child);
   t.state = 'RUNNING';
   t.launchState = 'RUNNING';
   t.quiescent = false;
   t.nativeTurnId = randomUUID();
   t.currentCommandId = requestKey;
   t.updatedAt = now();
-  addMessage(t, 'user', instruction);
-  child.stderr.resume();
+  addMessage(t, 'user', instruction, requestKey);
+  let stderr = '';
+  child.stderr.on('data', (d) => { stderr += d; if (stderr.length > 8192) stderr = stderr.slice(-8192); });
   let buf = '';
-  child.stdout.setEncoding('utf8');
   child.stdout.on('data', (d) => {
-    buf += d;
+    buf += d.toString();
     let i;
     while ((i = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, i); buf = buf.slice(i + 1);
       if (!line.trim()) continue;
       let row;
       try { row = JSON.parse(line); } catch { continue; }
-      const verdict = engine.onEvent(row, t, (role, text) => addMessage(t, role, text));
+      const verdict = engine.onEvent(row, t, (role, text, status) => addMessage(t, role, text, requestKey, status));
       if (verdict) t.pendingVerdict = verdict;
       t.updatedAt = now();
     }
     if (buf.length > (1 << 20)) buf = buf.slice(-(1 << 20));
   });
-  child.on('close', async (code) => {
-    if (run.stopKeys.length || shuttingDown) signalRun(run, 'SIGKILL');
-    clearTimeout(run.timeout);
-    // The CLI can exit before descendants have released the process group.
-    for (let attempt = 0; attempt < 30 && groupAlive(run); attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    t.quiescent = !groupAlive(run);
+  child.on('close', (code) => {
+    live.delete(t.taskId);
+    t.quiescent = true;
     t.updatedAt = now();
+    if (t.state === 'CANCELLED') { save(); return; }
     if (!t.output) {
-      t.output = t.publicMessages.slice(firstMessage)
-        .filter((m) => m.role === 'assistant').map((m) => m.text).join('\n');
+      t.output = t.publicMessages.filter((m) => m.role === 'assistant').map((m) => m.text).join('\n');
     }
-    if (!t.quiescent) {
-      t.state = 'FAILED'; t.reasonCode = 'PROCESS_EXIT_UNCONFIRMED';
-    } else if (run.stopKeys.length || shuttingDown) {
-      t.state = 'CANCELLED'; t.reasonCode = 'STOPPED_BY_OWNER';
-    } else if (code === 0 && (t.pendingVerdict === 'SUCCEEDED'
-        || (t.pendingVerdict !== 'FAILED' && t.output))) {
+    if (t.pendingVerdict === 'SUCCEEDED' || (code === 0 && t.pendingVerdict !== 'FAILED')) {
       t.state = 'SUCCEEDED'; t.reasonCode = '';
     } else {
       t.state = 'FAILED';
-      t.reasonCode = run.spawnFailed ? 'ENGINE_SPAWN_FAILED'
-        : t.pendingVerdict === 'FAILED' ? 'ENGINE_FAILED' : 'ENGINE_EXIT_' + code;
+      t.reasonCode = t.pendingVerdict === 'FAILED' ? 'ENGINE_FAILED' : 'ENGINE_EXIT_' + code;
+      if (stderr.trim() && !t.output) t.output = stderr.trim().split('\n').slice(-20).join('\n');
     }
-    // Keep stderr on the host side. Vendor diagnostics can contain account data.
     t.pendingVerdict = undefined;
-    for (const key of run.stopKeys) {
-      const row = ledger.requests[key];
-      row.state = t.quiescent ? 'APPLIED' : 'FAILED';
-      row.result = { taskId: t.taskId, state: t.state, quiescent: t.quiescent };
-      if (!t.quiescent) row.code = t.reasonCode;
-    }
-    live.delete(t.taskId);
     save();
-    if (shuttingDown && live.size === 0) process.exit(0);
   });
   save();
 };
 
-function groupAlive({ child }) {
-  if (!child.pid) return false;
-  if (process.platform === 'win32') return child.exitCode === null && child.signalCode === null;
-  try { process.kill(-child.pid, 0); return true; }
-  catch (error) { return error.code !== 'ESRCH'; }
-}
-
-function signalRun({ child }, signal) {
-  if (!child.pid) return;
-  try {
-    if (process.platform === 'win32') child.kill(signal);
-    else process.kill(-child.pid, signal);
-  } catch { /* The process may have already exited. */ }
-}
-
-function requestStop(run) {
-  if (run.timeout) return;
-  signalRun(run, 'SIGTERM');
-  run.timeout = setTimeout(() => signalRun(run, 'SIGKILL'), 3000);
-}
-
-let shuttingDown = false;
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => {
-    shuttingDown = true;
-    if (live.size === 0) process.exit(0);
-    for (const run of live.values()) requestStop(run);
-  });
-}
-
-function checkTarget(t, body) {
-  for (const [bf, tf] of [['generation', 'generation'], ['nativeSessionId', 'nativeSessionId'],
-                         ['nativeTurnId', 'nativeTurnId'], ['targetCommandId', 'currentCommandId']]) {
-    if ((body[bf] ?? null) !== (t[tf] ?? null)) fail('NATIVE_TARGET_CHANGED', 409);
-  }
-}
+const stopTask = (t) => {
+  const child = live.get(t.taskId);
+  if (child) { try { child.kill('SIGTERM'); } catch {} setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 3000).unref(); }
+  if (!TERMINAL.has(t.state)) { t.state = 'CANCELLED'; t.reasonCode = 'STOPPED_BY_OWNER'; t.quiescent = true; }
+  t.updatedAt = now();
+};
 
 const facts = (t) => ({
   schemaVersion: 'worker-local/1',
   taskId: t.taskId, projectId: t.projectId, engineId: t.engineId, engineVersion,
-  profileId: 'USER_PROFILE', storeId: ledger.storeId,
+  profileId: 'MANAGED', storeId: ledger.storeId,
   state: t.state, launchState: t.launchState ?? t.state, reasonCode: t.reasonCode ?? '',
   quiescent: t.quiescent === true,
   generation: t.generation, segmentId: t.segmentId,
@@ -283,14 +313,13 @@ const facts = (t) => ({
   output: t.output ?? '',
   result: t.output ?? '',
   capabilities: { stop: live.has(t.taskId), pause: false, resume: false,
-                  steer: false, followUp: t.quiescent === true && !!t.nativeSessionId },
+                  steer: live.has(t.taskId), followUp: t.quiescent === true || TERMINAL.has(t.state) },
   configuredModel: 'vendor-cli',
 });
 
 const receipt = (r) => ({
   schemaVersion: 'worker-local-op/1',
   requestKey: r.requestKey, taskId: r.taskId ?? null, operation: r.operation ?? 'LAUNCH',
-  ...(r.operation === 'NATIVE_FOLLOW_UP' || r.operation === 'STOP' ? { kind: r.operation } : {}),
   state: r.state, result: r.result ?? null, code: r.code ?? null,
 });
 
@@ -366,10 +395,10 @@ const sealArtifacts = (t) => {
 const preflight = () => ({
   schemaVersion: 'worker-local-preflight/1',
   projectId: PROJECT_ID, engineId: ENGINE, engineVersion,
-  optionsRevision: digest([PROJECT_ID, ENGINE, engineVersion, PROJECT_DIR, 'REGISTERED_TARGET_ONLY']),
-  profileId: 'USER_PROFILE', executionProfile: 'vendor-cli-v1',
-  loadsUserExtensions: true, headRevision: null, hasUncommittedChanges: null,
-  workingCopyPolicy: 'REGISTERED_TARGET_ONLY',
+  optionsRevision: digest([PROJECT_ID, ENGINE, engineVersion]),
+  profileId: 'MANAGED', executionProfile: 'vendor-cli-v1',
+  loadsUserExtensions: false, headRevision: null, hasUncommittedChanges: false,
+  workingCopyPolicy: 'COMMITTED_BASE_ONLY',
   executionModes: ['WORKSPACE_TASK'], policyPreset: null,
 });
 
@@ -396,13 +425,13 @@ const routes = (method, seg, taskId, body, query) => {
   const rest = seg.slice(2);
   if (method === 'GET' && rest[0] === 'identity') return identity();
   if (method === 'GET' && rest[0] === 'projects' && rest.length === 1) {
-    return { ...identity(), items: [{ projectId: PROJECT_ID, displayName: PROJECT_NAME,
-      availability: 'AVAILABLE', headRevision: null, hasUncommittedChanges: null, kind: 'WORKSPACE' }] };
+    return { ...identity(), items: [{ projectId: PROJECT_ID, displayName: PROJECT_ID,
+      availability: 'AVAILABLE', headRevision: null, hasUncommittedChanges: false, kind: 'WORKSPACE' }] };
   }
   if (method === 'GET' && rest[0] === 'engines' && rest.length === 1) {
     return { ...identity(), items: [{ engineId: ENGINE, engineVersion, version: engineVersion,
-      availability: 'AVAILABLE', profileId: 'USER_PROFILE',
-      capabilities: { executionModes: ['WORKSPACE_TASK'], steer: false, followUp: true,
+      availability: 'AVAILABLE', profileId: 'MANAGED', sourceKind: 'cli',
+      capabilities: { executionModes: ['WORKSPACE_TASK'], steer: true, followUp: true,
                       stop: true, pause: false, resume: false } }] };
   }
   if (method === 'GET' && rest[0] === 'tasks' && rest.length === 1) {
@@ -411,7 +440,7 @@ const routes = (method, seg, taskId, body, query) => {
       engineVersion, state: t.state })) };
   }
   if (method === 'GET' && rest[0] === 'task-requests' && rest.length === 2) {
-    const r = Object.hasOwn(ledger.requests, rest[1]) ? ledger.requests[rest[1]] : undefined;
+    const r = ledger.requests[rest[1]];
     if (!r || r.operation !== 'LAUNCH') fail('REQUEST_NOT_FOUND', 404);
     return receipt(r);
   }
@@ -464,16 +493,35 @@ const routes = (method, seg, taskId, body, query) => {
         return { text, coverage: 'BOUNDED_PUBLIC_MESSAGES' };
       }
       if (sub === 'messages') {
-        const all = t.publicMessages.map((m, i) => ({ ...m, seq: i }));
+        // Rows persisted by older builds lack the native-messages/1 fields —
+        // normalise at the edge so every served row validates on the phone.
+        const all = t.publicMessages.map((m, i) => ({
+          messageId: m.messageId,
+          sequence: String(m.sequence ?? i + 1),
+          revision: String(m.revision ?? '0'),
+          role: m.role,
+          ...(m.text !== undefined ? { text: m.text } : {}),
+          textTruncated: m.textTruncated === true,
+          status: m.status ?? (m.role === 'user' ? 'CONSUMED' : 'COMPLETED'),
+          ...(m.sourceRequestKey ? { sourceRequestKey: m.sourceRequestKey } : {}),
+          ...(m.nativeTurnId ? { nativeTurnId: m.nativeTurnId } : {}),
+          occurredAt: m.occurredAt ?? t.createdAt,
+          updatedAt: m.updatedAt ?? m.occurredAt ?? t.createdAt,
+        }));
         const num = (k) => (query.has(k) ? Number(query.get(k)) : null);
         const cursor = num('cursor'), before = num('before'), limit = num('limit') ?? 100;
-        let items = all;
-        if (cursor !== null) items = items.filter((m) => m.seq >= cursor);
-        if (before !== null) items = items.filter((m) => m.seq < before).slice(-limit);
-        else items = items.slice(0, limit);
-        const nextSeq = items.length ? items[items.length - 1].seq + 1 : null;
-        const hasMore = nextSeq !== null && all.length > nextSeq;
+        let slice = all;
+        if (cursor !== null) slice = slice.filter((m) => Number(m.sequence) >= cursor);
+        if (before !== null) slice = slice.filter((m) => Number(m.sequence) < before).slice(-limit);
+        else slice = slice.slice(0, limit);
+        const nextSeq = slice.length ? Number(slice[slice.length - 1].sequence) + 1 : null;
+        const hasMore = nextSeq !== null && all.length >= nextSeq;
+        const items = slice;
         return { messageSchemaVersion: 'native-messages/1', taskId: t.taskId, storeId: ledger.storeId,
+          firstSequence: items.length ? items[0].sequence : null,
+          latestSequence: all.length ? all[all.length - 1].sequence : null,
+          transcriptRevision: '0', historyMode: 'STRUCTURED_FROM_START',
+          legacy: null,
           text: t.output || all.filter((m) => m.role === 'assistant').map((m) => m.text).join('\n'),
           turns: {}, items, coverage: 'BOUNDED_PUBLIC_MESSAGES', hasMore,
           cursor: hasMore ? String(nextSeq) : null };
@@ -497,13 +545,13 @@ const routes = (method, seg, taskId, body, query) => {
     if (method === 'GET' && rest.length === 3 && sub === 'commands') fail('NOT_FOUND', 404);
     if (method === 'GET' && rest.length === 3 && sub === 'interaction-requests') fail('NOT_FOUND', 404);
     if (method === 'GET' && rest.length === 4 && sub === 'interaction-requests') {
-      const r = Object.hasOwn(ledger.requests, rest[3]) ? ledger.requests[rest[3]] : undefined;
+      const r = ledger.requests[rest[3]];
       if (!r || r.taskId !== t.taskId) fail('REQUEST_NOT_FOUND', 404);
       return receipt(r);
     }
     if (method === 'POST' && rest.length === 3 && sub === 'messages') {
       if (!body || typeof body.requestKey !== 'string') fail('INVALID_REQUEST', 400);
-      if (body.kind !== 'NATIVE_FOLLOW_UP') fail('OPERATION_NOT_ALLOWED', 403);
+      if (!['NATIVE_FOLLOW_UP', 'NATIVE_STEER'].includes(body.kind)) fail('OPERATION_NOT_ALLOWED', 403);
       if (typeof body.content !== 'string' || !body.content.trim()) fail('INVALID_REQUEST', 400);
       const prior = ledger.requests[body.requestKey];
       if (prior) {
@@ -512,12 +560,17 @@ const routes = (method, seg, taskId, body, query) => {
         }
         return receipt(prior);
       }
-      checkTarget(t, body);
+      // Target pins: the gateway already verified these against facts; the host
+      // rechecks so a stale phone target never silently steers a live CLI.
+      for (const [bf, tf] of [['generation', 'generation'], ['nativeSessionId', 'nativeSessionId'],
+                             ['nativeTurnId', 'nativeTurnId'], ['targetCommandId', 'currentCommandId']]) {
+        const bv = body[bf] ?? null, tv = t[tf] ?? null;
+        if (bv !== tv) fail('NATIVE_TARGET_CHANGED', 409);
+      }
       if (live.has(t.taskId)) fail('TASK_BUSY', 409);
-      if (!t.quiescent || !t.nativeSessionId) fail('NATIVE_SESSION_UNAVAILABLE', 409);
       ledger.requests[body.requestKey] = {
         requestKey: body.requestKey, taskId: t.taskId, operation: body.kind,
-        state: 'DISPATCHING', hash: digest({ c: body.content, k: body.kind }),
+        state: 'ACCEPTED', hash: digest({ c: body.content, k: body.kind }),
       };
       save();
       dispatch(t, body.content, body.requestKey);
@@ -533,15 +586,11 @@ const routes = (method, seg, taskId, body, query) => {
         if (prior.taskId !== t.taskId || prior.hash !== 'stop') fail('IDEMPOTENCY_PAYLOAD_MISMATCH', 409);
         return receipt(prior);
       }
-      checkTarget(t, body);
-      const run = live.get(t.taskId);
-      if (!run) fail('NATIVE_ACTION_UNSUPPORTED', 409);
+      stopTask(t);
       ledger.requests[body.requestKey] = {
         requestKey: body.requestKey, taskId: t.taskId, operation: 'STOP',
-        state: 'DISPATCHING', hash: 'stop',
+        state: 'SUCCEEDED', result: { taskId: t.taskId, state: t.state }, hash: 'stop',
       };
-      run.stopKeys.push(body.requestKey);
-      requestStop(run);
       save();
       return receipt(ledger.requests[body.requestKey]);
     }
@@ -565,17 +614,13 @@ http.createServer((req, res) => {
     const isIdentity = seg.join('/') === 'local/v1/identity';
     if (!isIdentity) {
       const store = req.headers['x-worker-local-store'];
-      if (store !== ledger.storeId && seg[0] === 'local') return send(409, { code: 'LOCAL_SOURCE_IDENTITY_CHANGED' });
+      if (store !== undefined && store !== ledger.storeId) return send(409, { code: 'LOCAL_SOURCE_IDENTITY_CHANGED' });
     }
     let body;
     if (req.method === 'POST') {
       let raw = '';
       for await (const c of req) { raw += c; if (raw.length > MAX_BODY) return send(413, { code: 'REQUEST_TOO_LARGE' }); }
       try { body = raw ? JSON.parse(raw) : {}; } catch { return send(422, { code: 'INVALID_REQUEST' }); }
-      if (shuttingDown) return send(503, { code: 'HOST_STOPPING' });
-      if (body && 'requestKey' in Object(body)
-          && (typeof body.requestKey !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(body.requestKey)
-              || Object.hasOwn(Object.prototype, body.requestKey))) return send(400, { code: 'INVALID_REQUEST' });
       const key = req.headers['idempotency-key'];
       if (key !== undefined && body.requestKey !== undefined && key !== body.requestKey) {
         return send(400, { code: 'IDEMPOTENCY_KEY_MISMATCH' });
