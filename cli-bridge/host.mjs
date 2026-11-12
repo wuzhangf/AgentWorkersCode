@@ -142,7 +142,7 @@ const ENGINES = {
         if (row.message.stopReason === 'error') {
           if (!task.engineError) {
             task.engineError = true;
-            addMessage('assistant', row.message.errorMessage ?? 'provider error');
+            addMessage('assistant', row.message.errorMessage ?? 'provider error', 'FAILED');
           }
           return 'FAILED';
         }
@@ -199,11 +199,12 @@ const msgId = () => 'msg-' + randomUUID();
 
 const task = (id) => ledger.tasks[id] ?? fail('REQUEST_NOT_FOUND', 404);
 
-const addMessage = (t, role, text, requestKey) => {
+const addMessage = (t, role, text, requestKey, status) => {
   const at = now();
   t.publicMessages.push({
     messageId: msgId(), sequence: String(t.publicMessages.length + 1), revision: '0',
-    role, text, textTruncated: false, status: 'COMPLETED',
+    role, text, textTruncated: false,
+    status: status ?? (role === 'user' ? 'CONSUMED' : 'COMPLETED'),
     occurredAt: at, updatedAt: at,
     ...(requestKey ? { sourceRequestKey: requestKey } : {}),
     ...(t.nativeTurnId ? { nativeTurnId: t.nativeTurnId } : {}),
@@ -238,7 +239,7 @@ const dispatch = (t, instruction, requestKey) => {
       if (!line.trim()) continue;
       let row;
       try { row = JSON.parse(line); } catch { continue; }
-      const verdict = engine.onEvent(row, t, (role, text) => addMessage(t, role, text, requestKey));
+      const verdict = engine.onEvent(row, t, (role, text, status) => addMessage(t, role, text, requestKey, status));
       if (verdict) t.pendingVerdict = verdict;
       t.updatedAt = now();
     }
@@ -476,7 +477,7 @@ const routes = (method, seg, taskId, body, query) => {
           role: m.role,
           ...(m.text !== undefined ? { text: m.text } : {}),
           textTruncated: m.textTruncated === true,
-          status: m.status ?? 'COMPLETED',
+          status: m.status ?? (m.role === 'user' ? 'CONSUMED' : 'COMPLETED'),
           ...(m.sourceRequestKey ? { sourceRequestKey: m.sourceRequestKey } : {}),
           ...(m.nativeTurnId ? { nativeTurnId: m.nativeTurnId } : {}),
           occurredAt: m.occurredAt ?? t.createdAt,
@@ -495,7 +496,7 @@ const routes = (method, seg, taskId, body, query) => {
           firstSequence: items.length ? items[0].sequence : null,
           latestSequence: all.length ? all[all.length - 1].sequence : null,
           transcriptRevision: '0', historyMode: 'STRUCTURED_FROM_START',
-          legacy: { text: '', textTruncated: false },
+          legacy: null,
           text: t.output || all.filter((m) => m.role === 'assistant').map((m) => m.text).join('\n'),
           turns: {}, items, coverage: 'BOUNDED_PUBLIC_MESSAGES', hasMore,
           cursor: hasMore ? String(nextSeq) : null };
