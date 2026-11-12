@@ -41,12 +41,37 @@ const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED']);
 
 const fail = (code, status) => { const e = new Error(code); e.code = code; e.status = status; throw e; };
 
+/** Vendor installer locations that never land on PATH or npm's shim dir —
+ * OpenAI Codex: %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe;
+ * Anthropic Claude native: %USERPROFILE%\.local\bin\claude.exe. */
+const wellKnownCliPaths = (name) => {
+  if (process.platform !== 'win32') return [];
+  const out = [];
+  if (name === 'codex' && process.env.LOCALAPPDATA) {
+    const root = join(process.env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin');
+    try {
+      for (const e of readdirSync(root, { withFileTypes: true })) {
+        const p = join(root, e.name, 'codex.exe');
+        if (e.isDirectory() && existsSync(p)) out.push(p);
+      }
+    } catch {}
+  }
+  if (name === 'claude' && process.env.USERPROFILE) {
+    const p = join(process.env.USERPROFILE, '.local', 'bin', 'claude.exe');
+    if (existsSync(p)) out.push(p);
+  }
+  return out;
+};
+
 /** Resolve a logical CLI name to an executable command + fixed arg prefix.
  * POSIX shims and real executables run directly; npm ".cmd" shims on Windows
  * are unwrapped to `node <entry.js>` so spawn keeps a clean argv and never
  * needs a shell — instruction text cannot break out through cmd quoting. */
 const resolveBin = (name) => {
   try { execFileSync(name, ['--version'], { stdio: 'ignore' }); return { cmd: name, pre: [] }; } catch {}
+  for (const p of wellKnownCliPaths(name)) {
+    try { execFileSync(p, ['--version'], { stdio: 'ignore' }); return { cmd: p, pre: [] }; } catch {}
+  }
   if (process.platform === 'win32') {
     const pathDirs = (process.env.PATH ?? process.env.Path ?? '')
       .split(';').map((s) => s.trim()).filter(Boolean);
