@@ -388,7 +388,7 @@ const routes = (method, seg, taskId, body, query) => {
   }
   if (method === 'GET' && rest[0] === 'engines' && rest.length === 1) {
     return { ...identity(), items: [{ engineId: ENGINE, engineVersion, version: engineVersion,
-      availability: 'AVAILABLE', profileId: 'MANAGED',
+      availability: 'AVAILABLE', profileId: 'MANAGED', sourceKind: 'cli',
       capabilities: { executionModes: ['WORKSPACE_TASK'], steer: true, followUp: true,
                       stop: true, pause: false, resume: false } }] };
   }
