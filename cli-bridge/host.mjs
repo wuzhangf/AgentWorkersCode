@@ -136,11 +136,20 @@ const ENGINES = {
       if (row.type === 'session' && typeof row.id === 'string') {
         task.nativeSessionId = row.id;
       }
-      if (row.type === 'message_end' && row.message?.role === 'assistant') {
+      if ((row.type === 'message_end' || row.type === 'message') && row.message?.role === 'assistant') {
+        // Provider/auth errors end the turn with an empty assistant message —
+        // surface the reason and fail honestly instead of a blank SUCCEEDED.
+        if (row.message.stopReason === 'error') {
+          if (!task.engineError) {
+            task.engineError = true;
+            addMessage('assistant', row.message.errorMessage ?? 'provider error');
+          }
+          return 'FAILED';
+        }
         const text = (row.message.content ?? [])
           .filter((b) => b.type === 'text' && typeof b.text === 'string' && b.text.trim())
           .map((b) => b.text).join('\n');
-        if (text.trim()) addMessage('assistant', text);
+        if (text.trim() && row.type === 'message_end') addMessage('assistant', text);
       }
       if (row.type === 'agent_settled') return row.aborted ? 'FAILED' : 'SUCCEEDED';
       return null;
@@ -190,9 +199,16 @@ const msgId = () => 'msg-' + randomUUID();
 
 const task = (id) => ledger.tasks[id] ?? fail('REQUEST_NOT_FOUND', 404);
 
-const addMessage = (t, role, text) => {
-  const seq = t.publicMessages.length;
-  t.publicMessages.push({ role, text, messageId: msgId(), seq, occurredAt: now(), textComplete: true });
+const addMessage = (t, role, text, requestKey) => {
+  const at = now();
+  t.publicMessages.push({
+    messageId: msgId(), sequence: String(t.publicMessages.length + 1), revision: '0',
+    role, text, textTruncated: false, status: 'COMPLETED',
+    occurredAt: at, updatedAt: at,
+    ...(requestKey ? { sourceRequestKey: requestKey } : {}),
+    ...(t.nativeTurnId ? { nativeTurnId: t.nativeTurnId } : {}),
+    textComplete: true,
+  });
 };
 
 /** Spawn the stock CLI for one turn; stream its events into the task row. */
@@ -210,7 +226,7 @@ const dispatch = (t, instruction, requestKey) => {
   t.nativeTurnId = randomUUID();
   t.currentCommandId = requestKey;
   t.updatedAt = now();
-  addMessage(t, 'user', instruction);
+  addMessage(t, 'user', instruction, requestKey);
   let stderr = '';
   child.stderr.on('data', (d) => { stderr += d; if (stderr.length > 8192) stderr = stderr.slice(-8192); });
   let buf = '';
@@ -222,7 +238,7 @@ const dispatch = (t, instruction, requestKey) => {
       if (!line.trim()) continue;
       let row;
       try { row = JSON.parse(line); } catch { continue; }
-      const verdict = engine.onEvent(row, t, (role, text) => addMessage(t, role, text));
+      const verdict = engine.onEvent(row, t, (role, text) => addMessage(t, role, text, requestKey));
       if (verdict) t.pendingVerdict = verdict;
       t.updatedAt = now();
     }
@@ -451,16 +467,35 @@ const routes = (method, seg, taskId, body, query) => {
         return { text, coverage: 'BOUNDED_PUBLIC_MESSAGES' };
       }
       if (sub === 'messages') {
-        const all = t.publicMessages.map((m, i) => ({ ...m, seq: i }));
+        // Rows persisted by older builds lack the native-messages/1 fields —
+        // normalise at the edge so every served row validates on the phone.
+        const all = t.publicMessages.map((m, i) => ({
+          messageId: m.messageId,
+          sequence: String(m.sequence ?? i + 1),
+          revision: String(m.revision ?? '0'),
+          role: m.role,
+          ...(m.text !== undefined ? { text: m.text } : {}),
+          textTruncated: m.textTruncated === true,
+          status: m.status ?? 'COMPLETED',
+          ...(m.sourceRequestKey ? { sourceRequestKey: m.sourceRequestKey } : {}),
+          ...(m.nativeTurnId ? { nativeTurnId: m.nativeTurnId } : {}),
+          occurredAt: m.occurredAt ?? t.createdAt,
+          updatedAt: m.updatedAt ?? m.occurredAt ?? t.createdAt,
+        }));
         const num = (k) => (query.has(k) ? Number(query.get(k)) : null);
         const cursor = num('cursor'), before = num('before'), limit = num('limit') ?? 100;
-        let items = all;
-        if (cursor !== null) items = items.filter((m) => m.seq >= cursor);
-        if (before !== null) items = items.filter((m) => m.seq < before).slice(-limit);
-        else items = items.slice(0, limit);
-        const nextSeq = items.length ? items[items.length - 1].seq + 1 : null;
-        const hasMore = nextSeq !== null && all.length > nextSeq;
+        let slice = all;
+        if (cursor !== null) slice = slice.filter((m) => Number(m.sequence) >= cursor);
+        if (before !== null) slice = slice.filter((m) => Number(m.sequence) < before).slice(-limit);
+        else slice = slice.slice(0, limit);
+        const nextSeq = slice.length ? Number(slice[slice.length - 1].sequence) + 1 : null;
+        const hasMore = nextSeq !== null && all.length >= nextSeq;
+        const items = slice;
         return { messageSchemaVersion: 'native-messages/1', taskId: t.taskId, storeId: ledger.storeId,
+          firstSequence: items.length ? items[0].sequence : null,
+          latestSequence: all.length ? all[all.length - 1].sequence : null,
+          transcriptRevision: '0', historyMode: 'STRUCTURED_FROM_START',
+          legacy: { text: '', textTruncated: false },
           text: t.output || all.filter((m) => m.role === 'assistant').map((m) => m.text).join('\n'),
           turns: {}, items, coverage: 'BOUNDED_PUBLIC_MESSAGES', hasMore,
           cursor: hasMore ? String(nextSeq) : null };
