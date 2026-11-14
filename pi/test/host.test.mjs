@@ -29,8 +29,8 @@ test('project aliases cannot rebind and execution is UNCONFIGURED while ledger r
     const manifest = (await call('/worker-host/v1/manifest')).body; assert.equal(manifest.currentAvailability, 'UNCONFIGURED'); assert.equal(manifest.engine.provenance.nodeExecutableSha256, hash(readFileSync(process.execPath)));
     assert.equal(manifest.engine.provenance.sdkEntrySha256, hash(readFileSync(fileURLToPath(import.meta.resolve('@earendil-works/pi-coding-agent')))));
     assert.equal((await call('/engines')).body.items[0].available, false); assert.equal(manifest.capabilities.find(c => c.id === 'P09').availability, 'UNCONFIGURED'); assert.equal(manifest.capabilities.find(c => c.id === 'P05').availability, 'AVAILABLE');
-    const pf = (await call('/task-preflights', { engineId: 'pi', projectId: 'bound' })).body; assert.equal(pf.executableDigest, manifest.engine.engineBindingDigest);
-    const denied = await call('/tasks', { requestKey: 'unconfigured', projectId: 'bound', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction: 'must not dispatch' }); assert.equal(denied.body.code, 'MODEL_BINDING_UNCONFIGURED'); assert.equal(host.store.tasks().length, 0);
+    const pf = (await call('/task-preflights', { engineId: 'sage-pi', projectId: 'bound' })).body; assert.equal(pf.executableDigest, manifest.engine.engineBindingDigest);
+    const denied = await call('/tasks', { requestKey: 'unconfigured', projectId: 'bound', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction: 'must not dispatch' }); assert.equal(denied.body.code, 'MODEL_BINDING_UNCONFIGURED'); assert.equal(host.store.tasks().length, 0);
     process.env.MODEL_DEFAULT_MODEL = 'explicit-model'; process.env.MODEL_BASE_URL = 'https://opencode.ai/zen/go/v1'; process.env.MODEL_API_KEY = 'benign-sentinel-not-credential'; assert.equal(host.manifest().reasonCode, 'MODEL_HEADER_UNCONFIGURED');
     delete process.env.MODEL_API_KEY; assert.equal(host.manifest().reasonCode, 'MODEL_AUTH_UNAVAILABLE'); assert.equal((await call('/identity')).body.storeId, host.store.identity.storeId);
   } finally { await host.close(); for (const key of names) if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; }
@@ -86,7 +86,7 @@ test('pending questions bind original generation and selection; steer has consum
   } finally { await s.host.close(); }
 });
 test('STOP accepted before dispatch durably closes intake', async () => {
-  const s = await setup(); try { const pf = s.host.preflight({ projectId: 'demo', engineId: 'pi' }); const c = s.host.create({ requestKey: 'early', engineId: 'pi', projectId: 'demo', optionsRevision: pf.optionsRevision, instruction: 'waiting' }); const d = s.host.store.task(c.taskId); const stopped = await s.host.stop(c.taskId, { requestKey: 'early-stop', intent: 'STOP', ...guard(d) }); assert.equal(stopped.state, 'APPLIED'); await new Promise(r => setTimeout(r, 100)); assert.equal(s.host.store.task(c.taskId).state, 'CANCELLED'); assert.equal(s.host.store.task(c.taskId).pid, undefined); } finally { await s.host.close(); }
+  const s = await setup(); try { const pf = s.host.preflight({ projectId: 'demo', engineId: 'sage-pi' }); const c = s.host.create({ requestKey: 'early', engineId: 'sage-pi', projectId: 'demo', optionsRevision: pf.optionsRevision, instruction: 'waiting' }); const d = s.host.store.task(c.taskId); const stopped = await s.host.stop(c.taskId, { requestKey: 'early-stop', intent: 'STOP', ...guard(d) }); assert.equal(stopped.state, 'APPLIED'); await new Promise(r => setTimeout(r, 100)); assert.equal(s.host.store.task(c.taskId).state, 'CANCELLED'); assert.equal(s.host.store.task(c.taskId).pid, undefined); } finally { await s.host.close(); }
 });
 test('source seal requires main-task quiescence: RUNNING refuses, terminal or stop-proof seals', async () => {
   const s = await setup(); try {
@@ -139,9 +139,9 @@ test('source seal refuses a queued task: admission-quiescent is still dispatchab
   const state = mkdtempSync(join(tmpdir(), 'nwf-pi-sealq-')); const p = project();
   const host = new PiHost({ state, token, childModule: fixture, maxActiveTasks: 1 }); host.register('demo', p);
   try {
-    const pf = host.preflight({ projectId: 'demo', engineId: 'pi' });
-    const busy = host.create({ requestKey: 'q-busy', projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction: 'waiting-never' });
-    const queued = host.create({ requestKey: 'q-queued', projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction: 'hello' });
+    const pf = host.preflight({ projectId: 'demo', engineId: 'sage-pi' });
+    const busy = host.create({ requestKey: 'q-busy', projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction: 'waiting-never' });
+    const queued = host.create({ requestKey: 'q-queued', projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction: 'hello' });
     const qt = host.store.task(queued.taskId);
     assert.equal(qt.state, 'QUEUED'); assert.equal(qt.launchState, 'QUEUED'); assert.equal(qt.quiescent, true);
     await assert.rejects(() => host.sourceSeal(queued.taskId, { requestKey: 'q-seal', target: 'HANDOFF' }), /TASK_NOT_QUIESCENT/);
@@ -155,8 +155,8 @@ test('source seal refuses a queued task: admission-quiescent is still dispatchab
 });
 test('create deadlineMs is optional, bounded and keeps the exact-field whitelist', async () => {
   const s = await setup(); try {
-    const pf = (await s.call('/task-preflights', { projectId: 'demo', engineId: 'pi' })).body;
-    const mk = extra => ({ requestKey: 'dl-' + Math.random().toString(36).slice(2), projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction: 'hello', ...extra });
+    const pf = (await s.call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi' })).body;
+    const mk = extra => ({ requestKey: 'dl-' + Math.random().toString(36).slice(2), projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction: 'hello', ...extra });
     for (const deadlineMs of [59999, 86400001, 'abc', 1.5, -1, true, null, {}]) assert.equal((await s.call('/tasks', mk({ deadlineMs }))).body.code, 'INVALID_DEADLINE_MS', JSON.stringify(deadlineMs));
     assert.equal((await s.call('/tasks', mk({ bogus: 1 }))).body.code, 'UNEXPECTED_FIELD');
     assert.equal(s.host.store.tasks().length, 0, 'rejected admissions create no task');
@@ -177,13 +177,13 @@ test('host taskDeadlineMs option applies at admission and per-task deadlineMs wi
   const state = mkdtempSync(join(tmpdir(), 'nwf-pi-deadline-')); const p = project();
   const host = new PiHost({ state, token, childModule: fixture, taskDeadlineMs: 120000 }); host.register('demo', p);
   try {
-    const pf = host.preflight({ projectId: 'demo', engineId: 'pi' });
-    const c = host.create({ requestKey: 'd1', projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction: 'hello' });
+    const pf = host.preflight({ projectId: 'demo', engineId: 'sage-pi' });
+    const c = host.create({ requestKey: 'd1', projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction: 'hello' });
     const task = host.store.task(c.taskId); assert.equal(task.deadlineMs, 120000);
     assert.ok(Math.abs(Number(task.deadlineEpochMillis) - (Date.now() + 120000)) < 30000);
-    const c2 = host.create({ requestKey: 'd2', projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction: 'hello', deadlineMs: 300000 });
+    const c2 = host.create({ requestKey: 'd2', projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction: 'hello', deadlineMs: 300000 });
     assert.equal(host.store.task(c2.taskId).deadlineMs, 300000, 'task-level value wins over the host option');
-    assert.throws(() => host.create({ requestKey: 'd3', projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction: 'hello', deadlineMs: 30 }), /INVALID_DEADLINE_MS/);
+    assert.throws(() => host.create({ requestKey: 'd3', projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction: 'hello', deadlineMs: 30 }), /INVALID_DEADLINE_MS/);
     assert.equal(host.store.tasks().length, 2, 'rejected admissions create no task');
     // Let the queued setImmediate launches settle so no launch touches a closed store.
     for (const id of [c.taskId, c2.taskId]) await wait(() => { const t = host.store.task(id); return t.state === 'SUCCEEDED' && t; });
@@ -199,11 +199,11 @@ test('serve --task-deadline-ms reaches task creation over real CLI plumbing', as
   try {
     const port = await new Promise((resolve, reject) => { let buf = ''; const timer = setTimeout(() => reject(new Error('READY_TIMEOUT')), 15000); child.stdout.on('data', d => { buf += d; const m = buf.match(/127\.0\.0\.1:(\d+)/); if (m) { clearTimeout(timer); resolve(Number(m[1])); } }); child.once('exit', () => reject(new Error('SERVE_EXITED'))); });
     const call = client(port);
-    const pf = (await call('/task-preflights', { projectId: 'demo', engineId: 'pi' })).body;
-    const c = await call('/tasks', { requestKey: 'cli-1', projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction: 'hello' });
+    const pf = (await call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi' })).body;
+    const c = await call('/tasks', { requestKey: 'cli-1', projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction: 'hello' });
     assert.equal(c.status, 202);
     assert.equal((await call('/tasks/' + c.body.taskId)).body.deadlineMs, 240000, 'serve-level option stamps the task window');
-    const c2 = await call('/tasks', { requestKey: 'cli-2', projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction: 'hello', deadlineMs: 90000 });
+    const c2 = await call('/tasks', { requestKey: 'cli-2', projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction: 'hello', deadlineMs: 90000 });
     assert.equal(c2.status, 202); assert.equal((await call('/tasks/' + c2.body.taskId)).body.deadlineMs, 90000);
   } finally { child.kill('SIGTERM'); await Promise.race([new Promise(d => child.once('exit', d)), new Promise(d => setTimeout(d, 5000))]); }
 });
@@ -244,8 +244,8 @@ test('detail timing fields are honest recorded facts only', async () => {
     const fd = await wait(async () => { const x = (await s.call('/tasks/' + f.taskId)).body; return x.state === 'FAILED' && x; });
     assert.ok(Date.parse(fd.runStartedAt)); assert.ok(Date.parse(fd.endedAt)); assert.equal(fd.completedAt, undefined, 'no fabricated completion');
     // A task cancelled before any turn keeps no run start and no completion.
-    const pf = s.host.preflight({ projectId: 'demo', engineId: 'pi' });
-    const early = s.host.create({ requestKey: 'early-timing', engineId: 'pi', projectId: 'demo', optionsRevision: pf.optionsRevision, instruction: 'waiting' });
+    const pf = s.host.preflight({ projectId: 'demo', engineId: 'sage-pi' });
+    const early = s.host.create({ requestKey: 'early-timing', engineId: 'sage-pi', projectId: 'demo', optionsRevision: pf.optionsRevision, instruction: 'waiting' });
     const d0 = s.host.store.task(early.taskId);
     await s.host.stop(early.taskId, { requestKey: 'early-timing-stop', intent: 'STOP', ...guard(d0) });
     await new Promise(r => setTimeout(r, 100));

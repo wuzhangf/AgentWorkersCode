@@ -16,8 +16,8 @@ async function call(path, body) { const response = await fetch(`http://127.0.0.1
 async function wait(fn, timeout = 180000) { const deadline = Date.now() + timeout; while (Date.now() < deadline) { const v = await fn(); if (v) return v; await new Promise(r => setTimeout(r, 500)); } throw new Error('MODEL_SMOKE_TIMEOUT'); }
 const guard = d => ({ generation: d.generation, nativeSessionId: d.nativeSessionId, targetCommandId: d.currentCommandId });
 try {
-  const pf = await call('/task-preflights', { engineId: 'pi', projectId: 'smoke' });
-  const request = { requestKey: 'real-start', engineId: 'pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: 'Use write tool to create result.txt containing exactly NWF_PI_REAL_1. Then reply NWF_PI_DONE_1. Use no shell for this first step.' };
+  const pf = await call('/task-preflights', { engineId: 'sage-pi', projectId: 'smoke' });
+  const request = { requestKey: 'real-start', engineId: 'sage-pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: 'Use write tool to create result.txt containing exactly NWF_PI_REAL_1. Then reply NWF_PI_DONE_1. Use no shell for this first step.' };
   const c = await call('/tasks', request); console.log('MODEL_START ' + JSON.stringify({ taskId: c.taskId, run }));
   let d = await wait(async () => { const d = await call('/tasks/' + c.taskId); if (d.state === 'FAILED') throw new Error('MODEL_FAILED ' + d.reasonCode); return d.state === 'SUCCEEDED' && d; });
   assert.equal((await call('/tasks', request)).taskId, c.taskId);

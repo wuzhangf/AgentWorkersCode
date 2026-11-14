@@ -23,8 +23,8 @@ const workspaceFiles = rootDir => { const out = []; const walk = (dir, prefix) =
 const evidence = { schemaVersion: 'nwf-pi-w5a/1', result: 'FAIL', engine: '@earendil-works/pi-coding-agent@1.4.0', node: process.version, platform: process.platform, model: process.env.MODEL_DEFAULT_MODEL, scenarios: {} };
 try {
   // Scenario A: real task succeeds, then a context package freezes workspace bytes.
-  const pf = await call('/task-preflights', { engineId: 'pi', projectId: 'smoke' });
-  const a = await call('/tasks', { requestKey: 'w5a-main', engineId: 'pi', projectId: 'smoke', optionsRevision: pf.optionsRevision,
+  const pf = await call('/task-preflights', { engineId: 'sage-pi', projectId: 'smoke' });
+  const a = await call('/tasks', { requestKey: 'w5a-main', engineId: 'sage-pi', projectId: 'smoke', optionsRevision: pf.optionsRevision,
     instruction: 'Reply with exactly NWF_W5A_MAIN_OK and nothing else. Do not use tools and do not ask questions.' });
   console.log('W5A_A_START ' + JSON.stringify({ taskId: a.taskId, run }));
   const d0 = await wait(async () => { const d = await call('/tasks/' + a.taskId); if (d.state === 'FAILED') throw new Error('MODEL_FAILED ' + d.reasonCode); return ['SUCCEEDED', 'BUDGET_EXCEEDED'].includes(d.state) && d; });

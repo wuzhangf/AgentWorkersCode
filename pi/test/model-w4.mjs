@@ -18,8 +18,8 @@ const events = async taskId => (await call(`/tasks/${taskId}/events?limit=100`))
 const evidence = { schemaVersion: 'nwf-pi-w4a/1', result: 'FAIL', engine: '@earendil-works/pi-coding-agent@1.4.0', node: process.version, platform: process.platform, model: process.env.MODEL_DEFAULT_MODEL, scenarios: {} };
 try {
   // Scenario A: SOFT budget of 1 token -> BUDGET_EXCEEDED at a real gate boundary, then EXTEND_BUDGET resumes a new segment on the same native session.
-  const pf = await call('/task-preflights', { engineId: 'pi', projectId: 'smoke' });
-  const a = await call('/tasks', { requestKey: 'w4-budget-a', engineId: 'pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: 'Use the write tool to create a1.txt containing exactly NWF_W4_A1. Then reply NWF_W4_DONE. Do not use bash.', budget: { maxTotalTokens: 1, enforcement: 'SOFT' } });
+  const pf = await call('/task-preflights', { engineId: 'sage-pi', projectId: 'smoke' });
+  const a = await call('/tasks', { requestKey: 'w4-budget-a', engineId: 'sage-pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: 'Use the write tool to create a1.txt containing exactly NWF_W4_A1. Then reply NWF_W4_DONE. Do not use bash.', budget: { maxTotalTokens: 1, enforcement: 'SOFT' } });
   console.log('W4_A_START ' + JSON.stringify({ taskId: a.taskId, run }));
   let d = await wait(async () => { const d = await call('/tasks/' + a.taskId); if (d.state === 'FAILED') throw new Error('MODEL_FAILED ' + d.reasonCode); return d.state === 'BUDGET_EXCEEDED' && d.quiescent && d; });
   const releaseAtExceed = { method: d.stopProof?.method, usage: { ...d.usage }, ledgerSource: d.usageLedger?.[0]?.source ?? 'UNKNOWN' };
@@ -44,7 +44,7 @@ try {
   // Junctions let a willing model attempt workspace-relative writes whose real targets resolve outside (denied) or inside a declared extra root (admitted) — the host gate enforces realpaths, not the model's belief.
   const outside = join(run, 'outside-target'); mkdirSync(outside);
   const allowedDir = join(run, 'allowed-extra'); mkdirSync(allowedDir);
-  const b = await call('/tasks', { requestKey: 'w4-scope-b', engineId: 'pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: 'Use the write tool to create two files inside your workspace: escape-link/escape.txt containing exactly NWF_W4_OUTSIDE and extra-link/extra.txt containing exactly NWF_W4_EXTRA. Do not use bash. Do not ask questions.', writeScope: { extraWriteDirs: [allowedDir] } });
+  const b = await call('/tasks', { requestKey: 'w4-scope-b', engineId: 'sage-pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: 'Use the write tool to create two files inside your workspace: escape-link/escape.txt containing exactly NWF_W4_OUTSIDE and extra-link/extra.txt containing exactly NWF_W4_EXTRA. Do not use bash. Do not ask questions.', writeScope: { extraWriteDirs: [allowedDir] } });
   console.log('W4_B_START ' + JSON.stringify({ taskId: b.taskId }));
   const bws = join(run, 'state', 'workspaces', b.taskId);
   { const deadline = Date.now() + 120000; while (!existsSync(bws)) { if (Date.now() > deadline) throw new Error('MODEL_W4_TIMEOUT'); await new Promise(r => setTimeout(r, 100)); } }
@@ -60,7 +60,7 @@ try {
   evidence.scenarios.writeScopeAllowedExtra = { taskId: b.taskId, extraWriteAdmitted: true };
 
   // Scenario C: unsatisfiable environment binding fails terminally before any model call.
-  const c = await call('/tasks', { requestKey: 'w4-env-c', engineId: 'pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: 'never dispatched', environment: { requiresCommands: ['nwf-w4-definitely-missing-cmd'] } });
+  const c = await call('/tasks', { requestKey: 'w4-env-c', engineId: 'sage-pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: 'never dispatched', environment: { requiresCommands: ['nwf-w4-definitely-missing-cmd'] } });
   d = await wait(async () => { const d = await call('/tasks/' + c.taskId); return d.state === 'BINDING_UNAVAILABLE' && d; });
   assert.equal(d.quiescent, true); assert.equal(d.pid, undefined); assert.equal(d.usage.input, 0);
   assert.equal(d.bindingUnavailable.missing[0].kind, 'command');
@@ -68,8 +68,8 @@ try {
 
   // Scenario D: cap 1 queues the second create; STOP releases the slot and the queue dispatches once.
   await host.close(); host = new PiHost({ state: join(run, 'state'), token: ownerToken, maxActiveTasks: 1 }); port = await host.listen();
-  const d1 = await call('/tasks', { requestKey: 'w4-queue-1', engineId: 'pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: 'Use the write tool to create queue1.txt containing exactly NWF_W4_Q1. Then reply NWF_W4_DONE. Do not ask questions. Use only the write tool; do not use bash or spawn processes.' });
-  const d2 = await call('/tasks', { requestKey: 'w4-queue-2', engineId: 'pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: 'Use the write tool to create queue2.txt containing exactly NWF_W4_Q2. Then reply NWF_W4_DONE. Do not ask questions. Use only the write tool; do not use bash or spawn processes.' });
+  const d1 = await call('/tasks', { requestKey: 'w4-queue-1', engineId: 'sage-pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: 'Use the write tool to create queue1.txt containing exactly NWF_W4_Q1. Then reply NWF_W4_DONE. Do not ask questions. Use only the write tool; do not use bash or spawn processes.' });
+  const d2 = await call('/tasks', { requestKey: 'w4-queue-2', engineId: 'sage-pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: 'Use the write tool to create queue2.txt containing exactly NWF_W4_Q2. Then reply NWF_W4_DONE. Do not ask questions. Use only the write tool; do not use bash or spawn processes.' });
   const q2 = await wait(async () => { const d = await call('/tasks/' + d2.taskId); return d.state === 'QUEUED' && d; });
   assert.equal(q2.queue.position, 1);
   const firstReady = await wait(async () => { const d = await call('/tasks/' + d1.taskId); if (d.state === 'FAILED') throw new Error('QUEUE_FIRST_FAILED ' + d.reasonCode); return d.state === 'SUCCEEDED' && d; });

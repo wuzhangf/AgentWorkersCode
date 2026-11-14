@@ -26,7 +26,7 @@ const fixture = fileURLToPath(new URL('./fixture-child.mjs', import.meta.url));
 async function wait(fn, timeout = 12000) { const deadline = Date.now() + timeout; while (Date.now() < deadline) { const v = await fn(); if (v) return v; await new Promise(r => setTimeout(r, 25)); } throw new Error('WAIT_TIMEOUT'); }
 async function setup(extra = {}) { const state = mkdtempSync(join(tmpdir(), 'nwf-pi-f19-state-')); const p = project(); const host = new PiHost({ state, token, childModule: fixture, ...extra }); host.register('demo', p); const port = await host.listen(); return { host, state, project: p, call: client(port) }; }
 function client(port) { return async (path, body, headers = {}, method) => { const response = await fetch(`http://127.0.0.1:${port}${path.startsWith('/worker-host') ? '' : '/local/v1'}${path}`, { method: method ?? (body ? 'POST' : 'GET'), headers: { Authorization: 'Bearer ' + token, ...(body ? { 'Content-Type': 'application/json', ...(body.requestKey ? { 'Idempotency-Key': body.requestKey } : {}) } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined }); return { status: response.status, body: await response.json() }; }; }
-async function create(call, instruction = 'hello', extra = {}) { const pf = (await call('/task-preflights', { projectId: 'demo', engineId: 'pi', ...(extra.policyPresetId ? { policyPresetId: extra.policyPresetId } : {}) })).body; const body = { requestKey: 'create-' + Math.random().toString(36).slice(2), projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction, ...extra }; const result = await call('/tasks', body); return { request: body, taskId: result.body.taskId, receipt: result.body, status: result.status, code: result.body.code }; }
+async function create(call, instruction = 'hello', extra = {}) { const pf = (await call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi', ...(extra.policyPresetId ? { policyPresetId: extra.policyPresetId } : {}) })).body; const body = { requestKey: 'create-' + Math.random().toString(36).slice(2), projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction, ...extra }; const result = await call('/tasks', body); return { request: body, taskId: result.body.taskId, receipt: result.body, status: result.status, code: result.body.code }; }
 const guard = t => ({ generation: t.generation, nativeSessionId: t.nativeSessionId, targetCommandId: t.currentCommandId });
 const succeeded = async (call, taskId) => wait(async () => { const d = (await call('/tasks/' + taskId)).body; return d.state === 'SUCCEEDED' && d; });
 
@@ -36,20 +36,20 @@ test('L0-PI-03 policy preset boundary: unknown refuses, narrowing exact, frozen 
     //    refuse identically at preflight and at create — and a refused create
     //    leaves no task row behind.
     for (const bad of ['bogus', 'read_only', 'READ-ONLY', '', 42, { id: 'read-only' }, ['read-only']]) {
-      const r = await s.call('/task-preflights', { projectId: 'demo', engineId: 'pi', policyPresetId: bad });
+      const r = await s.call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi', policyPresetId: bad });
       assert.equal(r.body.code, 'POLICY_PRESET_UNKNOWN', 'preflight preset ' + JSON.stringify(bad));
       assert.equal(r.status, 409);
     }
-    const pf0 = (await s.call('/task-preflights', { projectId: 'demo', engineId: 'pi' })).body;
+    const pf0 = (await s.call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi' })).body;
     assert.equal(pf0.policyPreset, null, 'omitted preset is legal and binds nothing');
-    const denied = await s.call('/tasks', { requestKey: 'f19-bad-preset', projectId: 'demo', engineId: 'pi', optionsRevision: pf0.optionsRevision, instruction: 'hello', policyPresetId: 'bogus' });
+    const denied = await s.call('/tasks', { requestKey: 'f19-bad-preset', projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf0.optionsRevision, instruction: 'hello', policyPresetId: 'bogus' });
     assert.equal(denied.status, 409); assert.equal(denied.body.code, 'POLICY_PRESET_UNKNOWN');
     assert.equal(s.host.store.tasks().length, 0, 'a refused preset creates no task row');
 
     // 2) 'read-only' narrows to a strict subset of the engine toolset and the
     //    frozen task row carries the declared set verbatim — the effective
     //    launch set is the preset declaration, never a widened union.
-    const pf = (await s.call('/task-preflights', { projectId: 'demo', engineId: 'pi', policyPresetId: 'read-only' })).body;
+    const pf = (await s.call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi', policyPresetId: 'read-only' })).body;
     assert.equal(pf.policyPreset.presetId, 'read-only');
     assert.equal(pf.policyPreset.effectiveRange, 'NEW_TASKS');
     const declared = pf.policyPreset.frozenParameters.toolAllowlist;

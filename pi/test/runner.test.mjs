@@ -33,7 +33,7 @@ async function model(steps) {
   await new Promise(done => api.listen(0, '127.0.0.1', done));
   return { api, tools, calls: () => calls, env: { MODEL_API_KEY: 'benign-runner-fixture-sentinel', MODEL_DEFAULT_MODEL: 'fixture-model', MODEL_BASE_URL: `http://127.0.0.1:${api.address().port}/v1` }, close: () => new Promise(done => api.close(done)) };
 }
-function create(host, instruction = 'Run the fixture') { const pf = host.preflight({ engineId: 'pi', projectId: 'demo' }); const body = { requestKey: 'runner-create', projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction }; return { body, receipt: host.create(body) }; }
+function create(host, instruction = 'Run the fixture') { const pf = host.preflight({ engineId: 'sage-pi', projectId: 'demo' }); const body = { requestKey: 'runner-create', projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction }; return { body, receipt: host.create(body) }; }
 async function withEnv(env, fn) { const saved = Object.fromEntries(Object.keys(env).map(k => [k, process.env[k]])); Object.assign(process.env, env); try { return await fn(); } finally { for (const k of Object.keys(env)) if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } }
 
 test('test qualification requires nonzero observed tests independently of command success', () => {
@@ -121,7 +121,7 @@ test('macOS Runner owner EOF after host SIGKILL stops heartbeat and original tas
   try {
     const port = await new Promise((done, reject) => { child.stdout.once('data', data => done(Number(String(data).trim()))); child.once('error', reject); });
     const call = async (path, body) => { const res = await fetch(`http://127.0.0.1:${port}/local/v1${path}`, { method: body ? 'POST' : 'GET', headers: { Authorization: 'Bearer ' + token, ...(body ? { 'Content-Type': 'application/json', 'Idempotency-Key': body.requestKey ?? '' } : {}) }, body: body ? JSON.stringify(body) : undefined }); assert(res.ok); return res.json(); };
-    const pf = await call('/task-preflights', { projectId: 'demo', engineId: 'pi' }), body = { requestKey: 'crash-runner-original', projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction: 'Run heartbeat' }, c = await call('/tasks', body);
+    const pf = await call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi' }), body = { requestKey: 'crash-runner-original', projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction: 'Run heartbeat' }, c = await call('/tasks', body);
     const t = await wait(async () => { const t = await call('/tasks/' + c.taskId); return existsSync(join(t.workspace, 'heartbeat.txt')) && t; });
     const exited = new Promise(done => child.once('exit', done)); child.kill('SIGKILL'); await exited;
     await new Promise(done => setTimeout(done, 500)); const size = readFileSync(join(t.workspace, 'heartbeat.txt')).length; await new Promise(done => setTimeout(done, 200)); assert.equal(readFileSync(join(t.workspace, 'heartbeat.txt')).length, size);

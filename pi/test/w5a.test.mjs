@@ -14,7 +14,7 @@ const fixture = fileURLToPath(new URL('./fixture-child.mjs', import.meta.url));
 async function wait(fn, timeout = 12000) { const deadline = Date.now() + timeout; while (Date.now() < deadline) { const v = await fn(); if (v) return v; await new Promise(r => setTimeout(r, 25)); } throw new Error('WAIT_TIMEOUT'); }
 async function setup(extra = {}) { const state = mkdtempSync(join(tmpdir(), 'nwf-pi-w5a-state-')); const p = project(); const host = new PiHost({ state, token, childModule: fixture, ...extra }); host.register('demo', p); const port = await host.listen(); return { host, state, project: p, call: client(port) }; }
 function client(port) { return async (path, body, headers = {}, method) => { const response = await fetch(`http://127.0.0.1:${port}${path.startsWith('/worker-host') ? '' : '/local/v1'}${path}`, { method: method ?? (body ? 'POST' : 'GET'), headers: { Authorization: 'Bearer ' + token, ...(body ? { 'Content-Type': 'application/json', ...(body.requestKey ? { 'Idempotency-Key': body.requestKey } : {}) } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined }); return { status: response.status, body: await response.json() }; }; }
-async function create(call, instruction = 'hello', extra = {}) { const pf = (await call('/task-preflights', { projectId: 'demo', engineId: 'pi' })).body; const body = { requestKey: 'create-' + Math.random().toString(36).slice(2), projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction, ...extra }; const result = await call('/tasks', body); return { request: body, taskId: result.body.taskId, receipt: result.body, status: result.status, code: result.body.code }; }
+async function create(call, instruction = 'hello', extra = {}) { const pf = (await call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi' })).body; const body = { requestKey: 'create-' + Math.random().toString(36).slice(2), projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction, ...extra }; const result = await call('/tasks', body); return { request: body, taskId: result.body.taskId, receipt: result.body, status: result.status, code: result.body.code }; }
 const guard = t => ({ generation: t.generation, nativeSessionId: t.nativeSessionId, targetCommandId: t.currentCommandId });
 const events = async (call, taskId) => (await call(`/tasks/${taskId}/events?limit=100`)).body.items;
 const succeeded = async (call, taskId) => wait(async () => { const d = (await call('/tasks/' + taskId)).body; return d.state === 'SUCCEEDED' && d; });
@@ -181,7 +181,7 @@ test('transitions: quiesce at boundary, new epoch on same session, stale epoch f
     const list = (await s.call(`/tasks/${c.taskId}/transitions`)).body.items;
     assert.equal(list.length, 1); assert.equal(list[0].fromEpoch, '1'); assert.equal(list[0].toEpoch, '2');
     assert.equal(list[0].fromSegment, d0.segmentId); assert.equal(list[0].toSegment, d.segmentId);
-    assert.equal(list[0].compatibility.engineId, 'pi'); assert.equal(list[0].compatibility.sameEngine, true);
+    assert.equal(list[0].compatibility.engineId, 'sage-pi'); assert.equal(list[0].compatibility.sameEngine, true);
     const evs = await events(s.call, c.taskId);
     assert.ok(evs.some(e => e.kind === 'transition.quiesced' && e.method === 'BOUNDARY_CHECKPOINT'));
     assert.ok(evs.some(e => e.kind === 'transition.admitted' && e.toEpoch === '2'));
@@ -197,7 +197,7 @@ test('transitions: quiesce at boundary, new epoch on same session, stale epoch f
       [{ engineId: 'codex' }, 'INCOMPATIBLE_TRANSITION'],
       [{ model: 'some-other-model' }, 'INCOMPATIBLE_TRANSITION'],
       [{ toolAllowlist: ['no_such_tool'] }, 'INCOMPATIBLE_TRANSITION'],
-      [{ engineId: 'pi', model: 'fixture-model', toolAllowlist: ['write'] }, 202],
+      [{ engineId: 'sage-pi', model: 'fixture-model', toolAllowlist: ['write'] }, 202],
       [undefined, 202],
     ]) {
       const key = 'tr-' + Math.random().toString(36).slice(2);

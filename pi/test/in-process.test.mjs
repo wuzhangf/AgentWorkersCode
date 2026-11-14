@@ -20,7 +20,7 @@ function fixture() {
   return { root, project, state: join(root, 'state') };
 }
 async function wait(fn) { for (let n = 0; n < 400; n++) { const result = await fn(); if (result) return result; await new Promise(done => setTimeout(done, 25)); } throw new Error('WAIT_TIMEOUT'); }
-function create(host, key, instruction) { const p = host.preflight({ engineId: 'pi', projectId: 'demo' }); return host.create({ requestKey: key, projectId: 'demo', engineId: 'pi', optionsRevision: p.optionsRevision, instruction }); }
+function create(host, key, instruction) { const p = host.preflight({ engineId: 'sage-pi', projectId: 'demo' }); return host.create({ requestKey: key, projectId: 'demo', engineId: 'sage-pi', optionsRevision: p.optionsRevision, instruction }); }
 
 test('unknown execution profile fails explicitly before opening state', () => {
   assert.throws(() => new PiHost({ state: '/unused', token, executionProfile: 'implicit-fallback' }), /EXECUTION_PROFILE_UNSUPPORTED/);

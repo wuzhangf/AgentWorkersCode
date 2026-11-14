@@ -19,8 +19,8 @@ const files = (a, b, c) => `Use the write tool to create ${a} containing exactly
 const evidence = { schemaVersion: 'nwf-pi-w3/1', result: 'FAIL', engine: '@earendil-works/pi-coding-agent@1.4.0', node: process.version, platform: process.platform, model: process.env.MODEL_DEFAULT_MODEL, semantics: { pause: 'BOUNDARY_CHECKPOINT', resumeInPlace: 'BOUNDARY_CHECKPOINT_RELEASE', resumeAfterRestart: 'INTERRUPT_CONTINUATION' }, scenarios: {} };
 try {
   // Scenario A: PAUSE mid-run against the live gate, 15s quiet dwell, in-place RESUME.
-  const pf = await call('/task-preflights', { engineId: 'pi', projectId: 'smoke' });
-  const created = await call('/tasks', { requestKey: 'w3-pause-a', engineId: 'pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: files('a1.txt', 'a2.txt', 'a3.txt') });
+  const pf = await call('/task-preflights', { engineId: 'sage-pi', projectId: 'smoke' });
+  const created = await call('/tasks', { requestKey: 'w3-pause-a', engineId: 'sage-pi', projectId: 'smoke', optionsRevision: pf.optionsRevision, instruction: files('a1.txt', 'a2.txt', 'a3.txt') });
   const taskA = created.taskId; console.log('W3_A_START ' + JSON.stringify({ taskId: taskA, run }));
   let d = await wait(async () => { const d = await call('/tasks/' + taskA); if (d.state === 'FAILED') throw new Error('MODEL_FAILED ' + d.reasonCode); return d.state === 'RUNNING' && (await events(taskA)).some(e => e.kind === 'TOOL_START') && d; });
   const paused = await call(`/tasks/${taskA}/commands`, { requestKey: 'w3-pause-a-cmd', intent: 'PAUSE', ...guard(d) });
@@ -45,8 +45,8 @@ try {
   evidence.scenarios.pauseResumeInPlace = { taskId: taskA, boundary: d.checkpointManifest?.boundary ?? 'sealed', pausedEventSeq: seqAtPause, dwellSeconds: 15, dwellNewEvents: 0, resumeVia: resumed.resumeVia, sameNativeSession: true, newSegment: true, artifacts: rowsA };
 
   // Scenario B: PAUSE then host close; new host RESUMEs via session reopen (INTERRUPT_CONTINUATION).
-  const pfB = await call('/task-preflights', { engineId: 'pi', projectId: 'smoke' });
-  const createdB = await call('/tasks', { requestKey: 'w3-pause-b', engineId: 'pi', projectId: 'smoke', optionsRevision: pfB.optionsRevision, instruction: files('b1.txt', 'b2.txt', 'b3.txt') });
+  const pfB = await call('/task-preflights', { engineId: 'sage-pi', projectId: 'smoke' });
+  const createdB = await call('/tasks', { requestKey: 'w3-pause-b', engineId: 'sage-pi', projectId: 'smoke', optionsRevision: pfB.optionsRevision, instruction: files('b1.txt', 'b2.txt', 'b3.txt') });
   const taskB = createdB.taskId; console.log('W3_B_START ' + JSON.stringify({ taskId: taskB }));
   d = await wait(async () => { const d = await call('/tasks/' + taskB); if (d.state === 'FAILED') throw new Error('MODEL_FAILED ' + d.reasonCode); return d.state === 'RUNNING' && (await events(taskB)).some(e => e.kind === 'TOOL_START') && d; });
   const pausedB = await call(`/tasks/${taskB}/commands`, { requestKey: 'w3-pause-b-cmd', intent: 'PAUSE', ...guard(d) });

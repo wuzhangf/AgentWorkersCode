@@ -15,7 +15,7 @@ async function wait(fn, timeout = 12000) { const deadline = Date.now() + timeout
 async function setup(extra = {}) { const state = mkdtempSync(join(tmpdir(), 'nwf-pi-w5c-state-')); const p = project(); const host = new PiHost({ state, token, childModule: fixture, ...extra }); host.register('demo', p); const port = await host.listen(); return { host, state, project: p, call: client(port), put: putter(port) }; }
 function client(port) { return async (path, body, headers = {}, method) => { const response = await fetch(`http://127.0.0.1:${port}${path.startsWith('/worker-host') ? '' : '/local/v1'}${path}`, { method: method ?? (body ? 'POST' : 'GET'), headers: { Authorization: 'Bearer ' + token, ...(body ? { 'Content-Type': 'application/json', ...(body.requestKey ? { 'Idempotency-Key': body.requestKey } : {}) } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined }); return { status: response.status, body: await response.json() }; }; }
 function putter(port) { return async (path, bytes, sha) => { const response = await fetch(`http://127.0.0.1:${port}/local/v1${path}`, { method: 'PUT', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/octet-stream', 'x-chunk-sha256': sha }, body: bytes }); return { status: response.status, body: await response.json() }; }; }
-async function create(call, instruction = 'hello', extra = {}) { const pf = (await call('/task-preflights', { projectId: 'demo', engineId: 'pi', ...(extra.policyPresetId ? { policyPresetId: extra.policyPresetId } : {}) })).body; const body = { requestKey: 'create-' + Math.random().toString(36).slice(2), projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction, ...extra }; const result = await call('/tasks', body); return { request: body, taskId: result.body.taskId, receipt: result.body, status: result.status, code: result.body.code }; }
+async function create(call, instruction = 'hello', extra = {}) { const pf = (await call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi', ...(extra.policyPresetId ? { policyPresetId: extra.policyPresetId } : {}) })).body; const body = { requestKey: 'create-' + Math.random().toString(36).slice(2), projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction, ...extra }; const result = await call('/tasks', body); return { request: body, taskId: result.body.taskId, receipt: result.body, status: result.status, code: result.body.code }; }
 const guard = t => ({ generation: t.generation, nativeSessionId: t.nativeSessionId, targetCommandId: t.currentCommandId });
 const events = async (call, taskId) => (await call(`/tasks/${taskId}/events?limit=100`)).body.items;
 const succeeded = async (call, taskId) => wait(async () => { const d = (await call('/tasks/' + taskId)).body; return d.state === 'SUCCEEDED' && d; });
@@ -46,13 +46,13 @@ test('source capabilities + execution policy projection and policy presets', asy
     assert.deepEqual(engines.executionPolicy.policyPresets, ['standard', 'read-only']);
     assert.equal(engines.executionPolicy.frozen, false);
     // preset selection freezes into the task; unknown presets refuse
-    const pf = (await s.call('/task-preflights', { projectId: 'demo', engineId: 'pi', policyPresetId: 'read-only' })).body;
+    const pf = (await s.call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi', policyPresetId: 'read-only' })).body;
     assert.equal(pf.policyPreset.presetId, 'read-only'); assert.equal(pf.policyPreset.effectiveRange, 'NEW_TASKS');
     const c2 = await create(s.call, 'hello', { policyPresetId: 'read-only' });
     const d2 = await succeeded(s.call, c2.taskId);
     assert.equal(d2.executionPolicy.policyPreset.presetId, 'read-only');
     assert.ok(Array.isArray(d2.executionPolicy.toolAllowlist) && d2.executionPolicy.toolAllowlist.every(t => !['write', 'edit', 'bash'].includes(t)), 'read-only preset narrows tools');
-    assert.equal((await s.call('/task-preflights', { projectId: 'demo', engineId: 'pi', policyPresetId: 'bogus' })).body.code, 'POLICY_PRESET_UNKNOWN');
+    assert.equal((await s.call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi', policyPresetId: 'bogus' })).body.code, 'POLICY_PRESET_UNKNOWN');
     for (const pid of ['P24', 'P25', 'P26', 'P27', 'P29', 'P30']) {
       const row = (await s.call('/worker-host/v1/capabilities')).body.items.find(i => i.id === pid);
       assert.ok(row, pid + ' row'); assert.equal(row.implementation, 'IMPLEMENTED');

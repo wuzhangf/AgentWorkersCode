@@ -26,8 +26,8 @@ const evidence = { schemaVersion: 'nwf-pi-w4b/1', result: 'FAIL', engine: '@eare
 try {
   // Scenario A: declared MCP server + skill + extension bind into the managed session;
   // the model calls the fixture MCP tool and the tool execution is durable evidence.
-  const pf = await call('/task-preflights', { engineId: 'pi', projectId: 'smoke' });
-  const a = await call('/tasks', { requestKey: 'w4b-mcp-a', engineId: 'pi', projectId: 'smoke', optionsRevision: pf.optionsRevision,
+  const pf = await call('/task-preflights', { engineId: 'sage-pi', projectId: 'smoke' });
+  const a = await call('/tasks', { requestKey: 'w4b-mcp-a', engineId: 'sage-pi', projectId: 'smoke', optionsRevision: pf.optionsRevision,
     instruction: 'Call the tool named mcp__fixsrv__workspace_marker once, then reply with exactly the marker text it returns followed by NWF_W4B_DONE. Do not ask questions.',
     mcpServers: [{ id: 'fixsrv', command: process.execPath, args: [mcpFixture], env: { FIXTURE_FLAG: 'literal' } }],
     skills: [{ name: 'w4b-skill', sourcePath: skillSrc }],
