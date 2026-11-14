@@ -257,11 +257,15 @@ const addMessage = (t, role, text, requestKey, status) => {
 };
 
 /** Spawn the stock CLI for one turn; stream its events into the task row. */
+// The bridge's own bearer must never reach the spawned CLI — children get the
+// user's normal environment minus worker credentials.
+const CHILD_ENV = { ...process.env };
+delete CHILD_ENV.WORKER_LOCAL_TOKEN;
 const dispatch = (t, instruction, requestKey) => {
   const argv = engine.argv(instruction, t.nativeSessionId, t);
   const child = spawn(resolved.cmd, [...resolved.pre, ...argv], {
     cwd: PROJECT_DIR,
-    env: { ...process.env },
+    env: CHILD_ENV,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   live.set(t.taskId, child);
