@@ -167,6 +167,9 @@ struct TermLive {
 const TERMINAL_RING: usize = 128 * 1024;
 const TERMINAL_MAX_PER_TASK: i64 = 8;
 const TERMINAL_OUTPUT_MAX: i64 = 64 * 1024;
+/// Our xpcode-pinned Codex variant reports sage-codex; a customer's stock
+/// codex install reports codex.
+const ENGINE_ID: &str = "sage-codex";
 pub(crate) type Shared = Arc<Host>;
 pub(crate) fn hash(bytes: impl AsRef<[u8]>) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -834,7 +837,7 @@ fn load_policy_presets(path: &Path, project_id: &str) -> Result<Vec<Value>> {
         {
             bail!("POLICY_PRESET_INVALID")
         }
-        if p["engine"].as_str().unwrap_or("codex") != "codex" {
+        if p["engine"].as_str().unwrap_or(ENGINE_ID) != ENGINE_ID {
             bail!("POLICY_PRESET_INVALID")
         }
         if p["projectScope"].as_str() != Some("*")
@@ -916,7 +919,7 @@ fn policy_options(h: &Host) -> Value {
             json!({
                 "presetId": p["presetId"],
                 "revision": p["revision"],
-                "engine": "codex",
+                "engine": ENGINE_ID,
                 "projectScope": p["projectScope"],
                 "effectiveRange": p["effectiveRange"],
                 "escalationNote": p["escalationNote"],
@@ -1308,7 +1311,7 @@ async fn seal_route(
             "segmentId": t["segmentId"],
             "baseCommit": t["baseCommit"],
             "taskState": t["state"],
-            "sealedBy": "codex",
+            "sealedBy": ENGINE_ID,
             "observedAt": store::now(),
         },
         "affectedChildren": affected,
@@ -1950,7 +1953,7 @@ fn preflight(h: &Host, b: &Value) -> Result<Value> {
     if string(b, "projectId")? != h.registry.project_id {
         bail!("PROJECT_NOT_REGISTERED")
     }
-    if string(b, "engineId")? != "codex" {
+    if string(b, "engineId")? != ENGINE_ID {
         bail!("ENGINE_NOT_REGISTERED")
     }
     // C7: the requested preset is part of the reviewed surface — it lands in
@@ -1958,7 +1961,7 @@ fn preflight(h: &Host, b: &Value) -> Result<Value> {
     let preset = policy_preset(h, b)?;
     verify(&h.root, &h.registry)?;
     let p = project(&h.registry)?;
-    let mut result = json!({"projectId":h.registry.project_id,"engineId":"codex","engineVersion":h.registry.version,"executableDigest":h.registry.executable_digest,"profileId":"MANAGED","profileHome":h.root.join("profile"),"loadsUserExtensions":false,"headRevision":p["headRevision"],"hasUncommittedChanges":p["hasUncommittedChanges"],"workingCopyPolicy":"COMMITTED_BASE_ONLY"});
+    let mut result = json!({"projectId":h.registry.project_id,"engineId":ENGINE_ID,"engineVersion":h.registry.version,"executableDigest":h.registry.executable_digest,"profileId":"MANAGED","profileHome":h.root.join("profile"),"loadsUserExtensions":false,"headRevision":p["headRevision"],"hasUncommittedChanges":p["hasUncommittedChanges"],"workingCopyPolicy":"COMMITTED_BASE_ONLY"});
     result["nativeToolProfile"] = json!(h.registry.tool_profile);
     // C7/C0: the published managed presets and the host-level mobile-controls
     // actions ride the deterministic preflight payload (they participate in
@@ -2122,7 +2125,7 @@ async fn handle(h: Shared, request: Request) -> Result<(u16, Value)> {
             ("GET", "manifest") => {
                 let mut v = identity(&h);
                 v["schemaVersion"] = json!("worker-host/1");
-                v["engine"] = json!({"id":"codex","version":h.registry.version});
+                v["engine"] = json!({"id":ENGINE_ID,"version":h.registry.version});
                 v["contracts"] = json!(["worker-host/1", "worker-local/1"]);
                 v["capabilities"] = json!(capabilities(&h));
                 v["supportedPaths"] = json!([
@@ -2227,7 +2230,7 @@ async fn handle(h: Shared, request: Request) -> Result<(u16, Value)> {
             ("GET", "engines") => {
                 return Ok((
                     200,
-                    json!({"schemaVersion":"worker-local/1","storeId":identity(&h)["storeId"],"items":[{"engineId":"codex","engineVersion":h.registry.version,"version":h.registry.version,"profileId":"MANAGED","pause":false,"resume":false,"stop":true,"steer":true,"followUp":true,"capabilities":{"pause":false,"resume":false,"stop":true,"steer":true,"followUp":true,"stoppedSessionFollowUp":true,"environmentBinding":true,"budget":true,"writeScope":true,"audit":true,"diagnostics":true,"terminals":{"pty":true,"resize":false,"maxPerTask":TERMINAL_MAX_PER_TASK,"outputBuffer":TERMINAL_OUTPUT_MAX,"signals":["terminate"]},"mcpServers":{"transport":"stdio","exposure":"direct","maxServers":8},"skills":{"managedProfileOnly":true,"contentBinding":"sha256"},"hooks":{"managedProfileOnly":true,"commands":true,"pretrusted":true},"contextPackages":true,"auxiliarySessions":true,"transitions":{"sameEngine":true,"crossEngine":false},"collaborations":{"dag":true,"isolatedCheckout":true,"maxChildren":COLLAB_MAX_CHILDREN,"maxActivePerTask":COLLAB_MAX_PER_TASK,"preflight":true,"childMessages":true},"adoptions":{"conflictCheck":true,"partial":true,"modes":["ALL","FILES"],"preview":true},"materialUploads":{"roles":["IMAGE","REFERENCE_TEXT"],"mediaTypes":crate::materials::MEDIA_TYPES,"chunkBytes":crate::materials::CHUNK_MAX},"sourceSeals":true,"handoffExport":true,"policyPresets":!h.registry.policy_presets.is_empty()},"executionPolicy":policy_options(&h)}]}),
+                    json!({"schemaVersion":"worker-local/1","storeId":identity(&h)["storeId"],"items":[{"engineId":ENGINE_ID,"engineVersion":h.registry.version,"version":h.registry.version,"profileId":"MANAGED","pause":false,"resume":false,"stop":true,"steer":true,"followUp":true,"capabilities":{"pause":false,"resume":false,"stop":true,"steer":true,"followUp":true,"stoppedSessionFollowUp":true,"environmentBinding":true,"budget":true,"writeScope":true,"audit":true,"diagnostics":true,"terminals":{"pty":true,"resize":false,"maxPerTask":TERMINAL_MAX_PER_TASK,"outputBuffer":TERMINAL_OUTPUT_MAX,"signals":["terminate"]},"mcpServers":{"transport":"stdio","exposure":"direct","maxServers":8},"skills":{"managedProfileOnly":true,"contentBinding":"sha256"},"hooks":{"managedProfileOnly":true,"commands":true,"pretrusted":true},"contextPackages":true,"auxiliarySessions":true,"transitions":{"sameEngine":true,"crossEngine":false},"collaborations":{"dag":true,"isolatedCheckout":true,"maxChildren":COLLAB_MAX_CHILDREN,"maxActivePerTask":COLLAB_MAX_PER_TASK,"preflight":true,"childMessages":true},"adoptions":{"conflictCheck":true,"partial":true,"modes":["ALL","FILES"],"preview":true},"materialUploads":{"roles":["IMAGE","REFERENCE_TEXT"],"mediaTypes":crate::materials::MEDIA_TYPES,"chunkBytes":crate::materials::CHUNK_MAX},"sourceSeals":true,"handoffExport":true,"policyPresets":!h.registry.policy_presets.is_empty()},"executionPolicy":policy_options(&h)}]}),
                 ));
             }
             ("GET", "projects") => return Ok((200, json!({"items":[project(&h.registry)?]}))),
@@ -3255,7 +3258,7 @@ async fn create(h: Shared, b: &Value) -> Result<(u16, Value)> {
     require_model_configuration(&h)?;
     let task = format!("native-{}", store::id());
     let workspace = h.root.join("workspaces").join(&task);
-    let mut t = json!({"taskId":task,"requestKey":key,"engineId":"codex","engineVersion":h.registry.version,"storeId":identity(&h)["storeId"],"projectId":h.registry.project_id,"state":"PREPARING","launchState":"PREPARING","generation":store::id(),"ownerBootId":h.boot,"currentCommandId":key,"runId":format!("run-{}",store::id()),"segmentId":format!("segment-{}",store::id()),"stateVersion":"1","ownerEpoch":"1","workspace":workspace,"baseCommit":checked["headRevision"],"configuredModel":h.registry.model,"configuredProvider":"nwf","profileId":"MANAGED","createdAt":store::now(),"quiescent":false,"turns":{},"inputRequests":{},"output":"","publicItemIds":[],"capabilities":{"stop":true,"steer":true,"followUp":true,"pause":false,"resume":false}});
+    let mut t = json!({"taskId":task,"requestKey":key,"engineId":ENGINE_ID,"engineVersion":h.registry.version,"storeId":identity(&h)["storeId"],"projectId":h.registry.project_id,"state":"PREPARING","launchState":"PREPARING","generation":store::id(),"ownerBootId":h.boot,"currentCommandId":key,"runId":format!("run-{}",store::id()),"segmentId":format!("segment-{}",store::id()),"stateVersion":"1","ownerEpoch":"1","workspace":workspace,"baseCommit":checked["headRevision"],"configuredModel":h.registry.model,"configuredProvider":"nwf","profileId":"MANAGED","createdAt":store::now(),"quiescent":false,"turns":{},"inputRequests":{},"output":"","publicItemIds":[],"capabilities":{"stop":true,"steer":true,"followUp":true,"pause":false,"resume":false}});
     t["nativeToolProfile"] = json!(h.registry.tool_profile);
     if let Some(binding) = crate::mac_tools::binding(&key)? {
         if h.registry.tool_profile != "macos-runner-v1" { bail!("MAC_TOOL_PROFILE_REQUIRED") }
@@ -6937,7 +6940,7 @@ async fn collab_preflight(h: Shared, task: &str, t: &Value, b: &Value) -> Result
         "sourceBindings": {
             "taskId": t["taskId"],
             "projectId": t["projectId"],
-            "engineId": "codex",
+            "engineId": ENGINE_ID,
             "engineVersion": h.registry.version,
             "generation": t["generation"],
             "segmentId": t["segmentId"],
@@ -8764,14 +8767,14 @@ async fn aux_deliver(h: Shared, task: &str, aux_id: &str, b: &Value) -> Result<(
 // of silently ignored.
 fn transition_compat(h: &Host, b: &Value) -> Result<Value> {
     if b["targetProfile"].is_null() {
-        return Ok(json!({"engineId":"codex","model":h.registry.model,"toolAllowlist":null,"sameEngine":true,"crossEngine":false,"sameNativeSession":true}));
+        return Ok(json!({"engineId":ENGINE_ID,"model":h.registry.model,"toolAllowlist":null,"sameEngine":true,"crossEngine":false,"sameNativeSession":true}));
     }
     let p = &b["targetProfile"];
     if !p.is_object() {
         bail!("INVALID_TARGET_PROFILE")
     }
     exact(p, &["engineId", "model", "toolAllowlist"])?;
-    if p["engineId"].as_str().unwrap_or("codex") != "codex" {
+    if p["engineId"].as_str().unwrap_or(ENGINE_ID) != ENGINE_ID {
         bail!("INCOMPATIBLE_TRANSITION")
     }
     if let Some(m) = p["model"].as_str() {
@@ -8794,7 +8797,7 @@ fn transition_compat(h: &Host, b: &Value) -> Result<Value> {
         }
         bail!("INCOMPATIBLE_TRANSITION")
     }
-    Ok(json!({"engineId":"codex","model":h.registry.model,"toolAllowlist":null,"sameEngine":true,"crossEngine":false,"sameNativeSession":true}))
+    Ok(json!({"engineId":ENGINE_ID,"model":h.registry.model,"toolAllowlist":null,"sameEngine":true,"crossEngine":false,"sameNativeSession":true}))
 }
 // Shared owned-writer shutdown (task STOP arm): interrupt the bound turn,
 // drain the managed peer, settle open terminals, cancel aux sessions, expire

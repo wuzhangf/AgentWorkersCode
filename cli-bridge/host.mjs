@@ -36,8 +36,12 @@ const TOKEN = process.env.WORKER_LOCAL_TOKEN ?? '';
 // Stock CLIs carry account-bound defaults that may not exist on the signed-in
 // plan — an explicit --model overrides the vendor config for spawned turns.
 const MODEL = opt.model ?? process.env.CLI_BRIDGE_MODEL ?? '';
+// ChatGPT-account codex rejects desktop-internal model names (gpt-6.1-sol)
+// from ~/.codex/config.toml — pin a catalog-valid default; --model overrides.
+const CODEX_DEFAULT_MODEL = 'gpt-5.6-sol';
 const MAX_BODY = 1 << 20;
 const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED']);
+const STALL_MS = Number(process.env.CLI_BRIDGE_STALL_MS ?? 180_000);
 
 const fail = (code, status) => { const e = new Error(code); e.code = code; e.status = status; throw e; };
 
@@ -125,10 +129,10 @@ const ENGINES = {
   codex: {
     argv: (instruction, sessionId) => sessionId
       ? ['exec', 'resume', sessionId, instruction, '--json', '--skip-git-repo-check',
-         ...(MODEL ? ['--model', MODEL] : [])]
+         '--model', MODEL || CODEX_DEFAULT_MODEL]
       : ['exec', instruction, '--json', '-C', PROJECT_DIR,
          '-s', 'workspace-write', '--skip-git-repo-check',
-         ...(MODEL ? ['--model', MODEL] : [])],
+         '--model', MODEL || CODEX_DEFAULT_MODEL],
     bin: 'codex',
     /** codex exec --json: thread.started carries thread_id; item.completed rows
      * carry agent_message text; turn.completed finishes the turn. */
@@ -253,10 +257,19 @@ const dispatch = (t, instruction, requestKey) => {
   t.currentCommandId = requestKey;
   t.updatedAt = now();
   addMessage(t, 'user', instruction, requestKey);
+  let lastActivity = Date.now();
+  const watchdog = STALL_MS > 0 ? setInterval(() => {
+    if (Date.now() - lastActivity < STALL_MS) return;
+    t.stalled = true;
+    try { child.kill('SIGTERM'); } catch {}
+    setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 3000).unref();
+  }, 15_000) : null;
+  watchdog?.unref();
   let stderr = '';
-  child.stderr.on('data', (d) => { stderr += d; if (stderr.length > 8192) stderr = stderr.slice(-8192); });
+  child.stderr.on('data', (d) => { lastActivity = Date.now(); stderr += d; if (stderr.length > 8192) stderr = stderr.slice(-8192); });
   let buf = '';
   child.stdout.on('data', (d) => {
+    lastActivity = Date.now();
     buf += d.toString();
     let i;
     while ((i = buf.indexOf('\n')) >= 0) {
@@ -271,6 +284,7 @@ const dispatch = (t, instruction, requestKey) => {
     if (buf.length > (1 << 20)) buf = buf.slice(-(1 << 20));
   });
   child.on('close', (code) => {
+    if (watchdog) clearInterval(watchdog);
     live.delete(t.taskId);
     t.quiescent = true;
     t.updatedAt = now();
@@ -278,12 +292,19 @@ const dispatch = (t, instruction, requestKey) => {
     if (!t.output) {
       t.output = t.publicMessages.filter((m) => m.role === 'assistant').map((m) => m.text).join('\n');
     }
-    if (t.pendingVerdict === 'SUCCEEDED' || (code === 0 && t.pendingVerdict !== 'FAILED')) {
+    if (t.stalled) {
+      const note = `引擎 ${Math.round(STALL_MS / 60000)} 分钟无输出，已终止（多为网络或代理问题）`;
+      t.state = 'FAILED'; t.reasonCode = 'ENGINE_STALLED';
+      if (!t.output) t.output = note;
+      addMessage(t, 'assistant', note, undefined, 'FAILED');
+    } else if (t.pendingVerdict === 'SUCCEEDED' || (code === 0 && t.pendingVerdict !== 'FAILED')) {
       t.state = 'SUCCEEDED'; t.reasonCode = '';
     } else {
       t.state = 'FAILED';
       t.reasonCode = t.pendingVerdict === 'FAILED' ? 'ENGINE_FAILED' : 'ENGINE_EXIT_' + code;
-      if (stderr.trim() && !t.output) t.output = stderr.trim().split('\n').slice(-20).join('\n');
+      const tail = stderr.trim().split('\n').filter(Boolean).slice(-20).join('\n');
+      if (tail && !t.output) t.output = tail;
+      if (tail && !t.publicMessages.some((m) => m.role === 'assistant')) addMessage(t, 'assistant', tail, undefined, 'FAILED');
     }
     t.pendingVerdict = undefined;
     save();
@@ -425,7 +446,7 @@ const routes = (method, seg, taskId, body, query) => {
   const rest = seg.slice(2);
   if (method === 'GET' && rest[0] === 'identity') return identity();
   if (method === 'GET' && rest[0] === 'projects' && rest.length === 1) {
-    return { ...identity(), items: [{ projectId: PROJECT_ID, displayName: PROJECT_ID,
+    return { ...identity(), items: [{ projectId: PROJECT_ID, displayName: opt['project-name'] ?? PROJECT_ID,
       availability: 'AVAILABLE', headRevision: null, hasUncommittedChanges: false, kind: 'WORKSPACE' }] };
   }
   if (method === 'GET' && rest[0] === 'engines' && rest.length === 1) {
