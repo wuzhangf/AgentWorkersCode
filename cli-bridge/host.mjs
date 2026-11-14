@@ -21,6 +21,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
 import { join, resolve, relative, sep, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { homedir } from 'node:os';
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -39,6 +40,19 @@ const MODEL = opt.model ?? process.env.CLI_BRIDGE_MODEL ?? '';
 // ChatGPT-account codex rejects desktop-internal model names (gpt-6.1-sol)
 // from ~/.codex/config.toml — pin a catalog-valid default; --model overrides.
 const CODEX_DEFAULT_MODEL = 'gpt-5.6-sol';
+// Model menu this bridge advertises: a per-engine default list plus
+// operator extras via CLI_BRIDGE_MODELS (JSON array of names). Entries are
+// names the wrapped CLI accepts verbatim; codex also declares effort levels
+// mapped to `-c model_reasoning_effort=`.
+const MODEL_CATALOG = (() => {
+  const defaults = { claude: ['sonnet', 'opus', 'haiku'], codex: [CODEX_DEFAULT_MODEL], pi: MODEL ? [MODEL] : [] };
+  let extra = [];
+  try { const parsed = JSON.parse(process.env.CLI_BRIDGE_MODELS ?? '[]'); if (Array.isArray(parsed)) extra = parsed; } catch { /* malformed catalog ignored */ }
+  const names = [...(defaults[ENGINE] ?? []), ...extra.filter(n => typeof n === 'string' && !(defaults[ENGINE] ?? []).includes(n))];
+  if (MODEL && !names.includes(MODEL)) names.unshift(MODEL);
+  const efforts = ENGINE === 'codex' ? ['minimal', 'low', 'medium', 'high'] : undefined;
+  return names.map(name => ({ modelRef: name, displayName: name, imageInput: false, ...(efforts ? { efforts } : {}) }));
+})();
 const MAX_BODY = 1 << 20;
 const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED']);
 const STALL_MS = Number(process.env.CLI_BRIDGE_STALL_MS ?? 180_000);
@@ -99,10 +113,10 @@ const resolveBin = (name) => {
 
 const ENGINES = {
   claude: {
-    argv: (instruction, sessionId) => [
+    argv: (instruction, sessionId, task) => [
       '-p', instruction, '--output-format', 'stream-json', '--verbose',
       '--dangerously-skip-permissions',
-      ...(MODEL ? ['--model', MODEL] : []),
+      ...(task?.model ?? MODEL ? ['--model', task?.model ?? MODEL] : []),
       ...(sessionId ? ['--resume', sessionId] : []),
     ],
     bin: 'claude',
@@ -127,12 +141,13 @@ const ENGINES = {
     },
   },
   codex: {
-    argv: (instruction, sessionId) => sessionId
-      ? ['exec', 'resume', sessionId, instruction, '--json', '--skip-git-repo-check',
-         '--model', MODEL || CODEX_DEFAULT_MODEL]
-      : ['exec', instruction, '--json', '-C', PROJECT_DIR,
-         '-s', 'workspace-write', '--skip-git-repo-check',
-         '--model', MODEL || CODEX_DEFAULT_MODEL],
+    argv: (instruction, sessionId, task) => [
+      ...(sessionId
+        ? ['exec', 'resume', sessionId, instruction, '--json', '--skip-git-repo-check']
+        : ['exec', instruction, '--json', '-C', PROJECT_DIR, '-s', 'workspace-write', '--skip-git-repo-check']),
+      '--model', (task?.model ?? MODEL) || CODEX_DEFAULT_MODEL,
+      ...(task?.effort ? ['-c', `model_reasoning_effort=${task.effort}`] : []),
+    ],
     bin: 'codex',
     /** codex exec --json: thread.started carries thread_id; item.completed rows
      * carry agent_message text; turn.completed finishes the turn. */
@@ -153,11 +168,11 @@ const ENGINES = {
     },
   },
   pi: {
-    argv: (instruction, sessionId) => [
+    argv: (instruction, sessionId, task) => [
       '-p', instruction, '--mode', 'json',
       '--session-dir', join(STATE_DIR, 'pi-sessions'),
       ...(sessionId ? ['--session', sessionId] : []),
-      ...(MODEL ? ['--model', MODEL] : [])],
+      ...(task?.model ?? MODEL ? ['--model', task?.model ?? MODEL] : [])],
     bin: 'pi',
     /** pi -p --mode json: `session` carries the id; assistant message_end rows
      * carry completed text blocks; agent_settled ends the turn. */
@@ -243,7 +258,7 @@ const addMessage = (t, role, text, requestKey, status) => {
 
 /** Spawn the stock CLI for one turn; stream its events into the task row. */
 const dispatch = (t, instruction, requestKey) => {
-  const argv = engine.argv(instruction, t.nativeSessionId);
+  const argv = engine.argv(instruction, t.nativeSessionId, t);
   const child = spawn(resolved.cmd, [...resolved.pre, ...argv], {
     cwd: PROJECT_DIR,
     env: { ...process.env },
@@ -341,6 +356,9 @@ const facts = (t) => ({
 const receipt = (r) => ({
   schemaVersion: 'worker-local-op/1',
   requestKey: r.requestKey, taskId: r.taskId ?? null, operation: r.operation ?? 'LAUNCH',
+  // Pi op replies carry the request kind; the phone's admission check reads
+  // source.kind to confirm a message-shaped request was the one observed.
+  kind: r.operation ?? 'LAUNCH',
   state: r.state, result: r.result ?? null, code: r.code ?? null,
 });
 
@@ -413,15 +431,59 @@ const sealArtifacts = (t) => {
   t.artifactManifest = manifest; save(); return manifest;
 };
 
-const preflight = () => ({
-  schemaVersion: 'worker-local-preflight/1',
-  projectId: PROJECT_ID, engineId: ENGINE, engineVersion,
-  optionsRevision: digest([PROJECT_ID, ENGINE, engineVersion]),
-  profileId: 'MANAGED', executionProfile: 'vendor-cli-v1',
-  loadsUserExtensions: false, headRevision: null, hasUncommittedChanges: false,
-  workingCopyPolicy: 'COMMITTED_BASE_ONLY',
-  executionModes: ['WORKSPACE_TASK'], policyPreset: null,
-});
+// Display name of the provider behind the wrapped CLI — read-only for the
+// phone footnote. cc-switch (or the user's own config files) stays the owner;
+// this only reports which provider the next spawn would inherit.
+const currentProvider = () => {
+  const hostHint = () => {
+    try {
+      if (ENGINE === 'claude') {
+        const url = JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'))?.env?.ANTHROPIC_BASE_URL;
+        if (url) return new URL(url).host;
+        return 'Anthropic 官方';
+      }
+      if (ENGINE === 'codex') {
+        const toml = readFileSync(join(homedir(), '.codex', 'config.toml'), 'utf8');
+        const active = toml.match(/model_provider\s*=\s*"([^"]+)"/)?.[1];
+        const section = active && toml.match(new RegExp(`\\[model_providers\\.${active.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\][^\\[]*`))?.[0];
+        const url = (section ?? toml).match(/base_url\s*=\s*"([^"]+)"/)?.[1];
+        if (url) return new URL(url).host;
+        const mode = JSON.parse(readFileSync(join(homedir(), '.codex', 'auth.json'), 'utf8'))?.auth_mode;
+        if (mode === 'chatgpt') return 'ChatGPT 账户';
+        if (mode === 'apikey') return 'OpenAI API';
+      }
+    } catch { /* no readable config — provider stays unknown */ }
+    return '';
+  };
+  const host = hostHint();
+  const app = ENGINE === 'claude' || ENGINE === 'codex' ? ENGINE : '';
+  if (app) {
+    try {
+      const db = join(homedir(), '.cc-switch', 'cc-switch.db');
+      if (existsSync(db)) {
+        const name = execFileSync('sqlite3', [db, `SELECT name FROM providers WHERE app_type='${app}' AND is_current=1 LIMIT 1`],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).trim();
+        if (name && name !== 'default') return name;
+      }
+    } catch { /* cc-switch absent or schema changed — fall through */ }
+  }
+  return host;
+};
+
+const preflight = () => {
+  const provider = currentProvider();
+  return {
+    schemaVersion: 'worker-local-preflight/1',
+    projectId: PROJECT_ID, engineId: ENGINE, engineVersion,
+    optionsRevision: digest([PROJECT_ID, ENGINE, engineVersion]),
+    profileId: 'MANAGED', executionProfile: 'vendor-cli-v1',
+    loadsUserExtensions: false, headRevision: null, hasUncommittedChanges: false,
+    workingCopyPolicy: 'COMMITTED_BASE_ONLY',
+    executionModes: ['WORKSPACE_TASK'], policyPreset: null,
+    models: MODEL_CATALOG,
+    ...(provider ? { provider } : {}),
+  };
+};
 
 const identity = () => ({
   schemaVersion: 'worker-host/1', storeId: ledger.storeId, storeGuard: 'HEADER_V1',
@@ -477,9 +539,11 @@ const routes = (method, seg, taskId, body, query) => {
     if (body.optionsRevision !== undefined && body.optionsRevision !== preflight().optionsRevision) {
       fail('PREFLIGHT_CHANGED', 409);
     }
+    if (body.model !== undefined && !MODEL_CATALOG.some(m => m.modelRef === body.model)) fail('MODEL_REF_UNKNOWN', 400);
+    if (body.effort !== undefined && !MODEL_CATALOG.some(m => m.modelRef === (body.model ?? MODEL) && (m.efforts ?? []).includes(body.effort))) fail('MODEL_EFFORT_UNSUPPORTED', 400);
     const prior = ledger.requests[body.requestKey];
     if (prior) {
-      if (prior.hash !== digest({ i: body.instruction, p: body.projectId, e: body.engineId })) {
+      if (prior.hash !== digest({ i: body.instruction, p: body.projectId, e: body.engineId, m: body.model, f: body.effort })) {
         fail('IDEMPOTENCY_PAYLOAD_MISMATCH', 409);
       }
       return receipt(prior);
@@ -492,13 +556,15 @@ const routes = (method, seg, taskId, body, query) => {
       nativeSessionId: null, nativeTurnId: null, currentCommandId: body.requestKey,
       createdAt: now(), updatedAt: now(),
       instruction: body.instruction, output: '', publicMessages: [], inputRequests: {},
+      ...(body.model !== undefined ? { model: body.model } : {}),
+      ...(body.effort !== undefined ? { effort: body.effort } : {}),
       baseline: [...inventory()].map(([p, v]) => ({ p, s: v.s, m: v.m })),
     };
     ledger.tasks[t.taskId] = t;
     ledger.requests[body.requestKey] = {
       requestKey: body.requestKey, taskId: t.taskId, operation: 'LAUNCH',
       state: 'ACCEPTED', result: { taskId: t.taskId, engineId: ENGINE, engineVersion, state: 'ACCEPTED' },
-      hash: digest({ i: body.instruction, p: body.projectId, e: body.engineId }),
+      hash: digest({ i: body.instruction, p: body.projectId, e: body.engineId, m: body.model, f: body.effort }),
     };
     save();
     dispatch(t, body.instruction, body.requestKey);
@@ -574,9 +640,16 @@ const routes = (method, seg, taskId, body, query) => {
       if (!body || typeof body.requestKey !== 'string') fail('INVALID_REQUEST', 400);
       if (!['NATIVE_FOLLOW_UP', 'NATIVE_STEER'].includes(body.kind)) fail('OPERATION_NOT_ALLOWED', 403);
       if (typeof body.content !== 'string' || !body.content.trim()) fail('INVALID_REQUEST', 400);
+      // A message may carry a per-turn model switch — the next spawned CLI
+      // invocation simply launches with the new --model/--effort argv.
+      if (body.model !== undefined && !MODEL_CATALOG.some(m => m.modelRef === body.model)) fail('MODEL_REF_UNKNOWN', 400);
+      if (body.effort !== undefined) {
+        const name = body.model ?? t.model ?? MODEL;
+        if (!MODEL_CATALOG.find(m => m.modelRef === name)?.efforts?.includes(body.effort)) fail('MODEL_EFFORT_UNSUPPORTED', 400);
+      }
       const prior = ledger.requests[body.requestKey];
       if (prior) {
-        if (prior.taskId !== t.taskId || prior.hash !== digest({ c: body.content, k: body.kind })) {
+        if (prior.taskId !== t.taskId || prior.hash !== digest({ c: body.content, k: body.kind, m: body.model ?? null, e: body.effort ?? null })) {
           fail('IDEMPOTENCY_PAYLOAD_MISMATCH', 409);
         }
         return receipt(prior);
@@ -591,8 +664,10 @@ const routes = (method, seg, taskId, body, query) => {
       if (live.has(t.taskId)) fail('TASK_BUSY', 409);
       ledger.requests[body.requestKey] = {
         requestKey: body.requestKey, taskId: t.taskId, operation: body.kind,
-        state: 'ACCEPTED', hash: digest({ c: body.content, k: body.kind }),
+        state: 'ACCEPTED', hash: digest({ c: body.content, k: body.kind, m: body.model ?? null, e: body.effort ?? null }),
       };
+      if (body.model !== undefined) t.model = body.model;
+      if (body.effort !== undefined) t.effort = body.effort;
       save();
       dispatch(t, body.content, body.requestKey);
       return receipt(ledger.requests[body.requestKey]);
