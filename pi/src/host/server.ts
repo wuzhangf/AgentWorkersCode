@@ -60,6 +60,11 @@ const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catc
 const budgetCap = (v: any) => { const n = typeof v === 'string' && /^(0|[1-9][0-9]*)$/.test(v) ? Number(v) : v; return Number.isSafeInteger(n) && n > 0 ? n : null; };
 export class PiHost {
   readonly store: Store; readonly bootId = randomUUID(); private live = new Map<string, Live>(); private auxLive = new Map<string, AuxLive>(); private collabLive = new Map<string, CollabLive>(); private terminals = new Map<string, Terminal>(); private sseConnections = new Set<Socket>(); private closed = false; private storageClosed = false; private materialsManager?: Materials;
+  // A slot belongs to a turn admitted by this host, including preparation and
+  // the interval between dispatch and acknowledgement. Idle sessions and
+  // persisted process-ownership evidence have separate lifetimes.
+  private readonly activeTasks = new Set<string>();
+  private readonly transitionsInFlight = new Set<string>();
   private get materials() { return this.materialsManager ??= new Materials(this.store, join(this.store.directory, 'materials')); }
   readonly engineBinding: ReturnType<typeof engineBinding>;
   readonly executionProfile: string;
@@ -68,12 +73,14 @@ export class PiHost {
   get executionTools() { return this.executionProfile === RUNNER_PROFILE ? ['read', 'write', 'edit', 'ask_user', 'bash', 'run_command', 'run_build', 'run_tests'] : this.executionProfile === IN_PROCESS_PROFILE ? ['read', 'write', 'edit', 'ask_user'] : ['read', 'write', 'edit', 'bash', 'ask_user']; }
   readonly server = createServer((req, res) => { void this.http(req, res); });
   async sweepTaskDeadlines(at = Date.now()) {
-    for (const task of this.store.tasks()) {
+    for (const taskId of [...this.activeTasks]) {
+      if (this.closed || !this.activeTasks.has(taskId)) continue;
+      const task = this.store.task(taskId);
       // An acknowledged boundary pause deliberately parks the session. Its
       // next RESUME already starts a fresh execution window; do not turn that
       // recoverable checkpoint into a terminal STOP while the user is away.
-      if (task.quiescent || task.state === 'PAUSED' || at <= Number(task.deadlineEpochMillis)) continue;
-      await this.stop(task.taskId, { requestKey: 'deadline-' + task.taskId, intent: 'STOP', generation: task.generation, nativeSessionId: task.nativeSessionId, nativeTurnId: task.nativeTurnId, targetCommandId: task.currentCommandId });
+      if (task.intakeClosed || this.transitionsInFlight.has(taskId) || task.state === 'PAUSED' || TASK_TERMINAL_STATES.includes(task.state) || at <= Number(task.deadlineEpochMillis)) continue;
+      await this.stop(taskId, { requestKey: 'deadline-' + task.segmentId, intent: 'STOP', generation: task.generation, nativeSessionId: task.nativeSessionId, nativeTurnId: task.nativeTurnId, targetCommandId: task.currentCommandId });
     }
   }
   constructor(readonly config: { state: string; token: string; executionProfile?: string; childModule?: string; faultPoint?: string; pauseDeadlineMs?: number; resumeDeadlineMs?: number; maxActiveTasks?: number; macTools?: MacTaskTools; taskDeadlineMs?: number; ssePollMs?: number; sseHeartbeatMs?: number }) {
@@ -103,12 +110,15 @@ export class PiHost {
         for (const q of Object.values(task.inputRequests ?? {}) as Row[]) if (['PENDING', 'DISPATCH_STARTED'].includes(q.state)) q.state = 'EXPIRED';
         this.store.save(task); this.store.event(task, 'RESTART_RECONCILIATION', { reasonCode: 'BUDGET_EXCEEDED_SURVIVED_RESTART' });
       } else if (!task.quiescent) {
-        task.state = task.launchState === 'PREPARING' ? 'FAILED' : 'UNKNOWN';
-        // Same honest-recording rule as state(): the reconciliation verdict is
-        // durably recorded now — a real terminal observation for FAILED, no
-        // end time for UNKNOWN.
-        if (task.state === 'FAILED') task.endedAt ??= now(); else { delete task.endedAt; delete task.completedAt; }
-        task.reasonCode = task.launchState === 'PREPARING' ? 'LOCAL_LAUNCH_INTERRUPTED' : 'RESTART_RECONCILIATION_REQUIRED';
+        // A completed turn is durable even if the previous owner's shutdown
+        // could not prove that all writers stopped.
+        if (!TASK_TERMINAL_STATES.includes(task.state)) {
+          const preparing = task.launchState === 'PREPARING';
+          this.state(task, preparing ? 'FAILED' : 'UNKNOWN');
+          task.reasonCode = preparing ? 'LOCAL_LAUNCH_INTERRUPTED' : 'RESTART_RECONCILIATION_REQUIRED';
+        }
+        if (task.launchState === 'PREPARING' && !task.pid) task.launchState = 'REJECTED';
+        task.intakeClosed = true;
         if (this.quiescenceMethod === 'WINDOWS_JOB_ACTIVE_ZERO' && task.pid) {
           // Windows Job handles are never inherited: the dead owner's Jobs
           // closed and killed every member, so a dispatched child cannot have
@@ -120,11 +130,15 @@ export class PiHost {
           task.stopProof ??= { ownerBootId: task.ownerBootId ?? task.bootId, pid: task.pid, method: 'WINDOWS_JOB_CLOSED_ON_HOST_DEATH', observedAt: now() };
         } else {
           // An absent child proves only the transport is gone. It does not prove escaped tools exited.
-          task.quiescent = task.launchState === 'PREPARING' && !task.pid;
+          task.quiescent = task.launchState === 'REJECTED' && !task.pid;
         }
         this.markEffectsUnknown(task);
-        for (const q of Object.values(task.inputRequests ?? {}) as Row[]) if (q.state === 'PENDING') q.state = 'EXPIRED';
-        this.store.save(task); this.store.event(task, 'RESTART_RECONCILIATION', { reasonCode: task.reasonCode });
+        for (const q of Object.values(task.inputRequests ?? {}) as Row[]) if (['PENDING', 'DISPATCH_STARTED'].includes(q.state)) q.state = 'EXPIRED';
+        this.store.save(task); this.store.event(task, 'RESTART_RECONCILIATION', { reasonCode: task.reasonCode ?? 'PREVIOUS_OWNER_EXITED' });
+      }
+      if (task.sealRequested && !task.sealedFor) {
+        delete task.sealRequested;
+        this.store.save(task);
       }
     }
     // Host death closed the owned Jobs; any recorded live terminal is gone.
@@ -191,7 +205,7 @@ export class PiHost {
     { id: 'P24', implementation: 'IMPLEMENTED', qualification: 'PARTIAL', availability: 'AVAILABLE', semantics: 'child-messages/1 durable per-stream capture for collaboration children and auxiliary sessions: ASSIGNMENT/STATUS/OUTPUT_DELTA/ASSISTANT_MESSAGE/TOOL_CALL/TOOL_RESULT/RETURN rows with decimal-string per-stream sequence (monotonic across restart), before/cursor pagination (exclusive, limit<=100); coverage is FULL_SINCE_CAPTURE only after durable capture begins (PARTIAL when page items carry truncated bodies) — legacy aggregate output is exposed as SUMMARY_ONLY text, never split into fake turns; streams never recorded report UNAVAILABLE', evidenceRef: 'workers/pi/test/w5c.test.mjs', reasonCode: null },
     { id: 'P25', implementation: 'IMPLEMENTED', qualification: 'PARTIAL', availability: 'AVAILABLE', semantics: 'Collaboration preflight: POST .../collaborations/preflight runs the full create-validation segment (ids, goals, dependency DAG, per-task/host limits, packages, budget, writeScope) without creating a collaboration row or spawning a child; returns preflightId + planDigest + sourceBindings + allowedScopes + budgetTerms + expiresAt. Final create may bind expectedPreflightId/expectedPlanDigest — stale/divergent plans conflict PREFLIGHT_STALE; unbound create stays allowed for legacy clients. Records are capped (32/task, TTL-pruned)', evidenceRef: 'workers/pi/test/w5c.test.mjs', reasonCode: null },
     { id: 'P26', implementation: 'IMPLEMENTED', qualification: 'PARTIAL', availability: 'AVAILABLE', semantics: 'Read-only adoption preview: POST .../collaborations/{id}/previews runs the identical candidate/plan/conflict classification as apply (per-path candidate/baseline/parent sha256, write/delete/noop/conflict actions) and freezes it under previewId + planDigest with a TTL — nothing is written to the parent workspace. Adopt may bind expectedPreviewId/expectedPreviewDigest; stale or divergent previews conflict PREVIEW_STALE and apply still re-verifies candidate bytes against the live parent immediately before writing', evidenceRef: 'workers/pi/test/w5c.test.mjs', reasonCode: null },
-    { id: 'P27', implementation: 'IMPLEMENTED', qualification: 'PARTIAL', availability: 'AVAILABLE', semantics: 'Source seal + handoff export: POST .../source-seals first requires the main task quiescent — durable terminal verdict or recorded quiescence proof with no dispatch left, else TASK_NOT_QUIESCENT — then drains collaboration children and aux sessions and raises a durable write fence (every mutation path rejects SOURCE_SEALED; STOP and reads stay open; seal proof binds taskId/generation/segmentId/ownerEpoch/target/material sha256). GET .../handoff-export is a paginated read-only projection (messages, aux answers, collaboration report refs, artifact manifest, factual events) with exportDigest and body textRefs readable via .../handoff-export/{part}/chunks/{sha256}/{offset} — part is a closed whitelist, never a path. targetStart is reported NOT_STARTED: export acceptance is not handoff completion', evidenceRef: 'workers/pi/test/w5c.test.mjs', reasonCode: null },
+    { id: 'P27', implementation: 'IMPLEMENTED', qualification: 'PARTIAL', availability: 'AVAILABLE', semantics: 'Source seal + handoff export: POST .../source-seals verifies the stopped main task or requests teardown of its idle session, then drains collaboration children and aux sessions and raises a durable write fence (every mutation path rejects SOURCE_SEALED; STOP and reads stay open; seal proof binds taskId/generation/segmentId/ownerEpoch/target/material sha256). GET .../handoff-export is a paginated read-only projection (messages, aux answers, collaboration report refs, artifact manifest, factual events) with exportDigest and body textRefs readable via .../handoff-export/{part}/chunks/{sha256}/{offset} — part is a closed whitelist, never a path. targetStart is reported NOT_STARTED: export acceptance is not handoff completion', evidenceRef: 'workers/pi/test/w5c.test.mjs', reasonCode: null },
     { id: 'P29', implementation: 'IMPLEMENTED', qualification: 'PARTIAL', availability: 'AVAILABLE', semantics: 'Project-scoped material uploads: POST /projects/{p}/material-uploads registers an upload (allowlisted image/png|jpeg and UTF-8 text/markdown/log/json plus GIT_BUNDLE/PATCH_BINARY for handoff delivery, per-kind size ceilings); raw 256KiB-bounded PUT chunks are idempotent by offset+digest and contiguous at nextOffset; seal verifies byte count + whole sha256 and issues materialRef; delete revokes only unbound uploads (BOUND/CONSUMED refuse). messages[] materials requires a SEALED ref with matching sha256 and task/createKey binding; REFERENCE_TEXT bytes are injected into the model input; IMAGE is refused MODEL_IMAGE_INPUT_UNSUPPORTED because the Pi image-input path is unverified; attachments on non-prompt intents refuse MATERIALS_UNSUPPORTED_INTENT', evidenceRef: 'workers/pi/test/w5c.test.mjs', reasonCode: 'MODEL_IMAGE_INPUT_UNVERIFIED' },
     { id: 'P30', implementation: 'IMPLEMENTED', qualification: 'PARTIAL', availability: 'AVAILABLE', semantics: 'Frozen execution-policy projection (executionPolicy on task detail + engines): profile, honest sandbox scope (native host = UNDECLARED, never an OS sandbox), approval/tool-admission facts, effective writeScope, environment binding, selected policyPreset, frozen:true. Preflight/create accept policyPresetId from the managed preset table (unknown ids refuse POLICY_PRESET_UNKNOWN); presets narrow the declared toolAllowlist at launch and never widen it; running-task policy changes are not implemented', evidenceRef: 'workers/pi/test/w5c.test.mjs', reasonCode: 'RUNNING_POLICY_IMMUTABLE' },
   ].map(item => ({ schemaVersion: 'worker-capability/1', ...item, ...(!this.executionAvailability().available && item.availability === 'AVAILABLE' && item.id !== 'P05' ? { availability: 'UNCONFIGURED', reasonCode: this.executionAvailability().reasonCode } : {}) })) }; }
@@ -213,7 +227,7 @@ export class PiHost {
   private policyPresets(): Record<string, Row> {
     const readOnly = this.executionTools.filter(t => ['read', 'ls', 'grep', 'glob', 'ask_user'].includes(t));
     return {
-      'standard': { presetId: 'standard', revision: 'pi-policy-preset/1', engine: ENGINE_ID, projectScope: 'ANY', effectiveRange: 'NEW_TASKS', escalationNote: 'Managed default toolset for the execution profile; human approval via ask_user; file-mutating tools gated by declared writeScope; shell command paths are not statically attributed and the host is not an OS sandbox', revocable: false, frozenParameters: { toolAllowlist: null } },
+      'standard': { presetId: 'standard', revision: 'pi-policy-preset/1', engine: ENGINE_ID, projectScope: 'ANY', effectiveRange: 'NEW_TASKS', escalationNote: 'Managed default toolset for the execution profile; human approval via ask_user; explicit writeScope gates file-mutating tools; shell command paths are not statically attributed and the host is not an OS sandbox', revocable: false, frozenParameters: { toolAllowlist: null } },
       'read-only': { presetId: 'read-only', revision: 'pi-policy-preset/1', engine: ENGINE_ID, projectScope: 'ANY', effectiveRange: 'NEW_TASKS', escalationNote: 'Model-visible tools narrowed at session init to non-mutating tools only (' + readOnly.join(',') + '); the gate still enforces declared tools and this is not an OS sandbox', revocable: false, frozenParameters: { toolAllowlist: readOnly } },
     };
   }
@@ -230,8 +244,8 @@ export class PiHost {
     return { ...result, optionsRevision: digest(result) };
   }
   detail(task: Row) {
-    const live = this.live.get(task.taskId); const connected = !!live && !live.stopping && live.child.connected;
-    const queue = task.launchState === 'QUEUED' ? { ordinal: task.queueOrdinal, position: this.store.tasks().filter(t => t.launchState === 'QUEUED' && !t.intakeClosed).sort((a, b) => a.queueOrdinal - b.queueOrdinal).findIndex(t => t.taskId === task.taskId) + 1, activeTasks: this.store.tasks().filter(t => !t.quiescent).length, maxActiveTasks: this.maxActive() } : undefined;
+    const live = this.live.get(task.taskId); const connected = !!live && !task.intakeClosed && !live.stopping && live.child.connected;
+    const queue = task.launchState === 'QUEUED' ? { ordinal: task.queueOrdinal, position: this.store.tasks().filter(t => t.launchState === 'QUEUED' && !t.intakeClosed).sort((a, b) => a.queueOrdinal - b.queueOrdinal).findIndex(t => t.taskId === task.taskId) + 1, activeTasks: this.activeTasks.size, maxActiveTasks: this.maxActive() } : undefined;
     const lastEvent = this.store.lastEvent(task.taskId);
     const legacyDeadlineStop = !task.reasonCode && task.state === 'CANCELLED' && this.store.operation('deadline-' + task.taskId)?.state === 'APPLIED';
     return { ...task, reasonCode: task.reasonCode ?? (legacyDeadlineStop ? 'TASK_DEADLINE_EXCEEDED' : undefined), goal: undefined, output: undefined, inputRequests: undefined, publicMessages: undefined, pending: undefined, queue, storeId: this.store.identity.storeId, bootId: this.bootId, lastEventAt: lastEvent?.occurredAt ?? null, lastEventKind: lastEvent?.kind ?? null,
@@ -256,7 +270,7 @@ export class PiHost {
       'adoption.preview': write(a('AVAILABLE', null, { limits: { maxPaths: COLLAB_MAX_PATHS, maxPerTask: COLLAB_PREVIEW_MAX, ttlMs: COLLAB_PREVIEW_TTL_MS }, semantics: 'READ_ONLY_CANDIDATE_DIFF_FROZEN_DIGEST' })),
       'adoption.apply': write(a('AVAILABLE', null, { limits: { maxPaths: COLLAB_MAX_PATHS, maxAdoptions: COLLAB_MAX_ADOPTIONS }, semantics: 'FILE_LEVEL_WRITE_CONFLICT_ZERO_WRITE' })),
       'handoff.export': a('AVAILABLE', null, { limits: { defaultLimit: 50, maxLimit: HANDOFF_EXPORT_MAX_LIMIT, chunkBytes: HANDOFF_EXPORT_CHUNK_MAX }, semantics: 'READ_ONLY_PUBLIC_PROJECTION_NO_ARBITRARY_PATHS' }),
-      'handoff.seal': task.sealedFor ? a('BLOCKED_BY_STATE', 'SOURCE_ALREADY_SEALED') : this.sealQuiescent(task) ? a('AVAILABLE', null, { semantics: 'DRAINS_COLLAB_CHILDREN_AND_AUX_THEN_WRITE_FENCE' }) : a('BLOCKED_BY_STATE', 'TASK_NOT_QUIESCENT'),
+      'handoff.seal': task.sealedFor ? a('BLOCKED_BY_STATE', 'SOURCE_ALREADY_SEALED') : this.canRequestSourceSeal(task) ? a('AVAILABLE', null, { semantics: 'VERIFIES_STOPPED_MAIN_AND_DRAINS_CHILDREN' }) : a('BLOCKED_BY_STATE', 'TASK_NOT_QUIESCENT'),
       'materials.upload': blocked ? a('BLOCKED_BY_STATE', blocked) : a('AVAILABLE', null, { limits: this.materials.mediaLimits(), semantics: 'PROJECT_SCOPED_CHUNKED_SEAL' }),
       'message.materials': a('AVAILABLE', null, { limits: { maxPerMessage: this.materials.maxPerMessage(), roles: ['IMAGE', 'REFERENCE_TEXT'] }, semantics: 'REFERENCE_TEXT_INJECTED_IMAGE_REJECTED_MODEL_INPUT_UNVERIFIED' }),
       'voice.transcribe': a('NOT_INTEGRATED', 'TRANSCRIPTION_OWNED_BY_PAC', { semantics: 'TRANSCRIPTION_IS_A_PAC_SERVICE_NOT_A_SOURCE_CAPABILITY' }),
@@ -270,7 +284,7 @@ export class PiHost {
    *  sandbox; only a bound no-fork execution profile claims process denial. */
   private executionPolicyProjection(task: Row) {
     const sandbox = this.executionProfile === RUNNER_PROFILE ? 'MODEL_NO_FORK_AND_REGISTERED_PROCESS_GROUPS' : isNoForkProfile(this.executionProfile) ? 'DENY_PROCESS_FORK' : 'UNDECLARED';
-    return { profile: this.executionProfile, profileId: this.profileId, sandbox, osSandboxClaimed: isNoForkProfile(this.executionProfile), approvalPolicy: 'HUMAN_VIA_ASK_USER_TOOL', toolAdmission: 'AWAITED_GATE_CHECK', writeScope: { effective: task.writeScope ?? null, default: 'WORKSPACE_ONLY', enforcement: 'FILE_MUTATING_TOOLS_GATE_SHELL_PATHS_NOT_ATTRIBUTED' }, environmentBinding: task.environmentBinding ?? null, toolAllowlist: task.toolAllowlist ?? null, policyPreset: task.policyPreset ?? null, frozen: true, semanticsNote: 'Frozen at launch; running-task policy changes are not implemented (new presets affect future tasks only)' };
+    return { profile: this.executionProfile, profileId: this.profileId, sandbox, osSandboxClaimed: isNoForkProfile(this.executionProfile), approvalPolicy: 'HUMAN_VIA_ASK_USER_TOOL', toolAdmission: task.writeScope || task.budget ? 'AWAITED_GATE_CHECK' : 'NATIVE', writeScope: { effective: task.writeScope ?? null, default: 'UNDECLARED', enforcement: task.writeScope ? 'FILE_MUTATING_TOOLS_GATE_SHELL_PATHS_NOT_ATTRIBUTED' : 'UNDECLARED' }, environmentBinding: task.environmentBinding ?? null, toolAllowlist: task.toolAllowlist ?? null, policyPreset: task.policyPreset ?? null, frozen: true, semanticsNote: 'Frozen at launch; running-task policy changes are not implemented (new presets affect future tasks only)' };
   }
   private update(taskId: string, fn: (task: Row) => void) { const task = this.store.task(taskId); fn(task); this.store.save(task); return task; }
   /** Effective execution window for a task: a bounded per-task deadlineMs set
@@ -308,7 +322,8 @@ export class PiHost {
     const extensions = this.validateDeclaredDirs(body.extensions, 'extension');
     const model = { name: process.env.MODEL_DEFAULT_MODEL ?? 'fixture-model', baseUrl: process.env.MODEL_BASE_URL ?? 'http://127.0.0.1:1', headerEnvKeys: Object.keys(process.env).filter(k => k.startsWith('LLM_HEADER_')), api: 'openai-completions', contextWindow: 131072, maxTokens: 8192, parameterQualification: 'OPERATOR_CONFIGURED_COMPATIBILITY_ASSUMPTIONS' };
     if (!/^https?:\/\//.test(model.baseUrl)) throw new Error('MODEL_BASE_URL_REQUIRED');
-    const taskId = 'native-' + randomUUID(); const queued = this.store.tasks().filter(t => !t.quiescent).length >= this.maxActive();
+    this.admitQueue();
+    const taskId = 'native-' + randomUUID(); const queued = this.activeTasks.size >= this.maxActive();
     const effectiveDeadlineMs = deadlineMs ?? this.taskDeadlineMs();
     const task: Row = { taskId, executionMode: mode, engineId: ENGINE_ID, engineVersion: PI_VERSION, projectId: body.projectId, baseCommit: checked.headRevision, profileId: this.profileId, executionProfile: this.executionProfile, workspace: join(this.store.directory, 'workspaces', taskId), sessionDir: join(this.store.directory, 'sessions', taskId), goal: body.instruction, modelBinding: model, configuredModel: model.name, configuredProvider: 'worker-model', generation: randomUUID(), nativeSessionId: null, nativeTurnId: null, segmentId: randomUUID(), currentCommandId: body.requestKey, ownerEpoch: '1', launchState: queued ? 'QUEUED' : 'PREPARING', state: queued ? 'QUEUED' : 'PREPARING', quiescent: queued, createdAt: now(), deadlineMs: effectiveDeadlineMs, deadlineEpochMillis: String(Date.now() + effectiveDeadlineMs), turns: {}, inputRequests: {}, publicMessages: [], output: '', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, usageLedger: [], budget, writeScope, environment, mcpServers, declaredSkills: skills, declaredExtensions: extensions, bootId: this.bootId };
     if (checked.policyPreset) {
@@ -328,18 +343,34 @@ export class PiHost {
       this.state(task, task.state); this.store.save(task); this.store.event(task, 'ACCEPTED');
       if (queued) this.store.event(task, 'QUEUED', { queueOrdinal: task.queueOrdinal });
     });
-    if (!queued) setImmediate(() => { void this.launch(taskId); }); return receipt!;
+    if (!queued) this.scheduleLaunch(taskId); return receipt!;
   }
   private maxActive() { const n = this.config.maxActiveTasks ?? Number(process.env.NWF_PI_MAX_ACTIVE_TASKS ?? 4); return Number.isFinite(n) ? Math.max(1, Math.floor(n)) : 4; }
+  private assertSlotAvailable(taskId: string) {
+    if (this.closed) throw new Error('LOCAL_HOST_CLOSED');
+    this.admitQueue();
+    if (!this.activeTasks.has(taskId) && this.activeTasks.size >= this.maxActive()) throw new Error('LOCAL_TASK_BUSY');
+  }
+  private scheduleLaunch(taskId: string) {
+    this.activeTasks.add(taskId);
+    setImmediate(() => { if (!this.closed) void this.launch(taskId); });
+  }
+  private releaseSlot(taskId: string) {
+    if (this.activeTasks.delete(taskId)) this.admitQueue();
+  }
   private admitQueue() {
     if (this.closed) return;
-    for (;;) {
-      const tasks = this.store.tasks();
-      if (tasks.filter(t => !t.quiescent).length >= this.maxActive()) return;
-      const next = tasks.filter(t => t.launchState === 'QUEUED' && !t.intakeClosed && t.state === 'QUEUED').sort((a, b) => a.queueOrdinal - b.queueOrdinal)[0];
-      if (!next) return;
-      this.store.transaction(() => { const t = this.store.task(next.taskId); if (t.launchState !== 'QUEUED' || t.intakeClosed) return; t.launchState = 'PREPARING'; t.quiescent = false; t.deadlineEpochMillis = String(Date.now() + this.taskDeadlineMs(t)); this.state(t, 'PREPARING'); this.store.save(t); this.store.event(t, 'ADMITTED', { queueOrdinal: t.queueOrdinal }); });
-      setImmediate(() => { void this.launch(next.taskId); });
+    const capacity = this.maxActive() - this.activeTasks.size;
+    if (capacity <= 0) return;
+    const queued = this.store.tasks().filter(t => t.launchState === 'QUEUED' && !t.intakeClosed && t.state === 'QUEUED');
+    queued.sort((a, b) => a.queueOrdinal - b.queueOrdinal);
+    for (const next of queued.slice(0, capacity)) {
+      this.store.transaction(() => {
+        next.launchState = 'PREPARING'; next.quiescent = false; next.bootId = this.bootId;
+        next.deadlineEpochMillis = String(Date.now() + this.taskDeadlineMs(next));
+        this.state(next, 'PREPARING'); this.store.save(next); this.store.event(next, 'ADMITTED', { queueOrdinal: next.queueOrdinal });
+      });
+      this.scheduleLaunch(next.taskId);
     }
   }
   private validateBudget(spec: any) {
@@ -472,9 +503,7 @@ export class PiHost {
         void this.budgetRelease(taskId, live);
         return;
       }
-      if (event.kind === 'TOOL_ADMISSION' && !event.toolName?.startsWith('mac__') && !['read', 'bash', 'run_command', 'run_build', 'run_tests', 'ask_user', 'ls', 'grep', 'glob'].includes(event.toolName)) {
-        // Scope gates only file-mutating tools (read/bash/shell paths are not
-        // statically attributable). Undeclared writeScope means workspace-only.
+      if (task.writeScope && event.kind === 'TOOL_ADMISSION' && !event.toolName?.startsWith('mac__') && !['read', 'bash', 'run_command', 'run_build', 'run_tests', 'ask_user', 'ls', 'grep', 'glob'].includes(event.toolName)) {
         const denied = this.scopeDenial(task, event);
         if (denied) { this.store.event(task, 'write.scope.violation', { toolName: event.toolName, toolCallId: event.toolCallId, deniedPath: denied, scopeId: task.writeScope?.scopeId ?? 'workspace' }); live.child.send({ type: 'gate_verdict', checkId: event.checkId, action: 'block', reason: 'WRITE_SCOPE_VIOLATION: ' + denied + ' is outside the task write scope' }); return; }
       }
@@ -493,12 +522,15 @@ export class PiHost {
       if (live.mac?.proof) t.processOwnership = live.mac.proof;
       this.store.event(t, stopped ? 'BUDGET_RELEASED' : 'BUDGET_RELEASE_UNKNOWN', {});
     });
-    this.admitQueue();
+    this.releaseSlot(taskId);
   }
   private async launch(taskId: string) {
     let task = this.store.task(taskId);
-    if (task.intakeClosed) return;
-    if ((task.executionProfile ?? 'native') !== this.executionProfile) { this.update(taskId, t => { t.reasonCode = 'EXECUTION_PROFILE_CHANGED'; this.state(t, 'UNKNOWN'); }); return; }
+    if (task.intakeClosed) { this.releaseSlot(taskId); return; }
+    if ((task.executionProfile ?? 'native') !== this.executionProfile) {
+      this.failLaunch(taskId, 'EXECUTION_PROFILE_CHANGED');
+      return;
+    }
     if (!this.bindEnvironment(task)) return;
     try {
       mkdirSync(resolve(task.workspace, '..'), { recursive: true }); mkdirSync(task.sessionDir, { recursive: true });
@@ -521,8 +553,26 @@ export class PiHost {
       const module = this.config.childModule ?? fileURLToPath(new URL('../engine/bootstrap.js', import.meta.url));
       const profileOptions = isNoForkProfile(this.executionProfile) ? { execPath: SANDBOX_EXEC, execArgv: ['-p', NO_FORK_POLICY, process.execPath] } : {};
       const child = fork(module, [], { ...profileOptions, cwd: task.workspace, env: environment, detached: process.platform !== 'win32', stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
-      child.on('error', () => {});
       const live: Live = { child, stopping: false, ready: false, pending: new Map(), pauseWaiters: new Map(), resumeWaiters: new Map() }; this.live.set(taskId, live);
+      child.on('message', msg => { this.event(taskId, live, msg as Row); });
+      child.on('exit', (code, signal) => {
+        for (const w of live.pauseWaiters.values()) w({ type: 'pause_failed', code: 'NATIVE_PROCESS_EXITED_UNCONFIRMED' }); live.pauseWaiters.clear();
+        for (const w of live.resumeWaiters.values()) w(null); live.resumeWaiters.clear();
+        if (this.closed || this.live.get(taskId) !== live) return;
+        this.update(taskId, t => {
+          if (!live.stopping) {
+            t.intakeClosed = true;
+            if (!TASK_TERMINAL_STATES.includes(t.state)) { this.state(t, 'UNKNOWN'); t.reasonCode = 'NATIVE_PROCESS_EXITED_UNCONFIRMED'; }
+            this.markEffectsUnknown(t);
+          }
+          for (const q of Object.values(t.inputRequests) as Row[]) if (['PENDING', 'DISPATCH_STARTED'].includes(q.state)) q.state = 'EXPIRED';
+          this.store.event(t, 'CHILD_EXITED', { code, signal });
+        });
+        if (!live.stopping) this.releaseSlot(taskId);
+      });
+      child.on('error', () => {
+        if (!this.closed && !live.stopping && this.live.get(taskId) === live) this.failLaunch(taskId, 'NATIVE_START_UNCONFIRMED');
+      });
       task = this.update(taskId, t => { t.pid = child.pid; t.ownerBootId = this.bootId; });
       if (process.platform === 'win32') {
         try { live.job = new WindowsJob(); live.job.assign(child.pid!); }
@@ -533,19 +583,38 @@ export class PiHost {
         if (live.stopping || this.closed || this.store.task(taskId).intakeClosed) { live.stopping = true; await this.terminate(live); return; }
         this.update(taskId, t => { t.processOwnership = { method: MAC_QUIESCENCE_METHOD, guardianArmed: true }; });
       }
-      child.on('message', msg => { this.event(taskId, live, msg as Row); });
-      child.on('exit', () => {
-        for (const w of live.pauseWaiters.values()) w({ type: 'pause_failed', code: 'NATIVE_PROCESS_EXITED_UNCONFIRMED' }); live.pauseWaiters.clear();
-        for (const w of live.resumeWaiters.values()) w(null); live.resumeWaiters.clear();
-        if (this.closed || this.live.get(taskId) !== live) return;
-        this.update(taskId, t => { if (!live.stopping) { this.state(t, 'UNKNOWN'); t.reasonCode = 'NATIVE_PROCESS_EXITED_UNCONFIRMED'; this.markEffectsUnknown(t); } for (const q of Object.values(t.inputRequests) as Row[]) if (q.state === 'PENDING') q.state = 'EXPIRED'; this.store.event(t, 'CHILD_EXITED'); });
-      });
-      child.on('error', () => { this.update(taskId, t => { this.state(t, 'UNKNOWN'); t.reasonCode = 'NATIVE_START_UNCONFIRMED'; }); });
       const macCapabilities = task.macToolBinding ? await this.config.macTools!.capabilities(task.macToolBinding) : [];
+      if (this.closed || live.stopping || this.store.task(taskId).intakeClosed) return;
       child.send({ type: 'init', executionMode: task.executionMode ?? 'WORKSPACE_TASK', macCapabilities, executionProfile: this.executionProfile, workspace: task.workspace, sessionDir: task.sessionDir, model: task.modelBinding, sessionFile: task.launchState === 'RESTORING' ? task.nativeSessionFile : undefined, probeEnv: task.environment?.envAllowlist ?? [], toolAllowlist: task.toolAllowlist,
+        checkBudget: !!task.budget, checkWriteScope: !!task.writeScope,
         mcpServers: (task.mcpServers ?? []).map((s: Row) => ({ id: s.id, config: { command: s.command, args: s.args, env: s.env, exposure: 'direct', timeout: 30 } })),
         extensions: (task.declaredExtensions ?? []).map((e: Row) => ({ name: e.name })) });
-    } catch (error) { if (this.closed) return; const reason = error instanceof Error && /^[A-Z][A-Z0-9_]+$/.test(error.message) ? error.message : 'LOCAL_LAUNCH_FAILED'; const freed = this.update(taskId, t => { if (t.intakeClosed) return; t.reasonCode = reason; if (t.launchState === 'PREPARING' && !t.pid) { this.state(t, 'FAILED'); t.quiescent = true; t.launchState = 'REJECTED'; } else this.state(t, 'UNKNOWN'); }); if (freed.quiescent) this.admitQueue(); }
+    } catch (error) {
+      if (this.closed || this.store.task(taskId).intakeClosed) return;
+      const reason = error instanceof Error && /^[A-Z][A-Z0-9_]+$/.test(error.message) ? error.message : 'LOCAL_LAUNCH_FAILED';
+      this.failLaunch(taskId, reason);
+    }
+  }
+  private failLaunch(taskId: string, reasonCode: string) {
+    const live = this.live.get(taskId);
+    if (live) {
+      live.stopping = true;
+      // Failed launches never accept another prompt on this child.
+      live.mac?.close();
+      live.job?.close();
+      live.child.kill();
+    }
+    this.update(taskId, t => {
+      t.intakeClosed = true;
+      if (!TASK_TERMINAL_STATES.includes(t.state)) {
+        const undispatched = t.launchState !== 'DISPATCH_STARTED';
+        this.state(t, undispatched ? 'FAILED' : 'UNKNOWN');
+        t.reasonCode = reasonCode;
+        if (undispatched && !live && !t.pid) { t.quiescent = true; t.launchState = 'REJECTED'; }
+      }
+      this.store.event(t, 'NATIVE_FAILURE', { reasonCode });
+    });
+    this.releaseSlot(taskId);
   }
   /** Copy declared skills/extensions into the task-managed profile and seal a content
    *  sha256 binding; on relaunch the managed copies are re-hashed against it. */
@@ -614,7 +683,7 @@ export class PiHost {
     }
     if (missing.length) {
       this.store.transaction(() => { const t = this.store.task(task.taskId); if (t.intakeClosed) return; this.state(t, 'BINDING_UNAVAILABLE'); t.reasonCode = 'BINDING_UNAVAILABLE'; t.quiescent = true; t.launchState = 'REJECTED'; t.bindingUnavailable = { missing, at: now() }; this.store.save(t); this.store.event(t, 'BINDING_UNAVAILABLE', { missing }); });
-      this.admitQueue(); return false;
+      this.releaseSlot(task.taskId); return false;
     }
     this.update(task.taskId, t => { t.environmentBinding = { ...t.environmentBinding, resolved, boundAt: now(), bootId: this.bootId }; });
     return true;
@@ -639,7 +708,7 @@ export class PiHost {
   }
   private dispatch(task: Row, live: Live, requestKey: string, content: string) {
     if (task.intakeClosed || live.stopping) return;
-    if (engineBinding(this.executionProfile).digest !== this.engineBinding.digest) { this.update(task.taskId, t => { this.state(t, 'FAILED'); t.reasonCode = 'ENGINE_BINDING_CHANGED'; }); return; }
+    if (engineBinding(this.executionProfile).digest !== this.engineBinding.digest) { this.failLaunch(task.taskId, 'ENGINE_BINDING_CHANGED'); return; }
     task.engineBindingDigest = this.engineBinding.digest;
     this.store.transaction(() => {
       task.launchState = 'DISPATCH_STARTED'; this.state(task, 'UNKNOWN'); task.runStartedAt ??= now(); this.store.save(task);
@@ -654,7 +723,18 @@ export class PiHost {
     if (live.stopping && !['stopped'].includes(event.type)) return;
     switch (event.type) {
       case 'ready':
-        if (live.ready) return; live.ready = true; if (task.reopenFrom && task.reopenFrom.nativeSessionId !== event.nativeSessionId) { this.update(taskId, t => { this.state(t, 'FAILED'); t.reasonCode = 'NATIVE_SESSION_IDENTITY_CHANGED'; }); return; } task.nativeSessionId = event.nativeSessionId; task.nativeSessionFile = event.sessionFile; task.activeTools = event.tools; if (event.envProbe) task.envProbe = event.envProbe; task.actualModel = event.model ?? task.modelBinding.name; task.modelBindingDigest = digest(task.modelBinding); this.store.save(task); if (event.model && event.model !== task.modelBinding.name) { this.update(taskId, t => { this.state(t, 'FAILED'); t.reasonCode = 'MODEL_BINDING_MISMATCH'; }); return; } if (task.executionMode === 'CONTEXT_ONLY' && (!Array.isArray(event.tools) || event.tools.length !== 0)) { this.update(taskId,t=>{t.reasonCode='CONTEXT_ONLY_TOOLS_EXPOSED';this.state(t,'FAILED');}); void this.stop(taskId,{requestKey:'context-only-reject-'+taskId,intent:'STOP',generation:task.generation,nativeSessionId:task.nativeSessionId,targetCommandId:task.currentCommandId});return;} this.bindResources(taskId, event); this.dispatch(task, live, task.currentCommandId, task.goal); return;
+        if (live.ready || task.intakeClosed) return;
+        live.ready = true;
+        if (task.reopenFrom && task.reopenFrom.nativeSessionId !== event.nativeSessionId) { this.failLaunch(taskId, 'NATIVE_SESSION_IDENTITY_CHANGED'); return; }
+        if (event.model && event.model !== task.modelBinding.name) { this.failLaunch(taskId, 'MODEL_BINDING_MISMATCH'); return; }
+        task.nativeSessionId = event.nativeSessionId; task.nativeSessionFile = event.sessionFile; task.activeTools = event.tools; if (event.envProbe) task.envProbe = event.envProbe; task.actualModel = event.model ?? task.modelBinding.name; task.modelBindingDigest = digest(task.modelBinding);
+        this.store.save(task);
+        if (task.executionMode === 'CONTEXT_ONLY' && (!Array.isArray(event.tools) || event.tools.length !== 0)) {
+          this.update(taskId, t => { this.state(t, 'FAILED'); t.reasonCode = 'CONTEXT_ONLY_TOOLS_EXPOSED'; });
+          void this.stop(taskId, { requestKey: 'context-only-reject-' + taskId, intent: 'STOP', generation: task.generation, nativeSessionId: task.nativeSessionId, nativeTurnId: task.nativeTurnId, targetCommandId: task.currentCommandId });
+          return;
+        }
+        this.bindResources(taskId, event); this.dispatch(task, live, task.currentCommandId, task.goal); return;
       // First observed turn start is a real run fact even when dispatch was
       // bypassed (steer/follow-up sent straight to a live child); ??= keeps
       // the earliest recorded fact.
@@ -695,13 +775,24 @@ export class PiHost {
         if (task.state === 'PAUSED' && task.checkpointManifest) task.checkpointManifest.pausedFromState = final;
         else if (task.state === 'PAUSE_REQUESTED') task.pauseFromState = final;
         else if (!['BUDGET_EXCEEDED', 'BINDING_UNAVAILABLE'].includes(task.state)) { this.state(task, final); if (final === 'FAILED') task.reasonCode = task.nativeFailure; }
-        task.nativeIdle = true; this.store.event(task, 'NATIVE_SETTLED'); break;
+        task.nativeIdle = true;
+        this.store.transaction(() => { this.store.save(task); this.store.event(task, 'NATIVE_SETTLED'); });
+        if (!this.transitionsInFlight.has(taskId)) this.releaseSlot(taskId);
+        return;
       }
       case 'queued': { const op = this.store.operation(event.requestKey); if (op && op.state !== 'CONSUMED') { op.state = 'ACKNOWLEDGED'; op.disposition = event.disposition; this.store.saveOperation(op); } break; }
       case 'question': task.inputRequests[event.inputRequestId] = { inputRequestId: event.inputRequestId, method: event.method, title: publicText(event.title), message: publicText(event.message), options: event.options, state: 'PENDING', generation: task.generation, nativeSessionId: task.nativeSessionId, nativeTurnId: task.nativeTurnId, targetCommandId: task.currentCommandId }; this.store.event(task, 'INPUT_REQUESTED', { inputRequestId: event.inputRequestId }); break;
       case 'question_consumed': if (task.inputRequests[event.inputRequestId]) { task.inputRequests[event.inputRequestId].state = 'ANSWERED'; this.store.event(task, 'INPUT_RESPONSE_CONSUMED', { inputRequestId: event.inputRequestId }); } break;
       case 'answered': { const op = this.store.operation(event.requestKey); if (op) { op.state = 'CONSUMED'; op.consumedAt = now(); this.store.saveOperation(op); } break; }
-      case 'failure': this.state(task, 'FAILED'); task.reasonCode = event.code; this.store.event(task, 'NATIVE_FAILURE', { reasonCode: event.code }); break;
+      case 'failure':
+        if (event.requestKey && event.requestKey !== task.currentCommandId) {
+          const op = this.store.operation(event.requestKey);
+          if (op && op.taskId === taskId && op.state === 'DISPATCHING') { op.state = 'UNKNOWN'; op.detail = event.code; this.store.saveOperation(op); }
+          return;
+        }
+        this.update(taskId, t => { this.state(t, 'FAILED'); t.reasonCode = event.code; this.markEffectsUnknown(t); });
+        this.failLaunch(taskId, event.code);
+        return;
       case 'tool_start': (task.effects ??= {})[event.toolCallId] = { toolName: event.toolName, status: 'STARTED', startedAt: now() }; this.store.event(task, 'TOOL_START', { toolName: event.toolName, toolCallId: event.toolCallId, isError: false, detail: event.detail ? publicText(String(event.detail).slice(0, 240)) : undefined }); break;
       case 'tool_end': { const entry = (task.effects ??= {})[event.toolCallId] ??= { toolName: event.toolName }; entry.status = 'SETTLED'; entry.settledAt = now(); entry.isError = event.isError ?? false; const preview = event.result != null ? publicText(String(event.result).slice(0, 4096)) : undefined; if (preview !== undefined) entry.resultPreview = preview; this.store.event(task, 'TOOL_END', { toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError ?? false, detail: event.detail ? publicText(String(event.detail).slice(0, 240)) : undefined, result: preview }); break; }
       case 'extension_error': this.store.event(task, 'EXTENSION_ERROR', { extensionPath: event.extensionPath, extensionEvent: event.event, error: publicText(String(event.error ?? '').slice(0, 500)) }); break;
@@ -755,22 +846,24 @@ export class PiHost {
    *  is already idempotent and the seal receipt depends on it); plain reads are
    *  never fenced. Called inside each mutating handler after the task load. */
   private assertUnsealed(task: Row) { if (task.sealedFor || task.sealRequested) throw new Error('SOURCE_SEALED'); }
-  /** 收口 quiescence gate for source-seal (design §9.4/F33): the write fence
-   *  may only land once the MAIN task can no longer write — a durable terminal
-   *  verdict, or recorded quiescence (stopProof / restart reconciliation) with
-   *  no dispatch left behind it. A QUEUED row is quiescent-flagged for
-   *  admission accounting only and can still launch, so it is not sealed
-   *  source material until stopped out of the queue; a live RUNNING/PREPARING
-   *  owner still has turn/tool writes in flight and refuses honestly. */
-  private sealQuiescent(task: Row) {
-    if (TASK_TERMINAL_STATES.includes(task.state)) return true;
-    const schedulable = task.launchState === 'QUEUED' && !task.intakeClosed && task.state === 'QUEUED';
-    return task.quiescent === true && !schedulable;
+  /** An idle native session can be drained when the caller requests a seal.
+   * A completed result alone does not certify stopped writers. */
+  private canRequestSourceSeal(task: Row) {
+    if (task.launchState === 'QUEUED' || this.activeTasks.has(task.taskId)) return false;
+    if (this.hasMainStopProof(task)) return true;
+    const live = this.live.get(task.taskId);
+    return TASK_TERMINAL_STATES.includes(task.state) && task.nativeIdle === true && !!live && !live.stopping && live.child.connected;
+  }
+  private hasMainStopProof(task: Row) {
+    return task.quiescent === true && (task.launchState === 'REJECTED'
+      || task.stopProof?.method === this.quiescenceMethod
+      || (process.platform === 'win32' && task.stopProof?.method === 'WINDOWS_JOB_CLOSED_ON_HOST_DEATH'));
   }
   private taskCreateKey(taskId: string): string | null { return this.taskOperations(taskId).find(o => !o.kind || o.kind === 'TASK_CREATE')?.requestKey ?? null; }
   interact(taskId: string, body: Row) {
     const prior = this.replay(body); if (prior) { if (prior.taskId !== taskId) throw new Error('IDEMPOTENCY_CONFLICT'); return prior; }
     const task = this.store.task(taskId); this.guard(task, body); this.assertUnsealed(task); const live = this.live.get(taskId);
+    if (this.transitionsInFlight.has(taskId)) throw new Error('LOCAL_TASK_BUSY');
     if (task.state === 'BUDGET_EXCEEDED') throw new Error('BUDGET_EXCEEDED');
     if ((!live || !live.child.connected || live.stopping) && body.kind === 'NATIVE_FOLLOW_UP') {
       let reopenAttach: Row | null = null;
@@ -778,7 +871,7 @@ export class PiHost {
       return this.reopenCompleted(task, body, reopenAttach);
     }
     if (!live || !live.child.connected || live.stopping) throw new Error('NATIVE_TARGET_CHANGED');
-    if (Date.now() >= Number(task.deadlineEpochMillis)) throw new Error('NATIVE_INTAKE_CLOSED');
+    if (task.intakeClosed || (this.activeTasks.has(taskId) && task.state !== 'PAUSED' && Date.now() >= Number(task.deadlineEpochMillis))) throw new Error('NATIVE_INTAKE_CLOSED');
     let attached: Row | null = null;
     if (body.materials !== undefined) {
       // Attachments only have meaning on prompt-shaped intents; an
@@ -795,7 +888,10 @@ export class PiHost {
     } else {
       if (engineBinding(this.executionProfile).digest !== this.engineBinding.digest) throw new Error('ENGINE_BINDING_CHANGED');
       if (typeof body.content !== 'string' || !body.content.trim() || Buffer.byteLength(body.content) > 16384) throw new Error('INVALID_NATIVE_CONTENT');
-      if (body.kind === 'NATIVE_FOLLOW_UP' && task.state !== 'SUCCEEDED') throw new Error('NATIVE_NOT_IDLE');
+      if (body.kind === 'NATIVE_FOLLOW_UP') {
+        if (task.state !== 'SUCCEEDED' || !task.nativeIdle) throw new Error('NATIVE_NOT_IDLE');
+        this.assertSlotAvailable(taskId);
+      }
       if (body.kind === 'NATIVE_STEER' && task.state !== 'RUNNING') throw new Error('NATIVE_NOT_RUNNING');
       if (!['NATIVE_FOLLOW_UP', 'NATIVE_STEER'].includes(body.kind)) throw new Error('NATIVE_ACTION_UNSUPPORTED');
     }
@@ -803,9 +899,10 @@ export class PiHost {
     const op = this.store.transaction(() => {
       const op = this.store.accept(body.requestKey, taskId, body, { state: 'DISPATCHING', dispatchStartedAt: now(), kind: body.kind });
       if (attached) { op.materials = attached.refs; this.materials.mark(attached.refs, 'BOUND', { boundTaskId: taskId, boundRequestKey: body.requestKey }); }
-      if (body.kind === 'NATIVE_FOLLOW_UP') { this.archiveEffects(task); task.currentCommandId = body.requestKey; task.segmentId = randomUUID(); task.nativeIdle = false; delete task.nativeFailure; delete task.reasonCode; this.state(task, 'UNKNOWN'); }
+      if (body.kind === 'NATIVE_FOLLOW_UP') { this.archiveEffects(task); task.currentCommandId = body.requestKey; task.segmentId = randomUUID(); task.nativeIdle = false; task.deadlineEpochMillis = String(Date.now() + this.taskDeadlineMs(task)); delete task.nativeFailure; delete task.reasonCode; this.state(task, 'UNKNOWN'); }
       this.store.save(task); this.store.event(task, 'INPUT_ACCEPTED', { requestKey: body.requestKey, inputKind: body.kind, ...(attached ? { materials: attached.refs.map((r: Row) => ({ materialRef: r.materialRef, sha256: r.sha256, role: r.role })) } : {}) }); return op;
     });
+    if (body.kind === 'NATIVE_FOLLOW_UP') this.activeTasks.add(taskId);
     if (body.kind === 'INPUT_RESPONSE') live.child.send({ type: 'answer', requestKey: body.requestKey, inputRequestId: body.inputRequestId, response: body.response });
     else {
       live.pending.set(body.requestKey, content); live.child.send({ type: body.kind === 'NATIVE_FOLLOW_UP' ? 'prompt' : 'steer', requestKey: body.requestKey, content });
@@ -829,7 +926,7 @@ export class PiHost {
   }
   private reopenCompleted(task: Row, body: Row, attached: Row | null = null) {
     if (!this.canReopen(task)) throw new Error('COMPLETED_SESSION_REQUIRED');
-    if (this.store.tasks().filter(t => t.taskId !== task.taskId && !t.quiescent).length >= this.maxActive()) throw new Error('LOCAL_TASK_BUSY');
+    this.assertSlotAvailable(task.taskId);
     if (!process.env.MODEL_API_KEY) throw new Error('MODEL_AUTH_UNAVAILABLE');
     this.assertModelReferences(task);
     if (task.engineBindingDigest !== this.engineBinding.digest || engineBinding(this.executionProfile).digest !== this.engineBinding.digest) throw new Error('ENGINE_BINDING_CHANGED');
@@ -847,7 +944,7 @@ export class PiHost {
       this.state(task, 'UNKNOWN'); this.store.save(task); this.store.event(task, 'COMPLETED_SESSION_REOPEN_ACCEPTED', { requestKey: body.requestKey, sourceSegmentId: task.reopenFrom.segmentId, ...(attached ? { materials: attached.refs.map((r: Row) => ({ materialRef: r.materialRef, sha256: r.sha256, role: r.role })) } : {}) }); return op;
     });
     if (attached) this.materials.mark(attached.refs, 'CONSUMED', { consumedTaskId: task.taskId, consumedRequestKey: body.requestKey });
-    setImmediate(() => { void this.launch(task.taskId); }); return op;
+    this.scheduleLaunch(task.taskId); return op;
   }
   async command(taskId: string, body: Row) {
     const prior = this.replay(body); if (prior) { if (prior.taskId !== taskId) throw new Error('IDEMPOTENCY_CONFLICT'); return prior; }
@@ -873,7 +970,8 @@ export class PiHost {
       return prior;
     }
     const task = this.store.task(taskId); this.guard(task, body); if (body.intent !== 'STOP') throw new Error('NATIVE_ACTION_UNSUPPORTED');
-    const deadlineCause = String(body.requestKey ?? '').startsWith('deadline-');
+    if (task.sealRequested) throw new Error('SOURCE_SEAL_IN_PROGRESS');
+    const deadlineCause = ['deadline-' + task.segmentId, 'deadline-' + taskId].includes(body.requestKey);
     const op = this.store.accept(body.requestKey, taskId, body, { kind: 'STOP', state: 'UNKNOWN', detail: 'Owned writers not proven stopped' });
     this.update(taskId, t => { t.intakeClosed = true; });
     await this.stopMacTools(taskId);
@@ -887,8 +985,9 @@ export class PiHost {
     const affected = this.affectedChildren(taskId);
     const live = this.live.get(taskId);
     if (!live) {
-      if (['PREPARING', 'RESTORING', 'QUEUED'].includes(task.launchState) && !task.pid && (!task.macToolBinding || this.store.task(taskId).macRemoteQuiescent === true)) { this.update(taskId, t => { t.quiescent = true; t.launchState = 'REJECTED'; this.state(t, 'CANCELLED'); if (deadlineCause) t.reasonCode = 'TASK_DEADLINE_EXCEEDED'; this.store.event(t, 'STOP_APPLIED', { requestKey: body.requestKey, proof: 'UNDISPATCHED_INTAKE_CLOSED', affectedChildren: affected }); }); op.state = 'APPLIED'; op.detail = 'Undispatched task intake durably closed'; op.affectedChildren = affected; this.store.saveOperation(op); this.admitQueue(); }
+      if (['PREPARING', 'RESTORING', 'QUEUED'].includes(task.launchState) && !task.pid && (!task.macToolBinding || this.store.task(taskId).macRemoteQuiescent === true)) { this.update(taskId, t => { t.quiescent = true; t.launchState = 'REJECTED'; if (!TASK_TERMINAL_STATES.includes(t.state)) this.state(t, 'CANCELLED'); if (deadlineCause) t.reasonCode = 'TASK_DEADLINE_EXCEEDED'; this.store.event(t, 'STOP_APPLIED', { requestKey: body.requestKey, proof: 'UNDISPATCHED_INTAKE_CLOSED', affectedChildren: affected }); }); op.state = 'APPLIED'; op.detail = 'Undispatched task intake durably closed'; op.affectedChildren = affected; this.store.saveOperation(op); }
       else if (task.quiescent && (!task.macToolBinding || this.store.task(taskId).macRemoteQuiescent === true)) { this.update(taskId, t => { if (!['SUCCEEDED', 'FAILED', 'CANCELLED', 'BUDGET_EXCEEDED', 'BINDING_UNAVAILABLE'].includes(t.state)) { this.state(t, 'CANCELLED'); if (deadlineCause) t.reasonCode = 'TASK_DEADLINE_EXCEEDED'; } this.store.event(t, 'STOP_APPLIED', { requestKey: body.requestKey, proof: 'ALREADY_QUIESCENT', affectedChildren: affected }); }); op.state = 'APPLIED'; op.detail = 'Task already quiescent; intake durably closed'; op.affectedChildren = affected; this.store.saveOperation(op); }
+      this.releaseSlot(taskId);
       return op;
     }
     live.stopping = true;
@@ -899,14 +998,18 @@ export class PiHost {
     this.update(taskId, t => {
       if (task.macToolBinding) t.localQuiescent = modelStopped;
       if (stopped) { t.quiescent = true; t.stopProof = { ownerBootId: this.bootId, pid: live.child.pid, method: this.quiescenceMethod, observedAt: now(), ...(live.runnerProof ?? {}) }; if (!['SUCCEEDED', 'FAILED', 'BUDGET_EXCEEDED', 'BINDING_UNAVAILABLE'].includes(t.state)) { this.state(t, 'CANCELLED'); if (deadlineCause) t.reasonCode = 'TASK_DEADLINE_EXCEEDED'; } }
-      if (live.mac?.proof) { t.processOwnership = live.mac.proof; if (!stopped) { this.state(t, 'UNKNOWN'); t.reasonCode = live.mac.proof.forkObserved ? 'PROCESS_ESCAPE_NOT_EXCLUDED' : 'PROCESS_QUIESCENCE_UNPROVEN'; } }
+      if (live.mac?.proof) t.processOwnership = live.mac.proof;
+      if (!stopped && !TASK_TERMINAL_STATES.includes(t.state)) {
+        this.state(t, 'UNKNOWN');
+        t.reasonCode = live.mac?.proof?.forkObserved ? 'PROCESS_ESCAPE_NOT_EXCLUDED' : 'PROCESS_QUIESCENCE_UNPROVEN';
+      }
       this.markEffectsUnknown(t);
       if (stopped) this.sealCompleted(t);
       for (const q of Object.values(t.inputRequests) as Row[]) if (['PENDING', 'DISPATCH_STARTED'].includes(q.state)) q.state = 'EXPIRED';
       this.store.event(t, stopped ? 'STOP_APPLIED' : 'STOP_UNKNOWN', { requestKey: body.requestKey, affectedChildren: affected });
     });
     op.state = stopped ? 'APPLIED' : 'UNKNOWN'; op.detail = stopped ? (this.executionProfile === RUNNER_PROFILE ? 'Model no-fork process exited; all registered command contexts closed with zero active/unknown commands; arbitrary escaped processes NOT_PROVEN' : 'Owned transport and process tree exited') : 'Owned writers not proven stopped'; op.affectedChildren = affected; this.store.saveOperation(op);
-    if (stopped) this.admitQueue();
+    this.releaseSlot(taskId);
     return op;
   }
   /** Child-affect summary for STOP / source-seal receipts. Collab children are
@@ -1008,6 +1111,7 @@ export class PiHost {
     });
   }
   private async pause(taskId: string, body: Row, task: Row) {
+    if (this.transitionsInFlight.has(taskId)) throw new Error('LOCAL_TASK_BUSY');
     const live = this.live.get(taskId);
     this.assertUnsealed(task);
     if (!this.canPause(task, live)) throw new Error('NATIVE_NOT_RUNNING');
@@ -1035,6 +1139,7 @@ export class PiHost {
     return op;
   }
   private async resume(taskId: string, body: Row, task: Row) {
+    if (this.transitionsInFlight.has(taskId)) throw new Error('LOCAL_TASK_BUSY');
     const live = this.live.get(taskId);
     this.assertUnsealed(task);
     const connected = !!live && live.ready && !live.stopping && !live.stopped && !!live.child.connected;
@@ -1042,16 +1147,19 @@ export class PiHost {
       if (!connected) throw new Error('NATIVE_TARGET_CHANGED');
       return this.resumeLive(taskId, body, live!, true);
     }
-    if (task.state !== 'PAUSED' || !task.checkpointManifest) throw new Error('CHECKPOINT_INCOMPATIBLE');
+    if (task.state !== 'PAUSED' || !task.checkpointManifest || (!connected && !task.quiescent)) throw new Error('CHECKPOINT_INCOMPATIBLE');
     this.verifyCheckpoint(task);
     if (connected) return this.resumeLive(taskId, body, live!, false);
     return this.resumeRelaunch(taskId, body, task);
   }
   private async resumeLive(taskId: string, body: Row, live: Live, cancelled: boolean) {
+    const parkedIdle = this.store.task(taskId).nativeIdle === true;
+    if (!parkedIdle) this.assertSlotAvailable(taskId);
     const op = this.store.transaction(() => {
       const op = this.store.accept(body.requestKey, taskId, body, { kind: 'RESUME', state: 'DISPATCHING', dispatchStartedAt: now(), resumeVia: 'HELD_GATE' });
       this.store.event(this.store.task(taskId), cancelled ? 'PAUSE_CANCEL_DISPATCHED' : 'RESUME_DISPATCHED', { requestKey: body.requestKey }); return op;
     });
+    if (!parkedIdle) this.activeTasks.add(taskId);
     const reply = await this.requestResume(live, body.requestKey);
     if (reply?.type === 'resumed') {
       this.store.transaction(() => {
@@ -1089,7 +1197,7 @@ export class PiHost {
       if (process.env.MODEL_DEFAULT_MODEL !== task.modelBinding.name || process.env.MODEL_BASE_URL !== task.modelBinding.baseUrl) throw new Error('MODEL_BINDING_CHANGED');
     }
     if (engineBinding(this.executionProfile).digest !== this.engineBinding.digest) throw new Error('ENGINE_BINDING_CHANGED');
-    if (this.store.tasks().filter(t => t.taskId !== taskId && !t.quiescent).length >= this.maxActive()) throw new Error('LOCAL_TASK_BUSY');
+    this.assertSlotAvailable(taskId);
     try { if (realpathSync(task.workspace) !== realpathSync(join(this.store.directory, 'workspaces', taskId))) throw new Error('x'); } catch { throw new Error('CHECKPOINT_INCOMPATIBLE'); }
     const sourceSegmentId = manifest.segmentId;
     const op = this.store.transaction(() => {
@@ -1103,7 +1211,7 @@ export class PiHost {
       delete task.pid; delete task.stopProof; delete task.nativeFailure; delete task.pauseFromState; delete task.reasonCode;
       this.state(task, 'UNKNOWN'); this.store.save(task); this.store.event(task, 'RESUME_CONTINUATION_ACCEPTED', { requestKey: body.requestKey, sourceSegmentId }); return op;
     });
-    setImmediate(() => { void this.launch(taskId); }); return op;
+    this.scheduleLaunch(taskId); return op;
   }
   private extendBudget(taskId: string, body: Row, task: Row) {
     this.assertUnsealed(task);
@@ -1117,7 +1225,7 @@ export class PiHost {
       this.assertModelReferences(task);
       if (process.env.MODEL_DEFAULT_MODEL !== task.modelBinding.name || process.env.MODEL_BASE_URL !== task.modelBinding.baseUrl) throw new Error('MODEL_BINDING_CHANGED');
     }
-    if (this.store.tasks().filter(t => t.taskId !== taskId && !t.quiescent).length >= this.maxActive()) throw new Error('LOCAL_TASK_BUSY');
+    this.assertSlotAvailable(taskId);
     if (engineBinding(this.executionProfile).digest !== this.engineBinding.digest) throw new Error('ENGINE_BINDING_CHANGED');
     const sourceSegmentId = task.segmentId;
     const op = this.store.transaction(() => {
@@ -1131,7 +1239,7 @@ export class PiHost {
       delete task.pid; delete task.stopProof; delete task.nativeFailure; delete task.budgetExceeded; delete task.reasonCode;
       this.state(task, 'UNKNOWN'); this.store.save(task); this.store.event(task, 'BUDGET_EXTENDED', { requestKey: body.requestKey, caps, sourceSegmentId }); return op;
     });
-    setImmediate(() => { void this.launch(taskId); }); return op;
+    this.scheduleLaunch(taskId); return op;
   }
   private validateBudgetExtension(spec: any, task: Row) {
     if (!spec || typeof spec !== 'object' || Array.isArray(spec)) throw new Error('INVALID_BUDGET');
@@ -1155,7 +1263,7 @@ export class PiHost {
       if (!original) this.update(taskId, t => { t.macStopIntent = { requested: true }; });
       const receipt = await this.config.macTools!.stop(task.macToolBinding, original);
       this.update(taskId, t => { t.macStopReceipt = receipt; t.macRemoteQuiescent = receipt.remoteQuiescent === true || receipt.quiescent === true; });
-    } catch { this.update(taskId, t => { t.macRemoteQuiescent = false; t.quiescent = false; this.state(t, 'UNKNOWN'); t.macStopReason = 'MAC_STOP_UNCONFIRMED'; }); }
+    } catch { this.update(taskId, t => { t.macRemoteQuiescent = false; t.quiescent = false; t.macStopReason = 'MAC_STOP_UNCONFIRMED'; }); }
   }
   private async macToolRequest(taskId: string, live: Live, event: Row) {
     try {
@@ -1211,6 +1319,7 @@ export class PiHost {
       if (requestKey && !live.stopping && !this.closed) {
         this.update(taskId, t => { const r = t.runnerCommands?.[requestKey!]; if (r && !r.receipt) { r.status = 'UNKNOWN'; r.reasonCode = code; } t.intakeClosed = true; this.state(t, 'UNKNOWN'); t.reasonCode = 'RUNNER_SETTLEMENT_UNCONFIRMED'; this.store.event(t, 'RUNNER_UNKNOWN', { requestKey, reasonCode: code }); });
         live.stopping = true; await this.terminate(live);
+        this.releaseSlot(taskId);
       }
     }
   }
@@ -1445,7 +1554,7 @@ export class PiHost {
         if (a && a.state === 'RUNNING' && !live.stopping) void this.finishAux(taskId, auxSessionId, 'FAILED', 'AUX_PROCESS_EXITED_UNCONFIRMED', live);
         else this.auxLive.delete(auxSessionId);
       });
-      child.send({ type: 'init', executionProfile: this.executionProfile, workspace: aux.workspace, sessionDir: aux.sessionDir, model: task.modelBinding, probeEnv: task.environment?.envAllowlist ?? [], mcpServers: [], extensions: [] });
+      child.send({ type: 'init', executionProfile: this.executionProfile, workspace: aux.workspace, sessionDir: aux.sessionDir, model: task.modelBinding, probeEnv: task.environment?.envAllowlist ?? [], checkBudget: !!aux.budget, checkWriteScope: true, mcpServers: [], extensions: [] });
     } catch { void this.finishAux(taskId, auxSessionId, 'FAILED', 'LOCAL_LAUNCH_FAILED', this.auxLive.get(auxSessionId)); }
   }
   private auxEvent(taskId: string, auxSessionId: string, live: AuxLive, event: Row) {
@@ -1594,7 +1703,7 @@ export class PiHost {
       op.kind = 'TRANSITION'; op.transitionId = transitionId; op.fromEpoch = fromEpoch; op.toEpoch = toEpoch; op.state = 'DISPATCHING'; this.store.saveOperation(op);
       return op;
     });
-    setImmediate(() => { void this.launch(taskId); });
+    this.scheduleLaunch(taskId);
     return op;
   }
   private transitionModelGate(task: Row) {
@@ -1613,50 +1722,56 @@ export class PiHost {
     const prior = this.replay(body); if (prior) { if (prior.taskId !== taskId) throw new Error('IDEMPOTENCY_CONFLICT'); return prior; }
     exact(body, ['requestKey', 'targetProfile', 'generation', 'nativeSessionId', 'nativeTurnId', 'targetCommandId', 'ownerEpoch']);
     const task = this.store.task(taskId); this.guard(task, body); this.assertUnsealed(task);
+    if (this.transitionsInFlight.has(taskId)) throw new Error('LOCAL_TASK_BUSY');
     const compatibility = this.transitionCompatibility(task, body.targetProfile);
     const transitionId = 'tr-' + randomUUID();
     const live = this.live.get(taskId);
     // Path A: a live task. PAUSE at a real boundary first, then drain the owned
     // child and reopen the sealed session under the new epoch.
     if (this.canPause(task, live)) {
+      this.assertSlotAvailable(taskId);
       this.store.transaction(() => { this.store.accept(body.requestKey, taskId, body, { kind: 'TRANSITION', state: 'ACCEPTED', transitionId }); this.store.event(this.store.task(taskId), 'TRANSITION_ACCEPTED', { requestKey: body.requestKey, transitionId }); });
-      const reply = await this.requestPause(live!, body.requestKey);
-      const fail = (detail: string) => { const op = this.store.operation(body.requestKey)!; op.state = detail === 'TRANSITION_QUIESCE_FAILED' ? 'REQUESTED' : 'UNKNOWN'; op.detail = detail; this.store.saveOperation(op); this.store.event(this.store.task(taskId), 'transition.failed', { transitionId, reasonCode: detail }); return op; };
-      if (reply?.type !== 'paused') { try { await this.requestResume(live!, 'transition-release-' + body.requestKey); } catch {} return fail('TRANSITION_QUIESCE_FAILED'); }
-      const manifest = this.store.transaction(() => {
-        const t = this.store.task(taskId); const m = this.sealCheckpoint(t, live!, reply);
-        if (m) { t.checkpointManifest = m; if (!['CANCELLED', 'FAILED'].includes(t.state)) this.state(t, 'PAUSED'); this.store.save(t); this.store.event(t, 'transition.quiesced', { transitionId, boundary: reply.boundary ?? 'UNKNOWN', method: 'BOUNDARY_CHECKPOINT', checkpointId: m.checkpointId }); }
-        return m;
-      });
-      if (!manifest) { try { await this.requestResume(live!, 'transition-release-' + body.requestKey); } catch {} return fail('TRANSITION_QUIESCE_FAILED'); }
-      live!.stopping = true;
-      const stopped = await this.terminate(live!);
-      this.update(taskId, t => { this.markEffectsUnknown(t); for (const q of Object.values(t.inputRequests) as Row[]) if (['PENDING', 'DISPATCH_STARTED'].includes(q.state)) q.state = 'EXPIRED'; });
-      if (!stopped) return fail('TRANSITION_QUIESCE_UNPROVEN');
-      // Post-kill drift check: the held boundary must have kept the sealed bytes.
-      try { this.verifySealedFile(manifest); } catch { return fail('CHECKPOINT_INCOMPATIBLE'); }
-      this.transitionModelGate(this.store.task(taskId));
-      return this.transitionAdmit(taskId, body, transitionId, compatibility, 'BOUNDARY_CHECKPOINT', manifest);
-    }
-    // Path B: task already PAUSED with a sealed checkpoint (possibly post-restart).
-    if (task.state === 'PAUSED' && task.checkpointManifest) {
-      this.verifyCheckpoint(task);
-      if (live && live.child.connected && !live.stopping) {
-        live.stopping = true;
-        const stopped = await this.terminate(live);
-        if (!stopped) { const op = this.store.accept(body.requestKey, taskId, body, { kind: 'TRANSITION', state: 'UNKNOWN', detail: 'TRANSITION_QUIESCE_UNPROVEN' }); return op; }
-        this.verifyCheckpoint(task);
-        this.update(taskId, t => { this.markEffectsUnknown(t); });
+      this.activeTasks.add(taskId);
+      this.transitionsInFlight.add(taskId);
+      try {
+        const reply = await this.requestPause(live!, body.requestKey);
+        const fail = (detail: string) => { const op = this.store.operation(body.requestKey)!; op.state = detail === 'TRANSITION_QUIESCE_FAILED' ? 'REQUESTED' : 'UNKNOWN'; op.detail = detail; this.store.saveOperation(op); const current = this.store.task(taskId); this.store.event(current, 'transition.failed', { transitionId, reasonCode: detail }); return op; };
+        if (reply?.type !== 'paused') { try { await this.requestResume(live!, 'transition-release-' + body.requestKey); } catch {} return fail('TRANSITION_QUIESCE_FAILED'); }
+        if (this.store.task(taskId).intakeClosed) return fail('NATIVE_INTAKE_CLOSED');
+        const manifest = this.store.transaction(() => {
+          const t = this.store.task(taskId); const m = this.sealCheckpoint(t, live!, reply);
+          if (m) { t.checkpointManifest = m; if (!['CANCELLED', 'FAILED'].includes(t.state)) this.state(t, 'PAUSED'); this.store.save(t); this.store.event(t, 'transition.quiesced', { transitionId, boundary: reply.boundary ?? 'UNKNOWN', method: 'BOUNDARY_CHECKPOINT', checkpointId: m.checkpointId }); }
+          return m;
+        });
+        if (!manifest) { try { await this.requestResume(live!, 'transition-release-' + body.requestKey); } catch {} return fail('TRANSITION_QUIESCE_FAILED'); }
+        live!.stopping = true;
+        const stopped = await this.terminate(live!);
+        this.update(taskId, t => { this.markEffectsUnknown(t); for (const q of Object.values(t.inputRequests) as Row[]) if (['PENDING', 'DISPATCH_STARTED'].includes(q.state)) q.state = 'EXPIRED'; });
+        if (!stopped) return fail('TRANSITION_QUIESCE_UNPROVEN');
+        // Post-kill drift check: the held boundary must have kept the sealed bytes.
+        try { this.verifySealedFile(manifest); } catch { return fail('CHECKPOINT_INCOMPATIBLE'); }
+        const current = this.store.task(taskId);
+        if (current.intakeClosed) return fail('NATIVE_INTAKE_CLOSED');
+        this.transitionModelGate(current);
+        return this.transitionAdmit(taskId, body, transitionId, compatibility, 'BOUNDARY_CHECKPOINT', manifest);
+      } finally {
+        this.transitionsInFlight.delete(taskId);
+        const current = this.store.task(taskId);
+        if (current.generation === task.generation && (live!.stopping || current.nativeIdle || current.intakeClosed)) this.releaseSlot(taskId);
       }
-      if (this.store.tasks().filter(t => t.taskId !== taskId && !t.quiescent).length >= this.maxActive()) throw new Error('LOCAL_TASK_BUSY');
-      this.transitionModelGate(this.store.task(taskId));
+    }
+    // Path B: an already stopped PAUSED session with a sealed checkpoint.
+    if (task.state === 'PAUSED' && task.checkpointManifest && task.quiescent) {
+      this.verifyCheckpoint(task);
+      this.assertSlotAvailable(taskId);
+      this.transitionModelGate(task);
       const manifest = task.checkpointManifest;
       this.store.event(this.store.task(taskId), 'transition.quiesced', { transitionId, method: 'BOUNDARY_CHECKPOINT', checkpointId: manifest.checkpointId, priorPause: true });
       return this.transitionAdmit(taskId, body, transitionId, compatibility, 'BOUNDARY_CHECKPOINT', manifest);
     }
     // Path C: proven completed+sealed session — stopped-session continuation.
     if (this.canReopen(task)) {
-      if (this.store.tasks().filter(t => t.taskId !== taskId && !t.quiescent).length >= this.maxActive()) throw new Error('LOCAL_TASK_BUSY');
+      this.assertSlotAvailable(taskId);
       this.transitionModelGate(task);
       if (task.engineBindingDigest !== this.engineBinding.digest) throw new Error('ENGINE_BINDING_CHANGED');
       if (!this.config.childModule && (process.env.MODEL_DEFAULT_MODEL !== task.modelBinding.name || process.env.MODEL_BASE_URL !== task.modelBinding.baseUrl || digest(task.modelBinding) !== task.completedSessionSeal.modelBindingDigest)) throw new Error('MODEL_BINDING_CHANGED');
@@ -1892,7 +2007,7 @@ export class PiHost {
         if (c && c.state === 'RUNNING' && !live.stopping) void this.finishCollabChild(taskId, collabId, childId, 'FAILED', 'COLLAB_PROCESS_EXITED_UNCONFIRMED', live);
         else this.collabLive.delete(collabId + '/' + childId);
       });
-      proc.send({ type: 'init', executionProfile: this.executionProfile, workspace: child.workspace, sessionDir: child.sessionDir, model: task.modelBinding, probeEnv: task.environment?.envAllowlist ?? [], mcpServers: [], extensions: [] });
+      proc.send({ type: 'init', executionProfile: this.executionProfile, workspace: child.workspace, sessionDir: child.sessionDir, model: task.modelBinding, probeEnv: task.environment?.envAllowlist ?? [], checkBudget: !!child.budget, checkWriteScope: true, mcpServers: [], extensions: [] });
     } catch (error) { const reason = error instanceof Error && /^[A-Z][A-Z0-9_]+$/.test(error.message) ? error.message : 'LOCAL_LAUNCH_FAILED'; void this.finishCollabChild(taskId, collabId, childId, 'FAILED', reason, this.collabLive.get(collabId + '/' + childId)); }
   }
   private collabEvent(taskId: string, collabId: string, childId: string, live: CollabLive, event: Row) {
@@ -2239,10 +2354,7 @@ export class PiHost {
     const sealId = 'seal-' + randomUUID();
     this.store.transaction(() => {
       const t = this.store.task(taskId); this.assertUnsealed(t);
-      // Quiescence gate is atomic with the fence landing: a non-quiescent main
-      // task refuses before sealRequested exists, so no drain/fence state can
-      // half-apply over in-flight turn or tool writes.
-      if (!this.sealQuiescent(t)) throw new Error('TASK_NOT_QUIESCENT');
+      if (!this.canRequestSourceSeal(t)) throw new Error('TASK_NOT_QUIESCENT');
       t.sealRequested = { sealId, requestedAt: now(), requestKey: body.requestKey };
       this.store.save(t); this.store.event(t, 'task.source.seal.requested', { sealId, requestKey: body.requestKey, target, materials: materialRefs.length });
     });
@@ -2251,6 +2363,23 @@ export class PiHost {
     // If the drain throws, roll back the fence — a half-sealed source with no
     // seal record is worse than an honest rejection.
     try {
+      if (!this.hasMainStopProof(task)) {
+        const live = this.live.get(taskId)!;
+        live.stopping = true;
+        await this.stopMacTools(taskId);
+        const modelStopped = await this.terminate(live);
+        const stopped = modelStopped && (!task.macToolBinding || this.store.task(taskId).macRemoteQuiescent === true);
+        this.update(taskId, t => {
+          t.intakeClosed = true;
+          if (task.macToolBinding) t.localQuiescent = modelStopped;
+          if (live.mac?.proof) t.processOwnership = live.mac.proof;
+          if (stopped) {
+            t.quiescent = true;
+            t.stopProof = { ownerBootId: this.bootId, pid: live.child.pid, method: this.quiescenceMethod, observedAt: now(), ...(live.runnerProof ?? {}) };
+          }
+        });
+        if (!stopped) throw new Error('TASK_NOT_QUIESCENT');
+      }
       for (const c of Object.values(this.store.task(taskId).collaborations ?? {}) as Row[]) if (c.state === 'RUNNING') await this.stopCollaboration(taskId, c.collaborationId, 'SOURCE_SEALED');
       for (const [auxId, live] of [...this.auxLive]) if (live.taskId === taskId) await this.finishAux(taskId, auxId, 'CANCELLED', 'SOURCE_SEALED', live);
       // A live terminal keeps writing into the sealed workspace — drain it
@@ -2689,7 +2818,40 @@ export class PiHost {
     req.on('close', drop); res.on('close', drop);
   }
   async listen(port = 0) { await new Promise<void>(done => this.server.listen(port, '127.0.0.1', done)); return (this.server.address() as any).port as number; }
-  async close() { if (this.closed) return; this.closed = true; for (const socket of [...this.sseConnections]) socket.destroy(); await new Promise<void>(done => this.server.close(() => done())); for (const taskId of new Set([...this.terminals.values()].map(t => t.taskId))) await this.killTaskTerminals(taskId, 'HOST_CLOSE'); for (const [auxId, live] of this.auxLive) await this.finishAux(live.taskId, auxId, 'CANCELLED', 'HOST_CLOSE', live); for (const task of this.store.tasks()) if (Object.values(task.collaborations ?? {}).some((c: any) => c.state === 'RUNNING')) await this.stopTaskCollaborations(task.taskId, 'HOST_CLOSE'); for (const [taskId, live] of this.live) { live.stopping = true; await this.stopMacTools(taskId); const modelStopped = await this.terminate(live); const stopped = modelStopped && (!this.store.task(taskId).macToolBinding || this.store.task(taskId).macRemoteQuiescent === true); if (stopped) this.update(taskId, t => { t.quiescent = true; t.stopProof = { ownerBootId: this.bootId, pid: live.child.pid, method: this.quiescenceMethod, observedAt: now(), ...(live.runnerProof ?? {}) }; if (!['SUCCEEDED', 'FAILED', 'PAUSED', 'BUDGET_EXCEEDED', 'BINDING_UNAVAILABLE'].includes(t.state)) this.state(t, 'CANCELLED'); this.sealCompleted(t); this.store.event(t, 'HOST_CLOSE_STOPPED'); }); else this.update(taskId, t => { if (live.mac?.proof) t.processOwnership = live.mac.proof; if (!['BUDGET_EXCEEDED'].includes(t.state)) this.state(t, 'UNKNOWN'); t.reasonCode = 'PROCESS_QUIESCENCE_UNPROVEN'; this.markEffectsUnknown(t); this.store.event(t, 'HOST_CLOSE_STOP_UNKNOWN'); }); } this.storageClosed = true; this.store.close(); }
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    for (const socket of this.sseConnections) socket.destroy();
+    await new Promise<void>(done => this.server.close(() => done()));
+    for (const taskId of new Set([...this.terminals.values()].map(t => t.taskId))) await this.killTaskTerminals(taskId, 'HOST_CLOSE');
+    for (const [auxId, live] of this.auxLive) await this.finishAux(live.taskId, auxId, 'CANCELLED', 'HOST_CLOSE', live);
+    for (const task of this.store.tasks()) await this.stopTaskCollaborations(task.taskId, 'HOST_CLOSE');
+    for (const [taskId, live] of this.live) {
+      if (this.store.task(taskId).quiescent) continue;
+      live.stopping = true;
+      await this.stopMacTools(taskId);
+      const modelStopped = await this.terminate(live);
+      const task = this.store.task(taskId);
+      const stopped = modelStopped && (!task.macToolBinding || task.macRemoteQuiescent === true);
+      this.update(taskId, t => {
+        if (t.state !== 'PAUSED' || !stopped) t.intakeClosed = true;
+        if (live.mac?.proof) t.processOwnership = live.mac.proof;
+        if (stopped) {
+          t.quiescent = true;
+          t.stopProof = { ownerBootId: this.bootId, pid: live.child.pid, method: this.quiescenceMethod, observedAt: now(), ...(live.runnerProof ?? {}) };
+          if (!TASK_TERMINAL_STATES.includes(t.state) && t.state !== 'PAUSED') this.state(t, 'CANCELLED');
+          this.sealCompleted(t);
+        } else if (!TASK_TERMINAL_STATES.includes(t.state)) {
+          this.state(t, 'UNKNOWN');
+          t.reasonCode = 'PROCESS_QUIESCENCE_UNPROVEN';
+        }
+        if (!stopped) this.markEffectsUnknown(t);
+        this.store.event(t, stopped ? 'HOST_CLOSE_STOPPED' : 'HOST_CLOSE_STOP_UNKNOWN');
+      });
+    }
+    this.storageClosed = true;
+    this.store.close();
+  }
   private async http(req: IncomingMessage, res: ServerResponse) {
     const send = (status: number, body: any) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
     try {
@@ -2719,7 +2881,7 @@ export class PiHost {
           const page = this.store.taskDirectory(url.searchParams.get('cursor'), limit);
           result = { ...this.identity(), nextCursor: page.nextCursor, items: page.items.map(t => ({ taskId: t.taskId, projectId: t.projectId, engineId: t.engineId, engineVersion: t.engineVersion, state: t.state })) };
         }
-        if (path[0] === 'engines') result = { ...this.identity(), items: [{ engineId: ENGINE_ID, version: PI_VERSION, executableDigest: this.engineBinding.digest, engineBindingDigest: this.engineBinding.digest, engineProvenanceKind: this.engineBinding.provenance.kind, profileId: this.profileId, executionProfile: this.executionProfile, supportsPause: true, supportsResume: true, ...this.executionAvailability(), executionPolicy: { profile: this.executionProfile, profileId: this.profileId, sandbox: this.executionProfile === RUNNER_PROFILE ? 'MODEL_NO_FORK_AND_REGISTERED_PROCESS_GROUPS' : isNoForkProfile(this.executionProfile) ? 'DENY_PROCESS_FORK' : 'UNDECLARED', osSandboxClaimed: isNoForkProfile(this.executionProfile), approvalPolicy: 'HUMAN_VIA_ASK_USER_TOOL', toolAdmission: 'AWAITED_GATE_CHECK', toolAllowlist: this.executionTools, policyPresets: Object.keys(this.policyPresets()), frozen: false, semanticsNote: 'Engine-level defaults; a task freezes its policy at launch and never mutates it in-run' }, capabilities: { executionModes: ['WORKSPACE_TASK', 'CONTEXT_ONLY'], steer: true, followUp: true, stop: true, pause: true, resume: true, inputMethods: ['confirm', 'select', 'input'], environmentBinding: true, budget: true, writeScope: true, audit: true, diagnostics: true, contextPackages: true, auxiliarySessions: true, transitions: { sameEngine: true, crossEngine: false }, collaborations: { dag: true, isolatedCheckout: true, maxChildren: COLLAB_MAX_CHILDREN, maxActivePerTask: COLLAB_MAX_PER_TASK }, adoptions: { conflictCheck: true, partial: true, modes: ['ALL', 'FILES'] }, terminals: { pty: false, resize: false, maxPerTask: MAX_TERMINALS_PER_TASK, outputBuffer: TERMINAL_BUFFER, signals: ['TERM', 'KILL', 'INT'] }, mcpServers: { transport: 'stdio', exposure: 'direct', maxServers: 8, envIndirection: false }, skills: { managedProfileOnly: true, contentBinding: 'sha256' }, extensions: { managedProfileOnly: true, contentBinding: 'sha256' } } }] };
+        if (path[0] === 'engines') result = { ...this.identity(), items: [{ engineId: ENGINE_ID, version: PI_VERSION, executableDigest: this.engineBinding.digest, engineBindingDigest: this.engineBinding.digest, engineProvenanceKind: this.engineBinding.provenance.kind, profileId: this.profileId, executionProfile: this.executionProfile, supportsPause: true, supportsResume: true, ...this.executionAvailability(), executionPolicy: { profile: this.executionProfile, profileId: this.profileId, sandbox: this.executionProfile === RUNNER_PROFILE ? 'MODEL_NO_FORK_AND_REGISTERED_PROCESS_GROUPS' : isNoForkProfile(this.executionProfile) ? 'DENY_PROCESS_FORK' : 'UNDECLARED', osSandboxClaimed: isNoForkProfile(this.executionProfile), approvalPolicy: 'HUMAN_VIA_ASK_USER_TOOL', toolAdmission: 'NATIVE', toolAllowlist: this.executionTools, policyPresets: Object.keys(this.policyPresets()), frozen: false, semanticsNote: 'Engine-level defaults; a task freezes its policy at launch and never mutates it in-run' }, capabilities: { executionModes: ['WORKSPACE_TASK', 'CONTEXT_ONLY'], steer: true, followUp: true, stop: true, pause: true, resume: true, inputMethods: ['confirm', 'select', 'input'], environmentBinding: true, budget: true, writeScope: true, audit: true, diagnostics: true, contextPackages: true, auxiliarySessions: true, transitions: { sameEngine: true, crossEngine: false }, collaborations: { dag: true, isolatedCheckout: true, maxChildren: COLLAB_MAX_CHILDREN, maxActivePerTask: COLLAB_MAX_PER_TASK }, adoptions: { conflictCheck: true, partial: true, modes: ['ALL', 'FILES'] }, terminals: { pty: false, resize: false, maxPerTask: MAX_TERMINALS_PER_TASK, outputBuffer: TERMINAL_BUFFER, signals: ['TERM', 'KILL', 'INT'] }, mcpServers: { transport: 'stdio', exposure: 'direct', maxServers: 8, envIndirection: false }, skills: { managedProfileOnly: true, contentBinding: 'sha256' }, extensions: { managedProfileOnly: true, contentBinding: 'sha256' } } }] };
       }
       if (path.length === 1 && method === 'POST') {
         if (path[0] === 'task-preflights') result = this.preflight(body);

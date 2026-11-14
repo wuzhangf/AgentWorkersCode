@@ -14,7 +14,7 @@ const fixture = fileURLToPath(new URL('./fixture-child.mjs', import.meta.url));
 async function wait(fn) { for (let n = 0; n < 200; n++) { const v = await fn(); if (v) return v; await new Promise(r => setTimeout(r, 25)); } throw new Error('WAIT_TIMEOUT'); }
 async function setup() { const state = mkdtempSync(join(tmpdir(), 'nwf-pi-state-')); const p = project(); const host = new PiHost({ state, token, childModule: fixture }); host.register('demo', p); const port = await host.listen(); return { host, state, project: p, call: client(port) }; }
 function client(port) { return async (path, body, headers = {}) => { const response = await fetch(`http://127.0.0.1:${port}${path.startsWith('/worker-host') ? '' : '/local/v1'}${path}`, { method: body ? 'POST' : 'GET', headers: { Authorization: 'Bearer ' + token, ...(body ? { 'Content-Type': 'application/json', ...(body.requestKey ? { 'Idempotency-Key': body.requestKey } : {}) } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined }); return { status: response.status, body: await response.json() }; }; }
-async function create(call, instruction = 'hello', extra = {}) { const pf = (await call('/task-preflights', { projectId: 'demo', engineId: 'pi' })).body; const body = { requestKey: 'create-' + Math.random().toString(36).slice(2), projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction, ...extra }; const result = await call('/tasks', body); assert.equal(result.status, 202); return { request: body, taskId: result.body.taskId, receipt: result.body }; }
+async function create(call, instruction = 'hello', extra = {}) { const pf = (await call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi' })).body; const body = { requestKey: 'create-' + Math.random().toString(36).slice(2), projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction, ...extra }; const result = await call('/tasks', body); assert.equal(result.status, 202); return { request: body, taskId: result.body.taskId, receipt: result.body }; }
 const guard = t => ({ generation: t.generation, nativeSessionId: t.nativeSessionId, targetCommandId: t.currentCommandId });
 function confirmGolden(vectors) { assert.equal(vectors.schemaVersion, 'worker-host-golden/1'); assert.ok(vectors.items.length > 0); const ids = new Set(); for (const vector of vectors.items) { assert.ok(!ids.has(vector.id), `duplicate golden vector id: ${vector.id}`); ids.add(vector.id); assert.equal(canonical(vector.input), vector.canonical, vector.id); assert.equal(hash(canonical(vector.input)), vector.sha256, vector.id); } }
 
@@ -285,7 +285,7 @@ for (const escaped of [false, true]) test(`macOS real ${escaped ? 'setsid escape
     const stop = (await s.call(`/tasks/${c.taskId}/commands`, { requestKey: 'mac-stop-tree', intent: 'STOP', ...guard(d) })).body;
     assert.equal(stop.state, 'UNKNOWN');
     const stopped = (await s.call(`/tasks/${c.taskId}`)).body;
-    assert.equal(stopped.state, 'UNKNOWN'); assert.equal(stopped.quiescent, false);
+    assert.equal(stopped.state, 'SUCCEEDED'); assert.equal(stopped.quiescent, false);
     assert.equal(stopped.processOwnership.forkObserved, true); assert.equal(stopped.completedSessionSeal, undefined);
     assert.equal(stopped.capabilities.completedSessionFollowUpAfterRestart, false);
     assert.equal((await s.call(`/tasks/${c.taskId}/artifacts`)).body.reasonCode, 'STOP_TO_SEAL_RESULTS');
@@ -297,7 +297,7 @@ for (const escaped of [false, true]) test(`macOS real ${escaped ? 'setsid escape
   } finally { if (pid) try { process.kill(pid, 'SIGKILL'); } catch {} await s.host.close(); }
 });
 
-test('macOS host SIGKILL guardian stops a real writer while restart keeps uncertain dispatch UNKNOWN', { skip: process.platform !== 'darwin' }, async () => {
+test('macOS host SIGKILL guardian stops a real writer and preserves the settled turn', { skip: process.platform !== 'darwin' }, async () => {
   const state = mkdtempSync(join(tmpdir(), 'nwf-pi-mac-parent-')); const p = project(); let descendantPid; let restarted;
   const parent = spawn(process.execPath, [fileURLToPath(new URL('./pause-host.mjs', import.meta.url)), state, p, token], { stdio: ['ignore', 'pipe', 'pipe'] });
   try {
@@ -310,7 +310,7 @@ test('macOS host SIGKILL guardian stops a real writer while restart keeps uncert
     await new Promise(r => setTimeout(r, 200)); const size = readFileSync(join(d.workspace, 'heartbeat.txt')).length;
     await new Promise(r => setTimeout(r, 150)); assert.equal(readFileSync(join(d.workspace, 'heartbeat.txt')).length, size);
     restarted = new PiHost({ state, token, childModule: fixture }); const t = restarted.store.task(c.taskId);
-    assert.equal(t.state, 'UNKNOWN'); assert.equal(t.quiescent, false); assert.equal(restarted.create(c.request).taskId, c.taskId);
+    assert.equal(t.state, 'SUCCEEDED'); assert.equal(t.quiescent, false); assert.equal(restarted.create(c.request).taskId, c.taskId);
     assert.equal(readFileSync(join(d.workspace, 'dispatch-count.txt'), 'utf8').trim().split('\n').length, 1);
   } finally { if (parent.exitCode === null && parent.signalCode === null) parent.kill('SIGKILL'); if (descendantPid) try { process.kill(descendantPid, 'SIGKILL'); } catch {} await restarted?.close(); }
 });

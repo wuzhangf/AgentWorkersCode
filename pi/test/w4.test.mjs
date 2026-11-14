@@ -15,7 +15,7 @@ const w4host = fileURLToPath(new URL('./w4-host.mjs', import.meta.url));
 async function wait(fn, timeout = 12000) { const deadline = Date.now() + timeout; while (Date.now() < deadline) { const v = await fn(); if (v) return v; await new Promise(r => setTimeout(r, 25)); } throw new Error('WAIT_TIMEOUT'); }
 async function setup(extra = {}) { const state = mkdtempSync(join(tmpdir(), 'nwf-pi-w4-state-')); const p = project(); const host = new PiHost({ state, token, childModule: fixture, ...extra }); host.register('demo', p); const port = await host.listen(); return { host, state, project: p, call: client(port) }; }
 function client(port) { return async (path, body, headers = {}) => { const response = await fetch(`http://127.0.0.1:${port}${path.startsWith('/worker-host') ? '' : '/local/v1'}${path}`, { method: body ? 'POST' : 'GET', headers: { Authorization: 'Bearer ' + token, ...(body ? { 'Content-Type': 'application/json', ...(body.requestKey ? { 'Idempotency-Key': body.requestKey } : {}) } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined }); return { status: response.status, body: await response.json() }; }; }
-async function create(call, instruction = 'hello', extra = {}) { const pf = (await call('/task-preflights', { projectId: 'demo', engineId: 'pi' })).body; const body = { requestKey: 'create-' + Math.random().toString(36).slice(2), projectId: 'demo', engineId: 'pi', optionsRevision: pf.optionsRevision, instruction, ...extra }; const result = await call('/tasks', body); return { request: body, taskId: result.body.taskId, receipt: result.body, status: result.status, code: result.body.code }; }
+async function create(call, instruction = 'hello', extra = {}) { const pf = (await call('/task-preflights', { projectId: 'demo', engineId: 'sage-pi' })).body; const body = { requestKey: 'create-' + Math.random().toString(36).slice(2), projectId: 'demo', engineId: 'sage-pi', optionsRevision: pf.optionsRevision, instruction, ...extra }; const result = await call('/tasks', body); return { request: body, taskId: result.body.taskId, receipt: result.body, status: result.status, code: result.body.code }; }
 const guard = t => ({ generation: t.generation, nativeSessionId: t.nativeSessionId, targetCommandId: t.currentCommandId });
 const events = async (call, taskId) => (await call(`/tasks/${taskId}/events?limit=100`)).body.items;
 
@@ -188,25 +188,30 @@ test('audit chain and diagnostics view: complete durable facts, no bodies, redac
   } finally { await s.host.close(); }
 });
 
-test('concurrency slots queue creates, admit in order on release, restart re-admits exactly once', async () => {
+test('completion releases the execution slot and queued creates run once in FIFO order', async () => {
   const s = await setup({ maxActiveTasks: 1 }); try {
     const a = await create(s.call, 'waiting-never'); const da = await wait(async () => { const d = (await s.call('/tasks/' + a.taskId)).body; return d.state === 'RUNNING' && d; });
-    const b = await create(s.call, 'hello'); assert.equal(b.status, 202);
+    const b = await create(s.call, 'question'); assert.equal(b.status, 202);
     const c = await create(s.call, 'hello-again');
     let db = (await s.call('/tasks/' + b.taskId)).body; let dc = (await s.call('/tasks/' + c.taskId)).body;
     assert.equal(db.state, 'QUEUED'); assert.equal(db.launchState, 'QUEUED'); assert.equal(db.queue.position, 1); assert.ok(db.queueOrdinal);
     assert.equal(dc.queue.position, 2); assert.ok(dc.queueOrdinal > db.queueOrdinal);
     assert.equal(db.capabilities.stop, true, 'queued task accepts STOP');
     const stopped = await s.call(`/tasks/${a.taskId}/commands`, { requestKey: 'stop-a', intent: 'STOP', ...guard(da) }); assert.equal(stopped.body.state, 'APPLIED');
-    db = await wait(async () => { const d = (await s.call('/tasks/' + b.taskId)).body; return d.state === 'SUCCEEDED' && d; });
-    assert.equal((await s.call('/tasks/' + c.taskId)).body.state, 'QUEUED', 'second queued create still waits while B holds the slot');
+    db = await wait(async () => {
+      const requests = (await s.call('/tasks/' + b.taskId + '/input-requests')).body.items;
+      if (requests.length) return (await s.call('/tasks/' + b.taskId)).body;
+    });
+    assert.equal((await s.call('/tasks/' + c.taskId)).body.state, 'QUEUED', 'B holds the slot while it is executing');
     assert.equal(readFileSync(join(db.workspace, 'dispatch-count.txt'), 'utf8').trim().split('\n').length, 1, 'admitted intent dispatched exactly once');
     assert.ok((await events(s.call, b.taskId)).some(e => e.kind === 'ADMITTED'));
-    const stoppedB = await s.call(`/tasks/${b.taskId}/commands`, { requestKey: 'stop-b', intent: 'STOP', ...guard(db) }); assert.equal(stoppedB.body.state, 'APPLIED');
+    const answered = await s.call(`/tasks/${b.taskId}/input-requests/q1/responses`, { requestKey: 'answer-b', response: { value: 'yes' }, ...guard(db) });
+    assert.equal(answered.status, 202, JSON.stringify(answered.body));
     dc = await wait(async () => { const d = (await s.call('/tasks/' + c.taskId)).body; return d.state === 'SUCCEEDED' && d; });
     assert.ok((await events(s.call, c.taskId)).find(e => e.kind === 'ADMITTED').queueOrdinal > (await events(s.call, b.taskId)).find(e => e.kind === 'ADMITTED').queueOrdinal);
-    // graceful restart: a queued intent is re-evaluated and dispatched exactly once;
-    // C still holds the slot until close, so the new create lands QUEUED
+    assert.equal((await s.call('/tasks/' + b.taskId)).body.quiescent, false, 'settlement frees capacity while retaining the idle session');
+    const running = await create(s.call, 'waiting-never');
+    await wait(async () => (await s.call('/tasks/' + running.taskId)).body.state === 'RUNNING');
     const e = await create(s.call, 'hello-after-restart'); assert.equal((await s.call('/tasks/' + e.taskId)).body.state, 'QUEUED');
     await s.host.close();
     const host = new PiHost({ state: s.state, token, childModule: fixture, maxActiveTasks: 1 }); const call = client(await host.listen());
@@ -218,7 +223,7 @@ test('concurrency slots queue creates, admit in order on release, restart re-adm
   } finally { await s.host.close(); }
 });
 
-test('SIGKILL reconciles the unknown writer: Windows Job close frees the slot, macOS retains it', { skip: !['win32', 'darwin'].includes(process.platform) }, async () => {
+test('SIGKILL re-admits queued work without replaying the interrupted dispatch', { skip: !['win32', 'darwin'].includes(process.platform) }, async () => {
   const state = mkdtempSync(join(tmpdir(), 'nwf-pi-w4-qkill-')); const p = project();
   const child = spawn(process.execPath, [w4host, state, p, token, '', '1'], { stdio: ['ignore', 'pipe', 'pipe'] });
   const port = await new Promise(resolve => child.stdout.once('data', data => resolve(Number(String(data).trim()))));
@@ -228,24 +233,21 @@ test('SIGKILL reconciles the unknown writer: Windows Job close frees the slot, m
   child.kill('SIGKILL'); await new Promise(resolve => child.once('exit', resolve));
   const host = new PiHost({ state, token, childModule: fixture, maxActiveTasks: 1 }); const call2 = client(await host.listen());
   try {
-    await new Promise(r => setTimeout(r, 300));
     const da = (await call2('/tasks/' + a.taskId)).body; assert.equal(da.state, 'UNKNOWN');
+    assert.equal(da.intakeClosed, true);
     if (process.platform === 'win32') {
       // Host death closed the never-inherited Job: writer quiescence is proven
       // (outcome stays UNKNOWN) and the queued intent wins the freed slot.
       const row = host.store.task(a.taskId);
       assert.equal(row.quiescent, true);
       assert.equal(row.stopProof?.method, 'WINDOWS_JOB_CLOSED_ON_HOST_DEATH');
-      const db = await wait(async () => { const d = (await call2('/tasks/' + b.taskId)).body; return d.state === 'SUCCEEDED' && d; });
-      assert.equal(readFileSync(join(db.workspace, 'dispatch-count.txt'), 'utf8').trim().split('\n').length, 1, 'admitted intent dispatched exactly once');
     } else {
-      const db = (await call2('/tasks/' + b.taskId)).body;
-      assert.equal(db.state, 'QUEUED', 'queued intent re-evaluated honestly: unknown writer still holds the slot');
-      assert.equal(db.queue.position, 1);
-      assert.equal(existsSync(join(state, 'workspaces', b.taskId, 'dispatch-count.txt')), false, 'queued intent was never dispatched');
-      const op = (await call2('/worker-host/v1/operations/lookup', { requestKey: b.request.requestKey })).body;
-      assert.equal(op.state, 'ACCEPTED', 'queued create receipt never entered DISPATCHING');
+      assert.equal(da.quiescent, false);
+      assert.equal(da.stopProof, undefined);
     }
+    const db = await wait(async () => { const d = (await call2('/tasks/' + b.taskId)).body; return d.state === 'SUCCEEDED' && d; });
+    assert.equal(readFileSync(join(db.workspace, 'dispatch-count.txt'), 'utf8').trim().split('\n').length, 1);
+    assert.equal(readFileSync(join(da.workspace, 'dispatch-count.txt'), 'utf8').trim().split('\n').length, 1);
   } finally { await host.close(); }
 });
 

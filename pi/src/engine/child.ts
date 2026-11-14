@@ -56,8 +56,22 @@ const hostChecks = new Map<string, (verdict: any) => void>();
 let hostCheckSeq = 0;
 function hostCheck(kind: 'PROVIDER_REQUEST' | 'TOOL_ADMISSION', fields: Record<string, unknown> = {}): Promise<any> {
   const checkId = 'chk-' + (++hostCheckSeq);
-  return new Promise(resolve => { hostChecks.set(checkId, resolve); send({ type: 'gate_check', checkId, kind, ...fields }); });
+  return new Promise(resolve => {
+    const complete = (verdict: any) => {
+      clearTimeout(timer);
+      hostChecks.delete(checkId);
+      resolve(verdict);
+    };
+    const timer = setTimeout(() => complete({ action: 'unavailable', reason: 'HOST_GATE_TIMEOUT' }), 5000);
+    hostChecks.set(checkId, complete);
+    if (!process.connected) { complete({ action: 'unavailable', reason: 'HOST_GATE_DISCONNECTED' }); return; }
+    process.send?.({ type: 'gate_check', checkId, kind, ...fields }, undefined, {}, error => {
+      if (error) complete({ action: 'unavailable', reason: 'HOST_GATE_DISCONNECTED' });
+    });
+  });
 }
+
+let gateFailure: string | undefined;
 
 function quietBoundary(): string | null {
   // A tool still executing (not merely held at admission) is real in-flight work;
@@ -125,11 +139,11 @@ async function init(config: any) {
     path: '<inline:worker-boundary-gate>', resolvedPath: '<inline:worker-boundary-gate>', hidden: true,
     sourceInfo: createSyntheticSourceInfo('<inline:worker-boundary-gate>', { source: 'inline', scope: 'temporary' }),
     handlers: new Map<string, ((event: any, ctx: any) => any)[]>([
-      // After any PAUSE hold, every provider request is admitted through the host gate:
-      // a budget verdict of terminate aborts before the request is ever dispatched.
       ['before_provider_request', [async (_event: any, ctx: any) => {
         if (gate.closed) await gateHold('PROVIDER_REQUEST');
+        if (!config.checkBudget) return undefined;
         const verdict = await hostCheck('PROVIDER_REQUEST');
+        if (verdict.action === 'unavailable') gateFailure = verdict.reason;
         if (verdict.action !== 'allow') ctx.abort();
         return undefined;
       }]],
@@ -140,7 +154,9 @@ async function init(config: any) {
       // fabricate a tool error into model context and corrupt its plan.
       ['tool_call', [async (event: any, ctx: any) => {
         if (gate.closed) await gateHold('TOOL_ADMISSION', event?.toolCallId);
+        if (!config.checkBudget && !config.checkWriteScope) return undefined;
         const verdict = await hostCheck('TOOL_ADMISSION', { toolName: event?.toolName, toolCallId: event?.toolCallId, input: event?.input });
+        if (verdict.action === 'unavailable') gateFailure = verdict.reason;
         if (verdict.action === 'block') return { block: true, reason: verdict.reason ?? 'TOOL_ADMISSION_DENIED' };
         if (verdict.action !== 'allow') { ctx.abort(); return { block: true, reason: verdict.reason ?? 'RUN_TERMINATED', terminate: true }; }
         return undefined;
@@ -336,11 +352,13 @@ process.on('message', (command: any) => {
       return;
     }
     if (command.type === 'prompt') {
+      gateFailure = undefined;
       directPrompt = { requestKey: command.requestKey, waitingUser: true };
       send({ type: 'started', requestKey: command.requestKey });
       await session.prompt(command.content, { expandPromptTemplates: false });
       await session.waitForIdle();
-      send({ type: 'settled', requestKey: command.requestKey });
+      if (gateFailure) send({ type: 'failure', requestKey: command.requestKey, code: gateFailure });
+      else send({ type: 'settled', requestKey: command.requestKey });
     } else if (command.type === 'steer') {
       const disposition = await session.steer(command.content);
       send({ type: 'queued', requestKey: command.requestKey, disposition });
@@ -348,5 +366,5 @@ process.on('message', (command: any) => {
       const answer = questions.get(command.inputRequestId); if (!answer) throw new Error('NATIVE_INPUT_EXPIRED');
       answer(command.response); send({ type: 'answered', requestKey: command.requestKey });
     }
-  })().catch(() => { send({ type: 'failure', requestKey: command.requestKey, code: 'PI_EXECUTION_FAILED' }); });
+  })().catch(() => { send({ type: 'failure', requestKey: command.requestKey, code: gateFailure ?? 'PI_EXECUTION_FAILED' }); });
 });
