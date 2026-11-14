@@ -173,16 +173,78 @@ export class PiHost {
   identity() { return { schemaVersion: 'worker-local/1', storeId: this.store.identity.storeId, bootId: this.bootId, storeGuard: 'HEADER_V1' }; }
   private executionAvailability() {
     if (this.config.childModule) return { available: true, availability: 'AVAILABLE', reasonCode: null };
+    const entry = this.models()[0];
     if (!process.env.MODEL_DEFAULT_MODEL || !process.env.MODEL_BASE_URL) return { available: false, availability: 'UNCONFIGURED', reasonCode: 'MODEL_BINDING_UNCONFIGURED' };
-    if (!process.env.MODEL_API_KEY) return { available: false, availability: 'UNCONFIGURED', reasonCode: 'MODEL_AUTH_UNAVAILABLE' };
-    let base: URL; try { base = new URL(process.env.MODEL_BASE_URL); if (!['http:', 'https:'].includes(base.protocol)) throw new Error(); } catch { return { available: false, availability: 'UNCONFIGURED', reasonCode: 'MODEL_BASE_URL_INVALID' }; }
+    if (!process.env[entry.apiKeyEnv ?? 'MODEL_API_KEY']) return { available: false, availability: 'UNCONFIGURED', reasonCode: 'MODEL_AUTH_UNAVAILABLE' };
+    let base: URL; try { base = new URL(entry.baseUrl); if (!['http:', 'https:'].includes(base.protocol)) throw new Error(); } catch { return { available: false, availability: 'UNCONFIGURED', reasonCode: 'MODEL_BASE_URL_INVALID' }; }
     if (base.hostname === 'opencode.ai' && !process.env.LLM_HEADER_x_opencode_session) return { available: false, availability: 'UNCONFIGURED', reasonCode: 'MODEL_HEADER_UNCONFIGURED' };
     return { available: true, availability: 'AVAILABLE', reasonCode: null };
   }
   private assertModelReferences(task: Row) {
     if (this.config.childModule) return;
-    if (!process.env.MODEL_API_KEY) throw new Error('MODEL_AUTH_UNAVAILABLE');
+    if (!process.env[task.modelBinding.apiKeyEnv ?? 'MODEL_API_KEY']) throw new Error('MODEL_AUTH_UNAVAILABLE');
     if (task.modelBinding.headerEnvKeys.some((key: string) => !process.env[key])) throw new Error('MODEL_HEADER_UNCONFIGURED');
+  }
+  /** Model catalog: PI_MODELS (JSON array) adds alternates to the env default.
+   *  Each entry inherits baseUrl/apiKeyEnv/headerEnvKeys/api from the MODEL_*
+   *  environment unless overridden — one provider serving many model names is
+   *  the common case. */
+  private models(): Row[] {
+    const fallback: Row = {
+      name: process.env.MODEL_DEFAULT_MODEL ?? 'fixture-model',
+      displayName: process.env.MODEL_DEFAULT_MODEL ?? 'fixture-model',
+      baseUrl: process.env.MODEL_BASE_URL ?? 'http://127.0.0.1:1',
+      apiKeyEnv: 'MODEL_API_KEY',
+      headerEnvKeys: Object.keys(process.env).filter(k => k.startsWith('LLM_HEADER_')),
+      api: 'openai-completions', contextWindow: 131072, maxTokens: 8192,
+    };
+    let extra: Row[] = [];
+    try { const parsed = JSON.parse(process.env.PI_MODELS ?? '[]'); if (Array.isArray(parsed)) extra = parsed; } catch { /* malformed catalog ignored */ }
+    const catalog = [fallback, ...extra.filter(e => e && typeof e.name === 'string' && e.name !== fallback.name)];
+    return catalog.map((e): Row => ({
+      name: e.name, displayName: e.displayName ?? e.name,
+      baseUrl: e.baseUrl ?? fallback.baseUrl, apiKeyEnv: e.apiKeyEnv ?? fallback.apiKeyEnv,
+      headerEnvKeys: e.headerEnvKeys ?? fallback.headerEnvKeys,
+      api: e.api ?? fallback.api, contextWindow: e.contextWindow ?? fallback.contextWindow,
+      maxTokens: e.maxTokens ?? fallback.maxTokens,
+      ...(Array.isArray(e.efforts) ? { efforts: e.efforts } : {}),
+      ...(Array.isArray(e.contexts) ? { contexts: e.contexts.filter((c: unknown) => typeof c === 'number' && Number.isInteger(c) && c > 0) } : {}),
+    }));
+  }
+  /** Catalog entry → task modelBinding. `name` is the only caller-supplied
+   *  fact; endpoints and credentials stay operator configuration. */
+  private modelBinding(name?: string): Row {
+    const entry = name === undefined ? this.models()[0] : this.models().find(e => e.name === name);
+    if (!entry) throw new Error('MODEL_REF_UNKNOWN');
+    return { name: entry.name, baseUrl: entry.baseUrl, apiKeyEnv: entry.apiKeyEnv, headerEnvKeys: entry.headerEnvKeys,
+      api: entry.api, contextWindow: entry.contextWindow, maxTokens: entry.maxTokens,
+      parameterQualification: 'OPERATOR_CONFIGURED_COMPATIBILITY_ASSUMPTIONS' };
+  }
+  /** The task binding still resolves against the current catalog — a renamed
+   *  or re-pointed catalog entry invalidates resume/reopen paths. */
+  private modelBindingCurrent(task: Row): boolean {
+    const entry = this.models().find(e => e.name === task.modelBinding.name);
+    return entry !== undefined && entry.baseUrl === task.modelBinding.baseUrl
+      && (entry.apiKeyEnv ?? 'MODEL_API_KEY') === (task.modelBinding.apiKeyEnv ?? 'MODEL_API_KEY')
+      && JSON.stringify(entry.headerEnvKeys ?? []) === JSON.stringify(task.modelBinding.headerEnvKeys ?? []);
+  }
+  /** Optional per-message model/effort override resolved against the catalog.
+   *  Returns the binding the session should assert — undefined when the
+   *  message carries no selection. */
+  private messageModel(task: Row, body: Row): Row | undefined {
+    if (body.model === undefined && body.effort === undefined && body.context === undefined) return undefined;
+    const model = body.model !== undefined ? this.modelBinding(body.model) : { ...task.modelBinding };
+    if (body.effort !== undefined) {
+      const entry = this.models().find(e => e.name === model.name);
+      if (!entry?.efforts?.includes(body.effort)) throw new Error('MODEL_EFFORT_UNSUPPORTED');
+      model.effort = body.effort;
+    }
+    if (body.context !== undefined) {
+      const entry = this.models().find(e => e.name === model.name);
+      if (!entry?.contexts?.includes(body.context)) throw new Error('MODEL_CONTEXT_UNSUPPORTED');
+      model.contextWindow = body.context;
+    }
+    return model;
   }
   capabilities() { return { schemaVersion: 'worker-capabilities/1', items: [
     { id: 'P01', implementation: 'GAP', qualification: 'PARTIAL', availability: 'AVAILABLE', semantics: 'Persistent native SDK session; explicit completed-session reopen after proven STOP/restart; public finalized history; fork remains GAP', evidenceRef: 'workers/pi/test/host.test.mjs', reasonCode: 'SESSION_FORK_GAP' },
@@ -240,7 +302,8 @@ export class PiHost {
   preflight(body: Row) {
     exact(body, ['projectId', 'engineId', 'policyPresetId']); if (body.engineId !== ENGINE_ID) throw new Error('ENGINE_NOT_REGISTERED'); const p = this.project(body.projectId);
     const policyPreset = this.policyPreset(body.policyPresetId);
-    const result = { projectId: p.projectId, engineId: ENGINE_ID, engineVersion: PI_VERSION, executableDigest: this.engineBinding.digest, engineBindingDigest: this.engineBinding.digest, engineProvenanceKind: this.engineBinding.provenance.kind, profileId: this.profileId, executionProfile: this.executionProfile, profileHome: null, loadsUserExtensions: false, headRevision: p.headRevision, hasUncommittedChanges: p.hasUncommittedChanges, workingCopyPolicy: 'COMMITTED_BASE_ONLY', executionModes: ['WORKSPACE_TASK', 'CONTEXT_ONLY'], policyPreset };
+    const result = { projectId: p.projectId, engineId: ENGINE_ID, engineVersion: PI_VERSION, executableDigest: this.engineBinding.digest, engineBindingDigest: this.engineBinding.digest, engineProvenanceKind: this.engineBinding.provenance.kind, profileId: this.profileId, executionProfile: this.executionProfile, profileHome: null, loadsUserExtensions: false, headRevision: p.headRevision, hasUncommittedChanges: p.hasUncommittedChanges, workingCopyPolicy: 'COMMITTED_BASE_ONLY', executionModes: ['WORKSPACE_TASK', 'CONTEXT_ONLY'], policyPreset,
+      models: this.models().map(m => ({ modelRef: m.name, displayName: m.displayName, imageInput: false, ...(m.efforts ? { efforts: m.efforts } : {}), ...(m.contexts?.length ? { contexts: m.contexts } : {}) })) };
     return { ...result, optionsRevision: digest(result) };
   }
   detail(task: Row) {
@@ -250,19 +313,19 @@ export class PiHost {
     const legacyDeadlineStop = !task.reasonCode && task.state === 'CANCELLED' && this.store.operation('deadline-' + task.taskId)?.state === 'APPLIED';
     return { ...task, reasonCode: task.reasonCode ?? (legacyDeadlineStop ? 'TASK_DEADLINE_EXCEEDED' : undefined), goal: undefined, output: undefined, inputRequests: undefined, publicMessages: undefined, pending: undefined, queue, storeId: this.store.identity.storeId, bootId: this.bootId, lastEventAt: lastEvent?.occurredAt ?? null, lastEventKind: lastEvent?.kind ?? null,
       contextPackages: Object.values(task.contextPackages ?? {}).map((p: any) => this.packageMeta(p)), auxiliarySessions: Object.values(task.auxSessions ?? {}).map((a: any) => this.auxPublic(a)), transitions: task.transitions ?? [], collaborations: Object.values(task.collaborations ?? {}).map((c: any) => this.collabPublic(c)),
-      sourceCapabilities: this.sourceCapabilities(task), executionPolicy: this.executionPolicyProjection(task),
+      sourceCapabilities: this.sourceCapabilities(task, lastEvent), executionPolicy: this.executionPolicyProjection(task),
       capabilities: { stop: (task.launchState === 'QUEUED' && !task.intakeClosed) || (!task.intakeClosed && !task.quiescent && (connected || ['PREPARING', 'RESTORING'].includes(task.launchState))), steer: connected && task.state === 'RUNNING', followUp: (connected && task.state === 'SUCCEEDED') || this.canReopen(task), completedSessionFollowUpAfterRestart: this.canReopen(task), pause: this.canPause(task, live), resume: this.canResume(task, live), extendBudget: task.state === 'BUDGET_EXCEEDED', observeAfterRestart: true, continueAfterRestart: task.state === 'PAUSED' && this.checkpointValid(task) } };
   }
   /** source-capabilities/1: source facts only. The Host reports what the source
    *  itself can do — DENIED/mobile-grant verdicts stay with the PAC, which
    *  computes device permission independently (D §4.2). */
-  private sourceCapabilities(task: Row) {
+  private sourceCapabilities(task: Row, lastEvent: Row | null) {
     const sealed = !!task.sealedFor || !!task.sealRequested;
     const contextOnly = task.executionMode === 'CONTEXT_ONLY';
     const blocked = sealed ? 'SOURCE_SEALED' : task.intakeClosed ? 'TASK_INTAKE_CLOSED' : null;
     const a = (state: string, reasonCode: string | null = null, extra: Row = {}) => ({ state, reasonCode, ...extra });
     const write = (available: Row) => contextOnly ? a('UNSUPPORTED', 'CONTEXT_ONLY_OPERATION_DENIED') : blocked ? a('BLOCKED_BY_STATE', blocked) : available;
-    return { schemaVersion: 'source-capabilities/1', revision: digest({ generation: task.generation, segmentId: task.segmentId, ownerEpoch: String(task.ownerEpoch ?? '1') }), observedAt: now(), actions: {
+    return { schemaVersion: 'source-capabilities/1', revision: digest({ generation: task.generation, segmentId: task.segmentId, ownerEpoch: String(task.ownerEpoch ?? '1') }), observedAt: lastEvent?.occurredAt ?? task.createdAt ?? null, actions: {
       'sideQuestion.create': write(a('AVAILABLE', null, { limits: { maxQuestionBytes: AUX_MAX_QUESTION, maxSessionsPerTask: AUX_MAX_PER_TASK, maxContextPackages: AUX_MAX_PACKAGES, deadlineMs: AUX_DEADLINE_MS }, semantics: 'ISOLATED_SNAPSHOT_COPY_READ_ONLY_SINGLE_TURN' })),
       'collaboration.create': write(a('AVAILABLE', null, { limits: { maxChildren: COLLAB_MAX_CHILDREN, maxActivePerTask: COLLAB_MAX_PER_TASK, hostPool: this.maxCollabChildren(), maxGoalBytes: COLLAB_MAX_GOAL, deadlineMs: COLLAB_DEADLINE_MS }, semantics: 'ISOLATED_CHECKOUT_DAG_SOFT_BUDGET' })),
       'collaboration.preflight': write(a('AVAILABLE', null, { limits: { maxChildren: COLLAB_MAX_CHILDREN, ttlMs: COLLAB_PREFLIGHT_TTL_MS, maxPerTask: COLLAB_PREFLIGHT_MAX }, semantics: 'VALIDATE_ONLY_NO_SPAWN_FROZEN_PLAN' })),
@@ -305,7 +368,7 @@ export class PiHost {
   }
   private replay(body: Row) { const previous = this.store.operation(id(body.requestKey)); if (previous && previous.bodyDigest !== digest(body)) throw new Error('IDEMPOTENCY_CONFLICT'); return previous; }
   create(body: Row) {
-    exact(body, ['requestKey', 'projectId', 'engineId', 'optionsRevision', 'instruction', 'budget', 'writeScope', 'environment', 'mcpServers', 'skills', 'extensions', 'executionMode', 'policyPresetId', 'deadlineMs']); const prior = this.replay(body); if (prior) return prior;
+    exact(body, ['requestKey', 'projectId', 'engineId', 'optionsRevision', 'instruction', 'budget', 'writeScope', 'environment', 'mcpServers', 'skills', 'extensions', 'executionMode', 'policyPresetId', 'deadlineMs', 'model', 'effort', 'context']); const prior = this.replay(body); if (prior) return prior;
     const mode = body.executionMode ?? 'WORKSPACE_TASK';
     if (!['WORKSPACE_TASK', 'CONTEXT_ONLY'].includes(mode)) throw new Error('EXECUTION_MODE_UNSUPPORTED');
     if (mode === 'CONTEXT_ONLY' && ['writeScope','environment','mcpServers','skills','extensions','policyPresetId'].some(k => body[k] !== undefined)) throw new Error('CONTEXT_ONLY_RESOURCE_DENIED');
@@ -320,7 +383,17 @@ export class PiHost {
     const mcpServers = this.validateMcpServers(body.mcpServers);
     const skills = this.validateDeclaredDirs(body.skills, 'skill');
     const extensions = this.validateDeclaredDirs(body.extensions, 'extension');
-    const model = { name: process.env.MODEL_DEFAULT_MODEL ?? 'fixture-model', baseUrl: process.env.MODEL_BASE_URL ?? 'http://127.0.0.1:1', headerEnvKeys: Object.keys(process.env).filter(k => k.startsWith('LLM_HEADER_')), api: 'openai-completions', contextWindow: 131072, maxTokens: 8192, parameterQualification: 'OPERATOR_CONFIGURED_COMPATIBILITY_ASSUMPTIONS' };
+    const model = this.modelBinding(typeof body.model === 'string' ? body.model : undefined);
+    if (body.effort !== undefined) {
+      const entry = this.models().find(e => e.name === model.name);
+      if (!entry?.efforts?.includes(body.effort)) throw new Error('MODEL_EFFORT_UNSUPPORTED');
+      model.effort = body.effort;
+    }
+    if (body.context !== undefined) {
+      const entry = this.models().find(e => e.name === model.name);
+      if (!entry?.contexts?.includes(body.context)) throw new Error('MODEL_CONTEXT_UNSUPPORTED');
+      model.contextWindow = body.context;
+    }
     if (!/^https?:\/\//.test(model.baseUrl)) throw new Error('MODEL_BASE_URL_REQUIRED');
     this.admitQueue();
     const taskId = 'native-' + randomUUID(); const queued = this.activeTasks.size >= this.maxActive();
@@ -545,7 +618,7 @@ export class PiHost {
       this.assertModelReferences(task);
       this.prepareResources(taskId);
       const environment: NodeJS.ProcessEnv = {};
-      for (const key of ['PATH', 'Path', 'SystemRoot', 'COMSPEC', 'PATHEXT', 'ProgramFiles', 'ProgramFiles(x86)', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', 'MODEL_API_KEY', ...task.modelBinding.headerEnvKeys]) if (process.env[key]) environment[key] = process.env[key];
+      for (const key of ['PATH', 'Path', 'SystemRoot', 'COMSPEC', 'PATHEXT', 'ProgramFiles', 'ProgramFiles(x86)', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', task.modelBinding.apiKeyEnv ?? 'MODEL_API_KEY', ...task.modelBinding.headerEnvKeys]) if (process.env[key]) environment[key] = process.env[key];
       const envCopied: string[] = [];
       for (const key of task.environment?.envAllowlist ?? []) if (process.env[key]) { environment[key] = process.env[key]; envCopied.push(key); }
       if (envCopied.length) this.update(taskId, t => { t.environmentBinding = { ...t.environmentBinding, envCopied }; });
@@ -585,7 +658,7 @@ export class PiHost {
       }
       const macCapabilities = task.macToolBinding ? await this.config.macTools!.capabilities(task.macToolBinding) : [];
       if (this.closed || live.stopping || this.store.task(taskId).intakeClosed) return;
-      child.send({ type: 'init', executionMode: task.executionMode ?? 'WORKSPACE_TASK', macCapabilities, executionProfile: this.executionProfile, workspace: task.workspace, sessionDir: task.sessionDir, model: task.modelBinding, sessionFile: task.launchState === 'RESTORING' ? task.nativeSessionFile : undefined, probeEnv: task.environment?.envAllowlist ?? [], toolAllowlist: task.toolAllowlist,
+      child.send({ type: 'init', executionMode: task.executionMode ?? 'WORKSPACE_TASK', macCapabilities, executionProfile: this.executionProfile, workspace: task.workspace, sessionDir: task.sessionDir, model: task.modelBinding, catalog: this.models().map(e => ({ name: e.name, baseUrl: e.baseUrl, apiKeyEnv: e.apiKeyEnv, headerEnvKeys: e.headerEnvKeys, api: e.api, contextWindow: e.contextWindow, maxTokens: e.maxTokens, ...(Array.isArray(e.efforts) ? { efforts: e.efforts } : {}), ...(e.contexts?.length ? { contexts: e.contexts } : {}) })), sessionFile: task.launchState === 'RESTORING' ? task.nativeSessionFile : undefined, probeEnv: task.environment?.envAllowlist ?? [], toolAllowlist: task.toolAllowlist,
         checkBudget: !!task.budget, checkWriteScope: !!task.writeScope,
         mcpServers: (task.mcpServers ?? []).map((s: Row) => ({ id: s.id, config: { command: s.command, args: s.args, env: s.env, exposure: 'direct', timeout: 30 } })),
         extensions: (task.declaredExtensions ?? []).map((e: Row) => ({ name: e.name })) });
@@ -715,7 +788,7 @@ export class PiHost {
       const op = this.store.operation(requestKey)!; op.state = 'DISPATCHING'; op.launchState = 'DISPATCH_STARTED'; op.dispatchStartedAt = now(); this.store.saveOperation(op); this.store.event(task, 'DISPATCHING');
     });
     if (this.config.faultPoint === 'dispatching') { process.exit(91); }
-    live.pending.set(requestKey, content); live.child.send({ type: 'prompt', requestKey, content });
+    live.pending.set(requestKey, content); live.child.send({ type: 'prompt', requestKey, content, model: task.modelBinding });
   }
   private event(taskId: string, live: Live, event: Row) {
     if (this.closed || this.live.get(taskId) !== live) return;
@@ -738,7 +811,7 @@ export class PiHost {
       // First observed turn start is a real run fact even when dispatch was
       // bypassed (steer/follow-up sent straight to a live child); ??= keeps
       // the earliest recorded fact.
-      case 'started': task.runStartedAt ??= now(); if (!['PAUSED', 'PAUSE_REQUESTED'].includes(task.state)) this.state(task, 'RUNNING'); break;
+      case 'started': task.runStartedAt ??= now(); if (!['PAUSED', 'PAUSE_REQUESTED'].includes(task.state)) this.state(task, 'RUNNING'); if (event.model) task.actualModel = event.model; break;
       case 'assistant': {
         const text = publicText(event.text ?? ''); if (text) { task.output = (task.output + text + '\n').slice(-262144); task.publicMessages.push({ role: 'assistant', text, commandId: task.currentCommandId, nativeTurnId: task.nativeTurnId, occurredAt: now() }); }
         if (event.failed) task.nativeFailure = event.errorCode;
@@ -895,17 +968,19 @@ export class PiHost {
       if (body.kind === 'NATIVE_STEER' && task.state !== 'RUNNING') throw new Error('NATIVE_NOT_RUNNING');
       if (!['NATIVE_FOLLOW_UP', 'NATIVE_STEER'].includes(body.kind)) throw new Error('NATIVE_ACTION_UNSUPPORTED');
     }
+    const model = body.kind === 'INPUT_RESPONSE' ? undefined : this.messageModel(task, body);
     const content = body.content + (attached?.injectedText ?? '');
     const op = this.store.transaction(() => {
       const op = this.store.accept(body.requestKey, taskId, body, { state: 'DISPATCHING', dispatchStartedAt: now(), kind: body.kind });
       if (attached) { op.materials = attached.refs; this.materials.mark(attached.refs, 'BOUND', { boundTaskId: taskId, boundRequestKey: body.requestKey }); }
+      if (model) { task.modelBinding = model; task.configuredModel = model.name; task.modelBindingDigest = digest(model); }
       if (body.kind === 'NATIVE_FOLLOW_UP') { this.archiveEffects(task); task.currentCommandId = body.requestKey; task.segmentId = randomUUID(); task.nativeIdle = false; task.deadlineEpochMillis = String(Date.now() + this.taskDeadlineMs(task)); delete task.nativeFailure; delete task.reasonCode; this.state(task, 'UNKNOWN'); }
       this.store.save(task); this.store.event(task, 'INPUT_ACCEPTED', { requestKey: body.requestKey, inputKind: body.kind, ...(attached ? { materials: attached.refs.map((r: Row) => ({ materialRef: r.materialRef, sha256: r.sha256, role: r.role })) } : {}) }); return op;
     });
     if (body.kind === 'NATIVE_FOLLOW_UP') this.activeTasks.add(taskId);
     if (body.kind === 'INPUT_RESPONSE') live.child.send({ type: 'answer', requestKey: body.requestKey, inputRequestId: body.inputRequestId, response: body.response });
     else {
-      live.pending.set(body.requestKey, content); live.child.send({ type: body.kind === 'NATIVE_FOLLOW_UP' ? 'prompt' : 'steer', requestKey: body.requestKey, content });
+      live.pending.set(body.requestKey, content); live.child.send({ type: body.kind === 'NATIVE_FOLLOW_UP' ? 'prompt' : 'steer', requestKey: body.requestKey, content, model: task.modelBinding });
       if (attached) { this.materials.mark(attached.refs, 'CONSUMED', { consumedTaskId: taskId, consumedRequestKey: body.requestKey }); this.store.event(this.store.task(taskId), 'message.materials', { requestKey: body.requestKey, materials: attached.refs.map((r: Row) => ({ materialRef: r.materialRef, sha256: r.sha256, role: r.role, assembledAs: r.assembledAs })) }); }
     }
     return op;
@@ -930,14 +1005,18 @@ export class PiHost {
     if (!process.env.MODEL_API_KEY) throw new Error('MODEL_AUTH_UNAVAILABLE');
     this.assertModelReferences(task);
     if (task.engineBindingDigest !== this.engineBinding.digest || engineBinding(this.executionProfile).digest !== this.engineBinding.digest) throw new Error('ENGINE_BINDING_CHANGED');
-    if (process.env.MODEL_DEFAULT_MODEL !== task.modelBinding.name || process.env.MODEL_BASE_URL !== task.modelBinding.baseUrl || digest(task.modelBinding) !== task.completedSessionSeal.modelBindingDigest) throw new Error('MODEL_BINDING_CHANGED');
+    if (!this.modelBindingCurrent(task) || digest(task.modelBinding) !== task.completedSessionSeal.modelBindingDigest) throw new Error('MODEL_BINDING_CHANGED');
     if (typeof body.content !== 'string' || !body.content.trim() || Buffer.byteLength(body.content) > 16384) throw new Error('INVALID_NATIVE_CONTENT');
     if (realpathSync(task.workspace) !== realpathSync(join(this.store.directory, 'workspaces', task.taskId))) throw new Error('OWNED_WORKSPACE_REQUIRED');
     if (hash(readFileSync(task.nativeSessionFile)) !== task.completedSessionSeal.sessionSha256) throw new Error('NATIVE_SESSION_SEAL_CHANGED');
+    // The seal checks above verify the session under the binding it was
+    // sealed with; a requested switch rebinds the reopened session here.
+    const model = this.messageModel(task, body);
     const content = body.content + (attached?.injectedText ?? '');
     const op = this.store.transaction(() => {
       const op = this.store.accept(body.requestKey, task.taskId, body, { kind: body.kind, state: 'ACCEPTED', sourceSegmentId: task.segmentId, reopenedCompletedSession: true });
       if (attached) { op.materials = attached.refs; this.materials.mark(attached.refs, 'BOUND', { boundTaskId: task.taskId, boundRequestKey: body.requestKey }); }
+      if (model) { task.modelBinding = model; task.configuredModel = model.name; task.modelBindingDigest = digest(model); }
       if (task.artifactManifest) { task.artifactHistory = [...(task.artifactHistory ?? []), task.artifactManifest]; delete task.artifactManifest; }
       this.archiveEffects(task);
       task.reopenFrom = task.completedSessionSeal; task.goal = content; task.currentCommandId = body.requestKey; task.segmentId = randomUUID(); task.generation = randomUUID(); task.intakeClosed = false; task.quiescent = false; task.nativeIdle = false; task.deadlineEpochMillis = String(Date.now() + this.taskDeadlineMs(task)); task.launchState = 'RESTORING'; delete task.pid; delete task.stopProof; delete task.nativeFailure; delete task.completedSessionSeal; delete task.reasonCode;
@@ -1194,7 +1273,7 @@ export class PiHost {
     if (!this.config.childModule) {
       if (!process.env.MODEL_API_KEY) throw new Error('MODEL_AUTH_UNAVAILABLE');
       this.assertModelReferences(task);
-      if (process.env.MODEL_DEFAULT_MODEL !== task.modelBinding.name || process.env.MODEL_BASE_URL !== task.modelBinding.baseUrl) throw new Error('MODEL_BINDING_CHANGED');
+      if (!this.modelBindingCurrent(task)) throw new Error('MODEL_BINDING_CHANGED');
     }
     if (engineBinding(this.executionProfile).digest !== this.engineBinding.digest) throw new Error('ENGINE_BINDING_CHANGED');
     this.assertSlotAvailable(taskId);
@@ -1223,7 +1302,7 @@ export class PiHost {
     if (!this.config.childModule) {
       if (!process.env.MODEL_API_KEY) throw new Error('MODEL_AUTH_UNAVAILABLE');
       this.assertModelReferences(task);
-      if (process.env.MODEL_DEFAULT_MODEL !== task.modelBinding.name || process.env.MODEL_BASE_URL !== task.modelBinding.baseUrl) throw new Error('MODEL_BINDING_CHANGED');
+      if (!this.modelBindingCurrent(task)) throw new Error('MODEL_BINDING_CHANGED');
     }
     this.assertSlotAvailable(taskId);
     if (engineBinding(this.executionProfile).digest !== this.engineBinding.digest) throw new Error('ENGINE_BINDING_CHANGED');
@@ -1530,7 +1609,7 @@ export class PiHost {
       });
       mkdirSync(aux.sessionDir, { recursive: true });
       const environment: NodeJS.ProcessEnv = {};
-      for (const key of ['PATH', 'Path', 'SystemRoot', 'COMSPEC', 'PATHEXT', 'ProgramFiles', 'ProgramFiles(x86)', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', 'MODEL_API_KEY', ...task.modelBinding.headerEnvKeys]) if (process.env[key]) environment[key] = process.env[key];
+      for (const key of ['PATH', 'Path', 'SystemRoot', 'COMSPEC', 'PATHEXT', 'ProgramFiles', 'ProgramFiles(x86)', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', task.modelBinding.apiKeyEnv ?? 'MODEL_API_KEY', ...task.modelBinding.headerEnvKeys]) if (process.env[key]) environment[key] = process.env[key];
       for (const key of task.environment?.envAllowlist ?? []) if (process.env[key]) environment[key] = process.env[key];
       environment.PI_CODING_AGENT_DIR = join(aux.sessionDir, 'profile'); environment.PI_TELEMETRY = 'off';
       const module = this.config.childModule ?? fileURLToPath(new URL('../engine/bootstrap.js', import.meta.url));
@@ -1710,7 +1789,7 @@ export class PiHost {
     if (!this.config.childModule) {
       if (!process.env.MODEL_API_KEY) throw new Error('MODEL_AUTH_UNAVAILABLE');
       this.assertModelReferences(task);
-      if (process.env.MODEL_DEFAULT_MODEL !== task.modelBinding.name || process.env.MODEL_BASE_URL !== task.modelBinding.baseUrl) throw new Error('MODEL_BINDING_CHANGED');
+      if (!this.modelBindingCurrent(task)) throw new Error('MODEL_BINDING_CHANGED');
     }
     if (engineBinding().digest !== this.engineBinding.digest) throw new Error('ENGINE_BINDING_CHANGED');
   }
@@ -1774,7 +1853,7 @@ export class PiHost {
       this.assertSlotAvailable(taskId);
       this.transitionModelGate(task);
       if (task.engineBindingDigest !== this.engineBinding.digest) throw new Error('ENGINE_BINDING_CHANGED');
-      if (!this.config.childModule && (process.env.MODEL_DEFAULT_MODEL !== task.modelBinding.name || process.env.MODEL_BASE_URL !== task.modelBinding.baseUrl || digest(task.modelBinding) !== task.completedSessionSeal.modelBindingDigest)) throw new Error('MODEL_BINDING_CHANGED');
+      if (!this.config.childModule && (!this.modelBindingCurrent(task) || digest(task.modelBinding) !== task.completedSessionSeal.modelBindingDigest)) throw new Error('MODEL_BINDING_CHANGED');
       if (realpathSync(task.workspace) !== realpathSync(join(this.store.directory, 'workspaces', task.taskId))) throw new Error('OWNED_WORKSPACE_REQUIRED');
       if (hash(readFileSync(task.nativeSessionFile)) !== task.completedSessionSeal.sessionSha256) throw new Error('NATIVE_SESSION_SEAL_CHANGED');
       this.store.event(this.store.task(taskId), 'transition.quiesced', { transitionId, method: 'COMPLETED_SESSION', proof: task.completedSessionSeal.quiescenceMethod });
@@ -1983,7 +2062,7 @@ export class PiHost {
       }));
       mkdirSync(child.sessionDir, { recursive: true });
       const environment: NodeJS.ProcessEnv = {};
-      for (const key of ['PATH', 'Path', 'SystemRoot', 'COMSPEC', 'PATHEXT', 'ProgramFiles', 'ProgramFiles(x86)', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', 'MODEL_API_KEY', ...task.modelBinding.headerEnvKeys]) if (process.env[key]) environment[key] = process.env[key];
+      for (const key of ['PATH', 'Path', 'SystemRoot', 'COMSPEC', 'PATHEXT', 'ProgramFiles', 'ProgramFiles(x86)', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', task.modelBinding.apiKeyEnv ?? 'MODEL_API_KEY', ...task.modelBinding.headerEnvKeys]) if (process.env[key]) environment[key] = process.env[key];
       for (const key of task.environment?.envAllowlist ?? []) if (process.env[key]) environment[key] = process.env[key];
       environment.PI_CODING_AGENT_DIR = join(child.sessionDir, 'profile'); environment.PI_TELEMETRY = 'off';
       const module = this.config.childModule ?? fileURLToPath(new URL('../engine/bootstrap.js', import.meta.url));
@@ -2954,7 +3033,7 @@ export class PiHost {
         if (method === 'GET' && path.length === 7 && path[2] === 'collaborations' && path[4] === 'children' && path[6] === 'messages') result = this.collabChildMessages(task, path[3], path[5], url.searchParams);
         if (method === 'GET' && path.length === 7 && path[2] === 'handoff-export' && path[4] === 'chunks') result = this.handoffChunk(task, path[3], path[5], path[6]);
         if (method === 'POST' && path.length === 3) {
-          if (path[2] === 'messages') { exact(body, ['requestKey', 'kind', 'content', 'materials', 'generation', 'nativeSessionId', 'nativeTurnId', 'targetCommandId']); result = this.interact(task.taskId, body); status = 202; }
+          if (path[2] === 'messages') { exact(body, ['requestKey', 'kind', 'content', 'materials', 'model', 'effort', 'context', 'generation', 'nativeSessionId', 'nativeTurnId', 'targetCommandId']); result = this.interact(task.taskId, body); status = 202; }
           if (path[2] === 'commands') { const fields = ['requestKey', 'intent', 'generation', 'nativeSessionId', 'nativeTurnId', 'targetCommandId']; exact(body, body.intent === 'EXTEND_BUDGET' ? [...fields, 'budget'] : fields); result = { kind: 'WORKER_LOCAL', ...(await this.command(task.taskId, body)) }; status = 202; }
           if (path[2] === 'terminals') { result = this.createTerminal(task.taskId, body); status = 202; }
           if (path[2] === 'context-packages') { result = this.createContextPackage(task.taskId, body); status = 202; }

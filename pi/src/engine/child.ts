@@ -8,6 +8,15 @@ import { isNoForkProfile, RUNNER_PROFILE } from '../control/profiles.js';
 
 const send = (message: any) => { if (process.connected) process.send?.(message); };
 let session: AgentSession | undefined;
+const modelIndex = new Map<string, any>();
+/** Assert the task's model binding on the live session — setModel/setThinkingLevel
+ *  are SDK mutations recorded on the session, not a relaunch. */
+async function applyModel(binding: any) {
+  if (!binding || typeof binding.name !== 'string' || !session) return;
+  const target = modelIndex.get(binding.name); if (!target) throw new Error('MODEL_NOT_FOUND');
+  if (session.model?.id !== binding.name) await session.setModel(target);
+  if (typeof binding.effort === 'string') session.setThinkingLevel(binding.effort);
+}
 let manager: SessionManager | undefined;
 const questions = new Map<string, (v: any) => void>();
 const macRequests = new Map<string, (v: any) => void>();
@@ -119,16 +128,23 @@ async function init(config: any) {
   if (config.executionMode === 'CONTEXT_ONLY' && ['macCapabilities','mcpServers','extensions'].some(k => (config[k] ?? []).length)) throw new Error('CONTEXT_ONLY_RESOURCE_DENIED');
   const credentials = new InMemoryCredentialStore();
   const modelRuntime = await ModelRuntime.create({ credentials, modelsStore: new InMemoryModelsStore(), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
-  modelRuntime.registerProvider('worker-model', {
-    baseUrl: config.model.baseUrl, api: 'openai-completions', apiKey: process.env.MODEL_API_KEY,
-    headers: Object.fromEntries((config.model.headerEnvKeys ?? []).filter((key: string) => process.env[key]).map((key: string) => [key.slice('LLM_HEADER_'.length).replaceAll('_', '-'), process.env[key]!])),
-    models: [{ id: config.model.name, name: config.model.name, reasoning: true, input: ['text'], contextWindow: 131072, maxTokens: 8192,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsDeveloperRole: false, supportsStore: false, supportsUsageInStreaming: true, maxTokensField: 'max_tokens' } }],
+  // Every catalog entry is registered up front so prompt/steer commands can
+  // switch the session model by name without another init round-trip.
+  const catalog: any[] = Array.isArray(config.catalog) && config.catalog.length ? config.catalog : [config.model];
+  catalog.forEach((binding, i) => {
+    modelRuntime.registerProvider('worker-model-' + i, {
+      baseUrl: binding.baseUrl, api: binding.api ?? 'openai-completions', apiKey: process.env[binding.apiKeyEnv ?? 'MODEL_API_KEY'],
+      headers: Object.fromEntries((binding.headerEnvKeys ?? []).filter((key: string) => process.env[key]).map((key: string) => [key.slice('LLM_HEADER_'.length).replaceAll('_', '-'), process.env[key]!])),
+      models: [{ id: binding.name, name: binding.name, reasoning: true, input: ['text'], contextWindow: binding.contextWindow ?? 131072, maxTokens: binding.maxTokens ?? 8192,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsDeveloperRole: false, supportsStore: false, supportsUsageInStreaming: true, supportsReasoningEffort: binding.effort !== undefined || Array.isArray(binding.efforts), maxTokensField: 'max_tokens' } }],
+    });
+    const registered = modelRuntime.getModel('worker-model-' + i, binding.name);
+    if (registered) modelIndex.set(binding.name, registered);
   });
   // Model credentials stay in runtime memory and never enter shell tool child environments.
-  delete process.env.MODEL_API_KEY;
+  for (const binding of catalog) delete process.env[binding.apiKeyEnv ?? 'MODEL_API_KEY'];
   for (const key of Object.keys(process.env)) if (key.startsWith('LLM_HEADER_')) delete process.env[key];
-  const model = modelRuntime.getModel('worker-model', config.model.name); if (!model) throw new Error('MODEL_NOT_FOUND');
+  const model = modelIndex.get(config.model.name); if (!model) throw new Error('MODEL_NOT_FOUND');
   const agentDir = join(config.sessionDir, 'profile'); mkdirSync(agentDir, { recursive: true });
   const mcpNamespace = (id: string) => 'mcp__' + id.replace(/[^A-Za-z0-9_]/g, '_');
   // Inline boundary-gate extension. pi-coding-agent 1.4.0 does not re-export
@@ -236,7 +252,7 @@ async function init(config: any) {
     getAppendSystemPromptSources: () => [], extendResources: () => {}, reload: async () => {},
   };
   manager = config.sessionFile ? SessionManager.open(config.sessionFile, config.sessionDir, config.workspace) : SessionManager.create(config.workspace, config.sessionDir);
-  ({ session } = await createAgentSession({ cwd: config.workspace, agentDir, modelRuntime, model, thinkingLevel: 'low', resourceLoader: resources,
+  ({ session } = await createAgentSession({ cwd: config.workspace, agentDir, modelRuntime, model, thinkingLevel: config.model.effort ?? 'low', resourceLoader: resources,
     sessionManager: manager, settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
     tools: effectiveAllowlist, customTools: config.executionMode === 'CONTEXT_ONLY' ? [] : [...(config.macCapabilities ?? []).map((tool: any) => ({
       ...tool,
@@ -352,14 +368,19 @@ process.on('message', (command: any) => {
       return;
     }
     if (command.type === 'prompt') {
+      // The host re-asserts the task binding on every prompt — a requested
+      // switch applies here, and any drift from a failed switch heals on the
+      // next dispatch rather than silently diverging from the ledger.
+      await applyModel(command.model);
       gateFailure = undefined;
       directPrompt = { requestKey: command.requestKey, waitingUser: true };
-      send({ type: 'started', requestKey: command.requestKey });
+      send({ type: 'started', requestKey: command.requestKey, model: session.model?.id });
       await session.prompt(command.content, { expandPromptTemplates: false });
       await session.waitForIdle();
       if (gateFailure) send({ type: 'failure', requestKey: command.requestKey, code: gateFailure });
       else send({ type: 'settled', requestKey: command.requestKey });
     } else if (command.type === 'steer') {
+      await applyModel(command.model);
       const disposition = await session.steer(command.content);
       send({ type: 'queued', requestKey: command.requestKey, disposition });
     } else if (command.type === 'answer') {
