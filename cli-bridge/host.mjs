@@ -24,7 +24,7 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync, lstatSync, realpathSync, appendFileSync, openSync, readSync, closeSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
 import { join, resolve, relative, sep, dirname, basename } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
@@ -1122,35 +1122,6 @@ const inventory = () => {
 
 const hashBytes = (b) => createHash('sha256').update(b).digest('hex');
 
-// ---- staged file transfer ---------------------------------------------------
-// Phone↔PC payloads ride the same authenticated JSON channel as every other
-// worker-local route — chunked base64 keeps bodies under MAX_BODY and works
-// identically over LAN, Tailscale, or relay. Staging mirrors the ACP message
-// store budget: 50 files / 512MB / 72h, then oldest-first eviction.
-const FILES_DIR = join(STATE_DIR, 'files');
-const FILES_TTL_MS = 72 * 60 * 60 * 1000;
-const FILES_MAX_BYTES = 64 << 20;
-const FILES_MAX_TOTAL = 512 << 20;
-const FILES_MAX_COUNT = 50;
-const FILE_CHUNK_MAX = 512 << 10;
-if (!ledger.files) ledger.files = {};
-
-const fileMeta = (id, f) => ({ id, name: f.name, size: f.size, mime: f.mime, at: f.at });
-
-const sweepFiles = () => {
-  const now = Date.now();
-  let total = 0, kept = 0, dirty = false;
-  for (const [id, f] of Object.entries(ledger.files).sort((a, b) => b[1].at - a[1].at)) {
-    const gone = !existsSync(f.path);
-    if (gone || f.at + FILES_TTL_MS <= now || kept >= FILES_MAX_COUNT || total + f.size > FILES_MAX_TOTAL) {
-      if (!gone) { try { rmSync(f.path, { force: true }); } catch {} }
-      delete ledger.files[id]; dirty = true; continue;
-    }
-    total += f.size; kept++;
-  }
-  if (dirty) save();
-};
-
 const sealArtifacts = (t) => {
   if (t.artifactManifest) return t.artifactManifest;
   if (!t.quiescent) return { items: [], reasonCode: 'STOP_TO_SEAL_RESULTS' };
@@ -1399,76 +1370,6 @@ const routes = (method, seg, taskId, body, query) => {
       })),
       ...(start > 0 ? { before: String(start + 1) } : {}),
     };
-  }
-  // /local/v1/files — staged phone↔PC payloads. Upload is a three-step JSON
-  // flow (create → chunk* → seal) so every body stays well under MAX_BODY;
-  // download reads sealed files back in the same chunk shape. Entries live in
-  // the ledger so restarts keep the index, and sweepFiles() enforces the
-  // TTL/count/byte budget on every touch.
-  if (rest[0] === 'files') {
-    sweepFiles();
-    if (method === 'GET' && rest.length === 1) {
-      return { schemaVersion: 'worker-local-files/1',
-        items: Object.entries(ledger.files).filter(([, f]) => f.ready)
-          .map(([id, f]) => fileMeta(id, f)).sort((a, b) => b.at - a.at) };
-    }
-    if (method === 'POST' && rest.length === 1) {
-      const name = typeof body?.name === 'string' ? body.name.trim().slice(0, 160) : '';
-      const size = Number(body?.size);
-      const mime = typeof body?.mime === 'string' && body.mime ? body.mime.slice(0, 100) : 'application/octet-stream';
-      if (!name || /[/\\]/.test(name) || !Number.isSafeInteger(size) || size < 0 || size > FILES_MAX_BYTES) {
-        fail('INVALID_REQUEST', 400);
-      }
-      const id = randomUUID();
-      mkdirSync(FILES_DIR, { recursive: true });
-      const path = join(FILES_DIR, id + '.part');
-      writeFileSync(path, Buffer.alloc(0));
-      ledger.files[id] = { name, size, mime, at: Date.now(), path, received: 0, ready: false };
-      save();
-      return { schemaVersion: 'worker-local-files/1', id, chunkMax: FILE_CHUNK_MAX, expiresAt: new Date(Date.now() + FILES_TTL_MS).toISOString() };
-    }
-    const fid = typeof rest[1] === 'string' && /^[0-9a-f-]{36}$/.test(rest[1]) ? rest[1] : null;
-    const f = fid ? ledger.files[fid] : undefined;
-    if (!f) fail('FILE_NOT_FOUND', 404);
-    if (method === 'POST' && rest[2] === 'chunk' && rest.length === 3) {
-      if (f.ready) fail('FILE_ALREADY_SEALED', 409);
-      const seq = Number(body?.seq);
-      const data = body?.data;
-      if (!Number.isSafeInteger(seq) || seq < 0 || typeof data !== 'string') fail('INVALID_REQUEST', 400);
-      const buf = Buffer.from(data, 'base64');
-      if (buf.length > FILE_CHUNK_MAX) fail('REQUEST_TOO_LARGE', 413);
-      if (seq !== Math.floor(f.received / FILE_CHUNK_MAX)) fail('FILE_CHUNK_OUT_OF_ORDER', 409);
-      if (f.received + buf.length > f.size) fail('FILE_TOO_LARGE', 413);
-      appendFileSync(f.path, buf);
-      f.received += buf.length;
-      save();
-      return { schemaVersion: 'worker-local-file-chunk/1', id: fid, seq, received: f.received };
-    }
-    if (method === 'POST' && rest[2] === 'seal' && rest.length === 3) {
-      if (f.ready) return { schemaVersion: 'worker-local-file/1', ...fileMeta(fid, f), ready: true };
-      if (f.received !== f.size) fail('FILE_INCOMPLETE', 409);
-      const done = join(FILES_DIR, fid + '.bin');
-      renameSync(f.path, done);
-      f.path = done; f.ready = true; save();
-      return { schemaVersion: 'worker-local-file/1', ...fileMeta(fid, f), ready: true };
-    }
-    if (method === 'GET' && rest.length === 2) {
-      if (!f.ready) fail('FILE_NOT_READY', 409);
-      return { schemaVersion: 'worker-local-file/1', ...fileMeta(fid, f) };
-    }
-    if (method === 'GET' && rest[2] === 'chunk' && rest.length === 3) {
-      if (!f.ready) fail('FILE_NOT_READY', 409);
-      const seq = Number(query.get('seq') ?? '0');
-      if (!Number.isSafeInteger(seq) || seq < 0 || seq * FILE_CHUNK_MAX >= Math.max(f.size, 1) + FILE_CHUNK_MAX) fail('INVALID_REQUEST', 400);
-      const fh = openSync(f.path, 'r');
-      try {
-        const buf = Buffer.alloc(FILE_CHUNK_MAX);
-        const n = readSync(fh, buf, 0, FILE_CHUNK_MAX, seq * FILE_CHUNK_MAX);
-        return { schemaVersion: 'worker-local-file-chunk/1', seq,
-          data: buf.subarray(0, n).toString('base64'), eof: seq * FILE_CHUNK_MAX + n >= f.size };
-      } finally { closeSync(fh); }
-    }
-    fail('OPERATION_NOT_ALLOWED', 403);
   }
   // /local/v1/history/questions — a side question about a vendor SESSION (not
   // a task): the session's own transcript is the read-only context, answered
