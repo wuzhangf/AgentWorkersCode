@@ -474,22 +474,41 @@ const SESSION_ROOTS = {
 
 /** Devin CLI/desktop keeps sessions in a SQLite store, not loose files —
  * listed and transcript-harvested through these two helpers instead of
- * historyFiles/sessionCwd. Read-only open; absent store reports empty. */
-const DEVIN_DB = join(homedir(), '.local', 'share', 'devin', 'cli', 'sessions.db');
+ * historyFiles/sessionCwd. Read-only open; absent store reports empty.
+ * Store location differs by platform: win32 keeps it under Roaming
+ * `%APPDATA%\Devin\cli`, macOS under Application Support, Linux/other XDG
+ * under ~/.local/share — first existing file wins. */
+const DEVIN_DBS = process.platform === 'win32'
+  ? [join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'Devin', 'cli', 'sessions.db'),
+     join(homedir(), '.local', 'share', 'devin', 'cli', 'sessions.db')]
+  : [join(homedir(), '.local', 'share', 'devin', 'cli', 'sessions.db'),
+     join(homedir(), 'Library', 'Application Support', 'Devin', 'cli', 'sessions.db')];
 const devinDb = () => {
-  if (!existsSync(DEVIN_DB)) return null;
-  try { return new DatabaseSync(DEVIN_DB, { readOnly: true }); } catch { return null; }
+  for (const file of DEVIN_DBS) {
+    if (!existsSync(file)) continue;
+    try { return new DatabaseSync(file, { readOnly: true }); } catch { continue; }
+  }
+  return null;
+};
+/** sessions.last_activity_at / created_at are seconds-since-epoch; accept
+ * ms/µs/ns too so a unit change never degrades rows to January 1970. */
+const devinAt = (v) => {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const ms = n < 1e11 ? n * 1e3 : n < 1e14 ? n : n < 1e17 ? n / 1e3 : n / 1e6;
+  return new Date(ms).toISOString();
 };
 const devinSessions = () => {
   const db = devinDb();
   if (!db) return [];
   try {
     return db.prepare(
-      `SELECT id, title, working_directory, last_activity_at FROM sessions
+      `SELECT id, title, working_directory, last_activity_at, created_at FROM sessions
        WHERE hidden = 0 ORDER BY last_activity_at DESC LIMIT 30`).all()
       .map((r) => ({ id: String(r.id), title: String(r.title ?? ''),
         cwd: String(r.working_directory ?? ''),
-        at: new Date(Number(r.last_activity_at)).toISOString() }));
+        at: devinAt(r.last_activity_at) ?? devinAt(r.created_at) }))
+      .filter((s) => s.at);
   } catch { return []; }
   finally { try { db.close(); } catch {} }
 };
