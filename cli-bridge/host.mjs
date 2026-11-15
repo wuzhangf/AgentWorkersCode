@@ -1351,22 +1351,15 @@ const sweepFiles = () => {
 
 const fileExpired = (f) => (f.expiresAtMs ?? 0) <= Date.now();
 
-/** Public meta row — the same shape the card marker carries, so the phone
- * parses list rows and <<FILE>> payloads identically. */
+/** Public row — list items, the meta answer and the <<FILE>> marker all
+ * carry this shape (worker-local-file/1 fields the gateway + phone verify). */
 const fileMeta = (f) => ({
-  schemaVersion: 'worker-files/1', id: f.id, taskId: f.taskId,
+  schemaVersion: 'worker-local-file/1', fileId: f.id, id: f.id, taskId: f.taskId,
   name: f.name, size: f.size, mime: f.mime, sha256: f.sha256,
   state: fileExpired(f) ? 'expired' : 'staged', storage: 'pc',
   stagedAt: new Date(f.stagedAtMs).toISOString(),
   expiresAt: new Date(f.expiresAtMs).toISOString(),
 });
-
-const fileList = () => {
-  sweepFiles();
-  return { schemaVersion: 'worker-files/1',
-    items: Object.values(ledger.files).map(fileMeta)
-      .sort((a, b) => b.stagedAt.localeCompare(a.stagedAt)) };
-};
 
 // Direct-stage path (files_stage MCP / POST /tasks/{t}/files): resolve inside
 // the task's working directory, copy into the pool, post the card. The id
@@ -1403,7 +1396,7 @@ const stagePathForTask = (t, body) => {
     fail('FILE_CHANGED', 409);
   }
   const sha256 = hashBytes(readFileSync(staged));
-  const id = 'f_' + hashBytes(t.taskId + '\0' + real + '\0' + sha256).slice(0, 24);
+  const id = 'file-' + hashBytes(t.taskId + '\0' + real + '\0' + sha256);
   const existing = ledger.files[id];
   if (existing) {
     try { rmSync(staged, { force: true }); } catch {}
@@ -1678,40 +1671,6 @@ const routes = (method, seg, taskId, body, query) => {
       })),
       ...(start > 0 ? { before: String(start + 1) } : {}),
     };
-  }
-  // /local/v1/files — staged agent→phone deliverables (worker-files/1). The
-  // byte route answers in worker-file-chunk/1 base64 slices because the
-  // worker transport carries JSON only — offset/length paging keeps every
-  // body bounded and resumable.
-  if (rest[0] === 'files') {
-    if (method === 'GET' && rest.length === 1) return fileList();
-    if (method === 'GET' && rest.length === 3 && rest[2] === 'chunks'
-        && /^f_[0-9a-f]{24}$/.test(rest[1])) {
-      sweepFiles();
-      const f = ledger.files[rest[1]];
-      if (!f || !existsSync(f.staged)) fail('FILE_NOT_FOUND', 404);
-      if (fileExpired(f)) {
-        try { rmSync(f.staged, { force: true }); } catch {}
-        fail('FILE_EXPIRED', 410);
-      }
-      const offset = Number(query.get('offset') ?? 0);
-      const length = Number(query.get('length') ?? (1 << 20));
-      if (!Number.isSafeInteger(offset) || offset < 0 || offset >= Math.max(1, f.size)
-          || !Number.isSafeInteger(length) || length < 1 || length > (4 << 20)) {
-        fail('INVALID_REQUEST', 400);
-      }
-      const n = Math.min(length, f.size - offset);
-      const fd = openSync(f.staged, 'r');
-      const buf = Buffer.alloc(n);
-      try { if (readSync(fd, buf, 0, n, offset) !== n) fail('FILE_CHANGED', 409); }
-      finally { closeSync(fd); }
-      return {
-        schemaVersion: 'worker-file-chunk/1', id: f.id, name: f.name,
-        size: f.size, offset, bodyBase64: buf.toString('base64'),
-        eof: offset + n >= f.size,
-      };
-    }
-    fail('NOT_FOUND', 404);
   }
   // /local/v1/material-uploads — task-bound attachments (material-upload/1).
   // Begin creates a staged upload keyed by uploadKey; chunks must arrive in
@@ -2044,10 +2003,10 @@ const routes = (method, seg, taskId, body, query) => {
           ...(expired ? { cursorExpired: true } : {}) };
       }
       if (sub === 'files') {
-        // Task-scoped view of the staged pool — same rows the top-level
-        // /files list serves, filtered to this task's cards.
+        // Task-scoped staged pool listing — the reconcile view the phone
+        // pulls alongside the FILE_CARD events feed.
         sweepFiles();
-        return { schemaVersion: 'worker-files/1', taskId: t.taskId,
+        return { schemaVersion: 'worker-local-files/1', taskId: t.taskId,
           items: Object.values(ledger.files).filter((f) => f.taskId === t.taskId)
             .map(fileMeta).sort((a, b) => b.stagedAt.localeCompare(a.stagedAt)) };
       }
@@ -2094,6 +2053,38 @@ const routes = (method, seg, taskId, body, query) => {
           bytes: chunk.toString('base64'), chunkSHA256: hashBytes(chunk) };
       } finally { closeSync(fd); }
     }
+    // Staged-file metadata + chunked pull — worker-local-file/1 meta rows and
+    // worker-local-file-chunk/1 slices, the same verification shape the
+    // gateway enforces on artifacts (262144-aligned, per-chunk digest).
+    if (method === 'GET' && rest.length === 4 && sub === 'files'
+        && /^file-[a-f0-9]{64}$/.test(rest[3])) {
+      sweepFiles();
+      const f = ledger.files[rest[3]];
+      if (!f || f.taskId !== t.taskId || !existsSync(f.staged)) fail('FILE_NOT_FOUND', 404);
+      if (fileExpired(f)) fail('FILE_EXPIRED', 410);
+      return fileMeta(f);
+    }
+    if (method === 'GET' && rest.length === 7 && sub === 'files' && rest[4] === 'chunks') {
+      sweepFiles();
+      const f = ledger.files[rest[3]];
+      const digest = rest[5], rawOffset = rest[6];
+      const offset = Number(rawOffset);
+      if (!f || f.taskId !== t.taskId || !existsSync(f.staged)) fail('FILE_NOT_FOUND', 404);
+      if (fileExpired(f)) fail('FILE_EXPIRED', 410);
+      if (f.sha256 !== digest
+          || !/^(0|[1-9][0-9]*)$/.test(rawOffset) || !Number.isSafeInteger(offset)
+          || offset % 262144 !== 0 || offset >= f.size) fail('FILE_NOT_AVAILABLE', 404);
+      const fd = openSync(f.staged, 'r');
+      try {
+        const len = Math.min(262144, f.size - offset);
+        const chunk = Buffer.alloc(len);
+        if (readSync(fd, chunk, 0, len, offset) !== len) fail('FILE_CHANGED', 409);
+        return { schemaVersion: 'worker-local-file-chunk/1', taskId: t.taskId,
+          fileId: f.id, sha256: f.sha256, offset,
+          sizeBytes: String(f.size), encoding: 'base64',
+          bytes: chunk.toString('base64'), chunkSHA256: hashBytes(chunk) };
+      } finally { closeSync(fd); }
+    }
     // Explicit stage — files_stage MCP children (files.key bearer) and local
     // tooling POST here; the path must live inside this task's workspace and
     // the card posts onto this task's stream + events feed.
@@ -2101,7 +2092,7 @@ const routes = (method, seg, taskId, body, query) => {
       const row = fileMeta(stagePathForTask(t, body));
       postFileCard(t, row);
       save();
-      return { schemaVersion: 'worker-files/1', ...row };
+      return { ...row };
     }
     if (method === 'GET' && rest.length === 3 && sub === 'commands') fail('NOT_FOUND', 404);
     if (method === 'GET' && rest.length === 3 && sub === 'interaction-requests') fail('NOT_FOUND', 404);
