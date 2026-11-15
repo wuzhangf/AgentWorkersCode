@@ -53,6 +53,64 @@ const MODEL_CATALOG = (() => {
   const efforts = ENGINE === 'codex' ? ['minimal', 'low', 'medium', 'high'] : undefined;
   return names.map(name => ({ modelRef: name, displayName: name, imageInput: false, ...(efforts ? { efforts } : {}) }));
 })();
+// ~/.agent-gateway/agent-modes.json — owner-picked permission posture per
+// engine, written from the Agent Link popover. "phone" (default): spawn with
+// no OS sandbox so our PreToolUse hook is the permission layer — every risky
+// call asks the phone. "workspace": workspace-write sandbox, silent (inside
+// auto, outside denied — no card can lift an OS sandbox). "open": full
+// access and the hook abstains — nothing asks, anything runs.
+const agentMode = (engine) => {
+  try {
+    const modes = JSON.parse(readFileSync(join(homedir(), '.agent-gateway', 'agent-modes.json'), 'utf8'));
+    const m = modes?.[engine];
+    return m === 'workspace' || m === 'open' ? m : 'phone';
+  } catch { return 'phone'; }
+};
+
+// ~/.agent-gateway/agent-hooks.json records what WE registered. A codex
+// reinstall wipes ~/.codex/hooks.json; without this heal every spawn until
+// the app's next refresh would run with the hook silently gone — and in
+// "phone" posture that means sandbox-free with nobody asking. Re-add the
+// recorded command before spawning; other entries are never touched.
+const hookIntent = (engine) => {
+  try {
+    return JSON.parse(readFileSync(
+      join(homedir(), '.agent-gateway', 'agent-hooks.json'), 'utf8'))?.[engine] ?? null;
+  } catch { return null; }
+};
+
+const ourEntryPresent = (settingsPath) => {
+  try { return readFileSync(settingsPath, 'utf8').includes('agent_pre_tool.py'); }
+  catch { return false; }
+};
+
+const healAgentHooks = (engine, settingsPath) => {
+  try {
+    const rec = hookIntent(engine);
+    if (!rec?.enabled || typeof rec.command !== 'string') return;
+    let settings = {};
+    try { settings = JSON.parse(readFileSync(settingsPath, 'utf8')) ?? {}; } catch {}
+    const hooks = (settings.hooks && typeof settings.hooks === 'object') ? settings.hooks : {};
+    let dirty = false;
+    for (const name of Array.isArray(rec.events) ? rec.events : ['PreToolUse']) {
+      const event = Array.isArray(hooks[name]) ? hooks[name] : [];
+      const present = event.some(g => Array.isArray(g?.hooks)
+        && g.hooks.some(h => String(h?.command ?? '').includes('agent_pre_tool.py')));
+      if (!present) {
+        event.push({ matcher: '*',
+          hooks: [{ type: 'command', command: rec.command, timeout: rec.timeout ?? 360 }] });
+        hooks[name] = event;
+        dirty = true;
+      }
+    }
+    if (dirty) {
+      settings.hooks = hooks;
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+    }
+  } catch { /* heal is best-effort — never break the spawn */ }
+};
+
 const MAX_BODY = 1 << 20;
 const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED']);
 const STALL_MS = Number(process.env.CLI_BRIDGE_STALL_MS ?? 180_000);
@@ -109,16 +167,43 @@ const resolveBin = (name) => {
   return { cmd: name, pre: [] };
 };
 
+// Turn-end error translation — the CLI's raw error text stays in task.output,
+// but the phone also gets one actionable line (auth → relogin, long prompt →
+// shorten, connection → resend). Limit/billing text is left as-is because it
+// usually already says when the quota resets.
+const friendlyCliError = (text) => {
+  const low = String(text ?? '').toLowerCase();
+  if (!low) return null;
+  if (['login expired', 'not logged in', 'please run /login', 'invalid api key',
+       'invalid bearer token', 'oauth token has expired', 'authentication_failed',
+       'invalid credentials'].some(k => low.includes(k))) {
+    return '登录态失效：请在这台电脑上重新登录该 CLI（如 /login），然后重发消息。';
+  }
+  if (low.includes('prompt is too long') || low.includes('request too large')) {
+    return '本轮内容太长：缩短消息或开新会话再试。';
+  }
+  if (['econnreset', 'tls handshake eof', 'etimedout', 'econnrefused',
+       'fetch failed', 'connection lost'].some(k => low.includes(k))) {
+    return '连接中断（网络问题，不是登录问题）：重发即可，反复失败就重启任务。';
+  }
+  return null;
+};
+
 // ---- stock-CLI engine adapters -------------------------------------------------
 
 const ENGINES = {
   claude: {
-    argv: (instruction, sessionId, task) => [
-      '-p', instruction, '--output-format', 'stream-json', '--verbose',
-      '--dangerously-skip-permissions',
-      ...(task?.model ?? MODEL ? ['--model', task?.model ?? MODEL] : []),
-      ...(sessionId ? ['--resume', sessionId] : []),
-    ],
+    argv: (instruction, sessionId, task) => {
+      // Same reinstall self-heal as codex: a wiped ~/.claude/settings.json
+      // gets our recorded entries back before the spawn.
+      healAgentHooks('claude', join(homedir(), '.claude', 'settings.json'));
+      return [
+        '-p', instruction, '--output-format', 'stream-json', '--verbose',
+        '--dangerously-skip-permissions',
+        ...(task?.model ?? MODEL ? ['--model', task?.model ?? MODEL] : []),
+        ...(sessionId ? ['--resume', sessionId] : []),
+      ];
+    },
     bin: 'claude',
     /** stream-json: init carries session_id; assistant rows carry text blocks;
      * result carries the terminal verdict. */
@@ -135,19 +220,50 @@ const ENGINES = {
       if (row.type === 'result') {
         if (typeof row.session_id === 'string') task.nativeSessionId = row.session_id;
         if (typeof row.result === 'string' && row.result.trim()) task.output = row.result;
-        return row.subtype === 'success' && row.is_error !== true ? 'SUCCEEDED' : 'FAILED';
+        const ok = row.subtype === 'success' && row.is_error !== true;
+        if (!ok) {
+          const friendly = friendlyCliError(task.output);
+          if (friendly) addMessage('assistant', friendly);
+        }
+        return ok ? 'SUCCEEDED' : 'FAILED';
       }
       return null;
     },
   },
   codex: {
-    argv: (instruction, sessionId, task) => [
-      ...(sessionId
-        ? ['exec', 'resume', sessionId, instruction, '--json', '--skip-git-repo-check']
-        : ['exec', instruction, '--json', '-C', PROJECT_DIR, '-s', 'workspace-write', '--skip-git-repo-check']),
-      '--model', (task?.model ?? MODEL) || CODEX_DEFAULT_MODEL,
-      ...(task?.effort ? ['-c', `model_reasoning_effort=${task.effort}`] : []),
-    ],
+    argv: (instruction, sessionId, task) => {
+      // Owner-selected posture (see agentMode). "phone" → danger-full-access:
+      // the phone IS the sandbox — every tool call reaches the PreToolUse
+      // hook which asks through the gateway, and allow/deny is the real
+      // decision (a workspace sandbox denies OS-level before any ask could
+      // happen, and a hook answer cannot lift it). "workspace" →
+      // workspace-write: inside auto, outside fails closed, no asks.
+      // "open" → danger-full-access with the hook abstaining: nothing asks.
+      // 接管关 → stock-ish confinement: the mode picker only matters while
+      // OUR hook is the one deciding. A hook that is off + full-access argv
+      // would be silent full access — the worst combination, so off always
+      // means workspace-write here. "On" = intent says enabled (written by
+      // install.py) OR our entry is actually present (pre-intent installs).
+      const codexHooks = join(homedir(), '.codex', 'hooks.json');
+      const takenOver = hookIntent('codex')?.enabled === true || ourEntryPresent(codexHooks);
+      const mode = takenOver ? agentMode('codex') : 'workspace';
+      healAgentHooks('codex', codexHooks);
+      const sandbox = mode === 'workspace' ? 'workspace-write' : 'danger-full-access';
+      return [
+        ...(sessionId
+          ? ['exec', 'resume', sessionId, instruction, '--json', '--skip-git-repo-check',
+             '-c', `sandbox_mode="${sandbox}"`]
+          : ['exec', instruction, '--json', '-C', PROJECT_DIR,
+             '-s', sandbox, '--skip-git-repo-check']),
+        // on-request keeps policy-flagged prompts routable to the
+        // PermissionRequest hook (phone decides); bypass-hook-trust because
+        // headless exec cannot answer trust prompts and we own the hooks.
+        ...(mode === 'phone' ? ['-c', 'approval_policy="on-request"'] : []),
+        '--dangerously-bypass-hook-trust',
+        '--model', (task?.model ?? MODEL) || CODEX_DEFAULT_MODEL,
+        ...(task?.effort ? ['-c', `model_reasoning_effort=${task.effort}`] : []),
+      ];
+    },
     bin: 'codex',
     /** codex exec --json: thread.started carries thread_id; item.completed rows
      * carry agent_message text; turn.completed finishes the turn. */
@@ -163,7 +279,12 @@ const ENGINES = {
         }
       }
       if (row.type === 'turn.completed') return 'SUCCEEDED';
-      if (row.type === 'turn.failed' || row.type === 'error') return 'FAILED';
+      if (row.type === 'turn.failed' || row.type === 'error') {
+        const raw = row.error?.message ?? row.message ?? task.output ?? '';
+        const friendly = friendlyCliError(raw);
+        if (friendly) addMessage('assistant', friendly);
+        return 'FAILED';
+      }
       return null;
     },
   },
