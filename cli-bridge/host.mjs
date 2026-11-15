@@ -24,7 +24,7 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync, lstatSync, realpathSync, appendFileSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync, lstatSync, realpathSync, appendFileSync, rmSync, openSync, readSync, closeSync, copyFileSync } from 'node:fs';
 import { join, resolve, relative, sep, dirname, basename } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
@@ -1152,7 +1152,7 @@ const sealArtifacts = (t) => {
     if (!old || old.s !== cur.s || Math.abs(old.m - cur.m) > 0.001) names.set(rel, old ? 'M' : 'A');
   }
   for (const rel of before.keys()) if (!current.has(rel)) names.set(rel, 'D');
-  const items = []; let total = 0;
+  const items = []; let total = 0, chunkedTotal = 0;
   for (const [rel, status] of [...names.entries()].sort().slice(0, 100)) {
     const row = { artifactId: 'file-' + hashBytes(rel + '\0' + t.segmentId), path: rel };
     items.push(row);
@@ -1164,14 +1164,23 @@ const sealArtifacts = (t) => {
     try {
       const s = lstatSync(candidate);
       if (!s.isFile() || s.isSymbolicLink() || !realpathSync(candidate).startsWith(root + sep)) { row.status = 'WITHHELD_PATH'; continue; }
-      if (s.size > 524288 || total + s.size > 4194304) { row.status = 'WITHHELD_SIZE'; continue; }
+      // Two delivery classes, same mac contract: ≤512KB goes whole-file
+      // (AVAILABLE), >512KB up to 20MB goes CHUNKS_V1 so a phone can resume —
+      // chunked files draw their own pool instead of the 4MB small-file budget.
+      if (s.size > 20971520) { row.status = 'WITHHELD_SIZE'; continue; }
+      const chunked = s.size > 524288;
+      if (chunked ? chunkedTotal + s.size > 20971520 : total + s.size > 4194304) { row.status = 'WITHHELD_SIZE'; continue; }
       const bytes = readFileSync(candidate);
       const after = lstatSync(candidate);
       if (after.mtimeMs !== s.mtimeMs || after.size !== s.size || after.ino !== s.ino) { row.status = 'WITHHELD_CHANGED'; continue; }
-      const text = bytes.toString('utf8');
-      if (knownSecrets.some((x) => text.includes(x)) || SECRET_RE.test(text)) { row.status = 'WITHHELD_SECRET'; continue; }
-      total += bytes.length;
-      row.status = 'AVAILABLE'; row.size = bytes.length; row.sha256 = hashBytes(bytes); row.mediaType = 'application/octet-stream';
+      // Secret scan stays bounded for chunked bodies: the first 512KB window
+      // carries headers/config where leaks live — no 20MB utf8 decode.
+      const scanned = chunked ? bytes.subarray(0, 524288).toString('utf8') : bytes.toString('utf8');
+      if (knownSecrets.some((x) => scanned.includes(x)) || SECRET_RE.test(scanned)) { row.status = 'WITHHELD_SECRET'; continue; }
+      if (chunked) chunkedTotal += s.size; else total += bytes.length;
+      row.status = chunked ? 'AVAILABLE_CHUNKED' : 'AVAILABLE';
+      if (chunked) { row.transferMode = 'CHUNKS_V1'; row.sizeBytes = s.size; }
+      row.size = bytes.length; row.sha256 = hashBytes(bytes); row.mediaType = 'application/octet-stream';
       mkdirSync(join(ART_DIR, t.taskId), { recursive: true });
       writeFileSync(join(ART_DIR, t.taskId, row.artifactId), bytes);
     } catch { row.status = 'WITHHELD_UNREADABLE'; }
@@ -1720,6 +1729,29 @@ const routes = (method, seg, taskId, body, query) => {
       const bytes = readFileSync(staged);
       if (hashBytes(bytes) !== row.sha256) fail('ARTIFACT_CHANGED', 409);
       return { artifactId: row.artifactId, path: row.path, sha256: row.sha256, encoding: 'base64', bytes: bytes.toString('base64') };
+    }
+    // Chunked delivery for >512KB artifacts (mac-artifact-chunk/1 — the same
+    // contract the gateway verifyArtifactChunk enforces end to end).
+    if (method === 'GET' && rest.length === 7 && sub === 'artifacts' && rest[4] === 'chunks') {
+      const manifest = sealArtifacts(t);
+      const row = (manifest.items ?? []).find((r) => r.artifactId === rest[3]);
+      const digest = rest[5], rawOffset = rest[6];
+      const offset = Number(rawOffset);
+      if (!row || row.status !== 'AVAILABLE_CHUNKED' || row.sha256 !== digest
+          || !/^(0|[1-9][0-9]*)$/.test(rawOffset) || !Number.isSafeInteger(offset)
+          || offset % 262144 !== 0 || offset >= row.size) fail('ARTIFACT_NOT_AVAILABLE', 404);
+      const staged = join(ART_DIR, t.taskId, row.artifactId);
+      if (!existsSync(staged)) fail('ARTIFACT_NOT_AVAILABLE', 404);
+      const fd = openSync(staged, 'r');
+      try {
+        const len = Math.min(262144, row.size - offset);
+        const chunk = Buffer.alloc(len);
+        if (readSync(fd, chunk, 0, len, offset) !== len) fail('ARTIFACT_CHANGED', 409);
+        return { schemaVersion: 'mac-artifact-chunk/1', taskId: t.taskId,
+          artifactId: row.artifactId, sha256: row.sha256, offset,
+          sizeBytes: String(row.size), encoding: 'base64',
+          bytes: chunk.toString('base64'), chunkSHA256: hashBytes(chunk) };
+      } finally { closeSync(fd); }
     }
     if (method === 'GET' && rest.length === 3 && sub === 'commands') fail('NOT_FOUND', 404);
     if (method === 'GET' && rest.length === 3 && sub === 'interaction-requests') fail('NOT_FOUND', 404);
