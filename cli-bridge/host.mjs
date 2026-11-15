@@ -37,6 +37,13 @@ const TOKEN = process.env.WORKER_LOCAL_TOKEN ?? '';
 // Stock CLIs carry account-bound defaults that may not exist on the signed-in
 // plan — an explicit --model overrides the vendor config for spawned turns.
 const MODEL = opt.model ?? process.env.CLI_BRIDGE_MODEL ?? '';
+// --executable pins the wrapped CLI for installs where PATH/shim probing is
+// unreliable; when set it replaces resolveBin() detection entirely.
+const EXECUTABLE = opt.executable ?? '';
+// --skip-permissions on|off: whether spawned turns bypass vendor tool
+// approval. Unset keeps per-engine defaults — claude skips (headless -p turns
+// cannot answer prompts), codex stays workspace-scoped.
+const SKIP = opt['skip-permissions'] ?? '';
 // ChatGPT-account codex rejects desktop-internal model names (gpt-6.1-sol)
 // from ~/.codex/config.toml — pin a catalog-valid default; --model overrides.
 const CODEX_DEFAULT_MODEL = 'gpt-5.6-sol';
@@ -199,7 +206,7 @@ const ENGINES = {
       healAgentHooks('claude', join(homedir(), '.claude', 'settings.json'));
       return [
         '-p', instruction, '--output-format', 'stream-json', '--verbose',
-        '--dangerously-skip-permissions',
+        ...(SKIP === 'off' ? [] : ['--dangerously-skip-permissions']),
         ...(task?.model ?? MODEL ? ['--model', task?.model ?? MODEL] : []),
         ...(sessionId ? ['--resume', sessionId] : []),
       ];
@@ -244,9 +251,13 @@ const ENGINES = {
       // would be silent full access — the worst combination, so off always
       // means workspace-write here. "On" = intent says enabled (written by
       // install.py) OR our entry is actually present (pre-intent installs).
+      // --skip-permissions is an explicit CLI override: 'on' pins the 'open'
+      // posture, 'off' pins 'workspace', unset defers to agent-modes.json.
       const codexHooks = join(homedir(), '.codex', 'hooks.json');
       const takenOver = hookIntent('codex')?.enabled === true || ourEntryPresent(codexHooks);
-      const mode = takenOver ? agentMode('codex') : 'workspace';
+      const mode = SKIP === 'on' ? 'open'
+        : SKIP === 'off' ? 'workspace'
+        : takenOver ? agentMode('codex') : 'workspace';
       healAgentHooks('codex', codexHooks);
       const sandbox = mode === 'workspace' ? 'workspace-write' : 'danger-full-access';
       return [
@@ -328,11 +339,24 @@ if (TOKEN.length < 24) { console.error('WORKER_LOCAL_TOKEN must be at least 24 c
 if (cmd !== 'serve') { console.error('usage: host.mjs serve ...'); process.exit(2); }
 
 const engine = ENGINES[ENGINE];
-const resolved = resolveBin(engine.bin);
+// An explicit --executable still goes through the .cmd shim unwrap so npm
+// shims picked in the UI spawn as `node <entry.js>`, never via a shell.
+const resolvePath = (p) => {
+  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(p)) {
+    try {
+      const src = readFileSync(p, 'utf8');
+      const m = src.match(/"%~?dp0%?\\([^"\r\n]+?\.js)"/i);
+      if (m) return { cmd: process.execPath, pre: [join(dirname(p), m[1])] };
+      return { cmd: 'cmd.exe', pre: ['/d', '/s', '/c', p] };
+    } catch {}
+  }
+  return { cmd: p, pre: [] };
+};
+const resolved = EXECUTABLE ? resolvePath(EXECUTABLE) : resolveBin(engine.bin);
 let engineVersion = 'unknown';
 try {
   engineVersion = execFileSync(resolved.cmd, [...resolved.pre, '--version'], { encoding: 'utf8' }).trim();
-} catch { console.error(`${engine.bin} not on PATH`); process.exit(2); }
+} catch { console.error(`${EXECUTABLE || engine.bin} not runnable`); process.exit(2); }
 
 // ---- durable ledger ------------------------------------------------------------
 
@@ -614,6 +638,7 @@ const identity = () => ({
   schemaVersion: 'worker-host/1', storeId: ledger.storeId, storeGuard: 'HEADER_V1',
   bootId: BOOT_ID, currentAvailability: 'AVAILABLE',
   engine: { id: ENGINE, version: engineVersion },
+  skipPermissions: ENGINE === 'codex' ? SKIP === 'on' : SKIP !== 'off',
   contracts: ['worker-host/1', 'worker-local/1'],
   supportedPaths: ['/local/v1', '/worker-host/v1/manifest'],
   capabilities: { items: [] },
