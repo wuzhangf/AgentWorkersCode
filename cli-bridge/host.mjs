@@ -818,6 +818,7 @@ if (!ledger.materialUploads) ledger.materialUploads = {};
 if (typeof ledger.filesKey !== 'string' || ledger.filesKey.length < 24) {
   ledger.filesKey = randomUUID() + randomUUID();
 }
+if (!ledger.files) ledger.files = {};
 const FILES_KEY_FILE = join(STATE_DIR, 'files.key');
 try { writeFileSync(FILES_KEY_FILE, ledger.filesKey); } catch {}
 
@@ -1164,14 +1165,14 @@ const emitEvent = (t, kind, payload) => {
 
 /** Post one file-card/1 event + the <<FILE>> marker row — the two channels a
  * phone consumes: events reconcile/notify, the marker row is the durable
- * inline card inside the message stream. */
-const postFileCard = (t, meta) => {
-  const expiresAt = new Date(meta.expiresAtMs).toISOString();
-  addMessage(t, 'assistant', `<<FILE ${JSON.stringify(meta)}>>`);
+ * inline card inside the message stream. Takes the public fileMeta row so the
+ * marker never leaks storage internals. */
+const postFileCard = (t, row) => {
+  addMessage(t, 'assistant', `<<FILE ${JSON.stringify(row)}>>`);
   emitEvent(t, 'FILE_CARD', {
     schemaVersion: 'file-card/1',
-    file: { id: meta.id, name: meta.name, size: meta.size, mime: meta.mime ?? 'application/octet-stream', sha256: meta.sha256 },
-    staged: { at: meta.storage ?? 'pc', expiresAt },
+    file: { id: row.id, name: row.name, size: row.size, mime: row.mime, sha256: row.sha256 },
+    staged: { at: row.storage ?? 'pc', expiresAt: row.expiresAt },
   });
 };
 
@@ -1254,7 +1255,7 @@ const handle = async (msg) => {
     try {
       const out = await stage(msg.params?.arguments ?? {});
       return toolText(id, 'Staged for the user phone: ' + out.name + ' (' + out.size +
-        ' bytes, fileId ' + out.fileId + ', expires ' + out.expiresAt + '). ' +
+        ' bytes, fileId ' + out.id + ', expires ' + out.expiresAt + '). ' +
         'A download card was posted to this task - nothing else to do.');
     } catch (e) {
       return toolText(id, 'files_stage failed: ' + String(e?.message ?? e), true);
@@ -1322,22 +1323,64 @@ const filesMcpArgv = (t) => {
   return [];
 };
 
-// Direct-stage cap for explicit calls (files_stage MCP / POST files): well
-// above the chunked-artifact ceiling so phone delivery stays one request
-// class; outbox drops keep their own larger budget for local pickups.
+// ---- staged deliverables (worker-files/1) ------------------------------------
+// A staged file lives in files/ under the bridge's own storage — the agent
+// session that produced it may exit immediately; the phone lists metadata and
+// fetches worker-file-chunk/1 base64 slices through the authenticated channel
+// whenever it comes back. Budget: 24h TTL, 50 files, 512MB per bridge, swept
+// on every touch.
+const FILES_DIR = join(STATE_DIR, 'files');
+const FILES_TTL_MS = 24 * 60 * 60 * 1000;
 const FILES_STAGE_MAX = 64 << 20;
+const FILES_MAX_TOTAL = 512 << 20;
+const FILES_MAX_COUNT = 50;
 
-/** Explicit stage (MCP files_stage / POST /files): resolve a path inside the
- * task's working directory, copy it into the shared FILES_DIR pool and post
- * the file card onto the task. Content-hash dedup is shared with the outbox
- * harvest — re-staging identical bytes refreshes expiry and re-posts the card
- * (a deliberate second send), never duplicates storage. */
+const sweepFiles = () => {
+  const nowMs = Date.now();
+  let total = 0, kept = 0, dirty = false;
+  for (const [id, f] of Object.entries(ledger.files).sort((a, b) => b[1].stagedAtMs - a[1].stagedAtMs)) {
+    const gone = !existsSync(f.staged);
+    if (gone || f.expiresAtMs <= nowMs || kept >= FILES_MAX_COUNT || total + f.size > FILES_MAX_TOTAL) {
+      if (!gone) { try { rmSync(f.staged, { force: true }); } catch {} }
+      delete ledger.files[id]; dirty = true; continue;
+    }
+    total += f.size; kept++;
+  }
+  if (dirty) save();
+};
+
+const fileExpired = (f) => (f.expiresAtMs ?? 0) <= Date.now();
+
+/** Public meta row — the same shape the card marker carries, so the phone
+ * parses list rows and <<FILE>> payloads identically. */
+const fileMeta = (f) => ({
+  schemaVersion: 'worker-files/1', id: f.id, taskId: f.taskId,
+  name: f.name, size: f.size, mime: f.mime, sha256: f.sha256,
+  state: fileExpired(f) ? 'expired' : 'staged', storage: 'pc',
+  stagedAt: new Date(f.stagedAtMs).toISOString(),
+  expiresAt: new Date(f.expiresAtMs).toISOString(),
+});
+
+const fileList = () => {
+  sweepFiles();
+  return { schemaVersion: 'worker-files/1',
+    items: Object.values(ledger.files).map(fileMeta)
+      .sort((a, b) => b.stagedAt.localeCompare(a.stagedAt)) };
+};
+
+// Direct-stage path (files_stage MCP / POST /tasks/{t}/files): resolve inside
+// the task's working directory, copy into the pool, post the card. The id
+// commits to task+path+content — re-staging identical bytes refreshes expiry
+// and re-posts the card (a deliberate second send), never duplicates storage.
 const stagePathForTask = (t, body) => {
   const src = typeof body?.path === 'string' ? body.path.trim() : '';
   if (!src || /[\x00-\x1f]/.test(src)) fail('INVALID_REQUEST', 400);
   const root = realpathSync(t.cwd ?? PROJECT_DIR);
+  const candidate = resolve(root, src);
+  const relTry = relative(root, candidate);
+  if (relTry === '..' || relTry.startsWith('..' + sep)) fail('FILE_OUTSIDE_WORKSPACE', 403);
   let real;
-  try { real = realpathSync(resolve(root, src)); } catch { fail('FILE_NOT_FOUND', 404); }
+  try { real = realpathSync(candidate); } catch { fail('FILE_NOT_FOUND', 404); }
   const rel = relative(root, real);
   if (rel === '' || rel === '..' || rel.startsWith('..' + sep)) fail('FILE_OUTSIDE_WORKSPACE', 403);
   const s = lstatSync(real);
@@ -1350,30 +1393,32 @@ const stagePathForTask = (t, body) => {
   finally { closeSync(pf); }
   const scanned = probe.toString('utf8');
   if (knownSecrets.some((x) => scanned.includes(x)) || SECRET_RE.test(scanned)) fail('FILE_SECRET', 403);
-  const meta = stageFile(real, t.taskId);
-  if (!meta) {
-    // Content already staged — refresh expiry so a deliberate re-send extends
-    // the pickup window, then post a fresh card for this task.
-    const sha256 = hashBytes(readFileSync(real));
-    const existing = loadFileIndex()['f_' + sha256.slice(0, 24)];
-    if (!existing) fail('FILE_CHANGED', 409);
-    const idx = loadFileIndex();
-    existing.expiresAtMs = Date.now() + FILE_TTL_MS;
-    idx[existing.id] = existing;
-    saveFileIndex(idx);
+  mkdirSync(FILES_DIR, { recursive: true });
+  const staged = join(FILES_DIR, 'stage-' + randomUUID());
+  copyFileSync(real, staged);
+  // The source must not have moved mid-copy — the staged bytes are what we hash.
+  const after = lstatSync(real);
+  if (after.mtimeMs !== s.mtimeMs || after.size !== s.size) {
+    try { rmSync(staged, { force: true }); } catch {}
+    fail('FILE_CHANGED', 409);
+  }
+  const sha256 = hashBytes(readFileSync(staged));
+  const id = 'f_' + hashBytes(t.taskId + '\0' + real + '\0' + sha256).slice(0, 24);
+  const existing = ledger.files[id];
+  if (existing) {
+    try { rmSync(staged, { force: true }); } catch {}
+    existing.expiresAtMs = Date.now() + FILES_TTL_MS;
+    save();
     return existing;
   }
   const name = typeof body?.name === 'string' && body.name.trim() && !/[/\\\x00-\x1f]/.test(body.name)
-    ? body.name.trim().slice(0, 160) : null;
-  const mime = typeof body?.mime === 'string' && body.mime ? body.mime.slice(0, 100) : null;
-  if (name || mime) {
-    const idx = loadFileIndex();
-    if (name) idx[meta.id].name = name;
-    if (mime) idx[meta.id].mime = mime;
-    saveFileIndex(idx);
-    return idx[meta.id];
-  }
-  return meta;
+    ? body.name.trim().slice(0, 160) : basename(real);
+  const mime = typeof body?.mime === 'string' && body.mime ? body.mime.slice(0, 100) : 'application/octet-stream';
+  const f = { id, taskId: t.taskId, name, size: s.size, mime, sha256,
+    sourcePath: real, staged, stagedAtMs: Date.now(),
+    expiresAtMs: Date.now() + FILES_TTL_MS, storage: 'pc' };
+  ledger.files[id] = f;
+  return f;
 };
 
 const sealArtifacts = (t) => {
@@ -1633,6 +1678,40 @@ const routes = (method, seg, taskId, body, query) => {
       })),
       ...(start > 0 ? { before: String(start + 1) } : {}),
     };
+  }
+  // /local/v1/files — staged agent→phone deliverables (worker-files/1). The
+  // byte route answers in worker-file-chunk/1 base64 slices because the
+  // worker transport carries JSON only — offset/length paging keeps every
+  // body bounded and resumable.
+  if (rest[0] === 'files') {
+    if (method === 'GET' && rest.length === 1) return fileList();
+    if (method === 'GET' && rest.length === 3 && rest[2] === 'chunks'
+        && /^f_[0-9a-f]{24}$/.test(rest[1])) {
+      sweepFiles();
+      const f = ledger.files[rest[1]];
+      if (!f || !existsSync(f.staged)) fail('FILE_NOT_FOUND', 404);
+      if (fileExpired(f)) {
+        try { rmSync(f.staged, { force: true }); } catch {}
+        fail('FILE_EXPIRED', 410);
+      }
+      const offset = Number(query.get('offset') ?? 0);
+      const length = Number(query.get('length') ?? (1 << 20));
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset >= Math.max(1, f.size)
+          || !Number.isSafeInteger(length) || length < 1 || length > (4 << 20)) {
+        fail('INVALID_REQUEST', 400);
+      }
+      const n = Math.min(length, f.size - offset);
+      const fd = openSync(f.staged, 'r');
+      const buf = Buffer.alloc(n);
+      try { if (readSync(fd, buf, 0, n, offset) !== n) fail('FILE_CHANGED', 409); }
+      finally { closeSync(fd); }
+      return {
+        schemaVersion: 'worker-file-chunk/1', id: f.id, name: f.name,
+        size: f.size, offset, bodyBase64: buf.toString('base64'),
+        eof: offset + n >= f.size,
+      };
+    }
+    fail('NOT_FOUND', 404);
   }
   // /local/v1/material-uploads — task-bound attachments (material-upload/1).
   // Begin creates a staged upload keyed by uploadKey; chunks must arrive in
@@ -1965,12 +2044,12 @@ const routes = (method, seg, taskId, body, query) => {
           ...(expired ? { cursorExpired: true } : {}) };
       }
       if (sub === 'files') {
-        // Task-scoped view of the shared staged pool — same rows the
-        // top-level /files list serves, filtered to this task's cards.
-        const idx = gcFiles(loadFileIndex());
+        // Task-scoped view of the staged pool — same rows the top-level
+        // /files list serves, filtered to this task's cards.
+        sweepFiles();
         return { schemaVersion: 'worker-files/1', taskId: t.taskId,
-          items: Object.values(idx).filter((m) => m.taskId === t.taskId)
-            .sort((a, b) => (b.stagedAtMs ?? 0) - (a.stagedAtMs ?? 0)) };
+          items: Object.values(ledger.files).filter((f) => f.taskId === t.taskId)
+            .map(fileMeta).sort((a, b) => b.stagedAt.localeCompare(a.stagedAt)) };
       }
       if (sub === 'metrics') return { cost: null, costCoverage: 'UNKNOWN', usageCoverage: 'NATIVE_TASK_TOTAL', configuredModel: 'vendor-cli' };
       if (sub === 'questions') {
@@ -2014,6 +2093,15 @@ const routes = (method, seg, taskId, body, query) => {
           sizeBytes: String(row.size), encoding: 'base64',
           bytes: chunk.toString('base64'), chunkSHA256: hashBytes(chunk) };
       } finally { closeSync(fd); }
+    }
+    // Explicit stage — files_stage MCP children (files.key bearer) and local
+    // tooling POST here; the path must live inside this task's workspace and
+    // the card posts onto this task's stream + events feed.
+    if (method === 'POST' && rest.length === 3 && sub === 'files') {
+      const row = fileMeta(stagePathForTask(t, body));
+      postFileCard(t, row);
+      save();
+      return { schemaVersion: 'worker-files/1', ...row };
     }
     if (method === 'GET' && rest.length === 3 && sub === 'commands') fail('NOT_FOUND', 404);
     if (method === 'GET' && rest.length === 3 && sub === 'interaction-requests') fail('NOT_FOUND', 404);
