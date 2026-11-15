@@ -19,9 +19,10 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
-import { join, resolve, relative, sep, dirname } from 'node:path';
+import { join, resolve, relative, sep, dirname, basename } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
+import { zstdDecompressSync } from 'node:zlib';
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -332,6 +333,98 @@ const ENGINES = {
     },
   },
 };
+
+// ---- local CLI history reader (read-only) -----------------------------------
+// `host.mjs history --engine codex|claude --root <dir> [--file <session>]`
+// Lists recent vendor session files or renders one file as normalized
+// {role, text} messages. Codex rollouts are zstd-compressed JSONL; claude
+// transcripts are plain JSONL. One JSON document on stdout; needs no token.
+const decodeSession = (file) => file.endsWith('.zst')
+  ? zstdDecompressSync(readFileSync(file)).toString('utf8')
+  : readFileSync(file, 'utf8');
+
+/** Codex `response_item.message` rows (user→input_text, assistant→output_text)
+ * and claude `type:user|assistant` rows both map to {role, text}. Messages whose
+ * whole body is a `<…>` snapshot (desktop env-context/app-event injections) are
+ * noise for reading — dropped. */
+const transcriptMessages = (file) => {
+  const out = [];
+  for (const line of decodeSession(file).split('\n')) {
+    if (!line.trim()) continue;
+    let row; try { row = JSON.parse(line); } catch { continue; }
+    const p = row.payload;
+    if (p?.type === 'message' && (p.role === 'user' || p.role === 'assistant')) {
+      const texts = (p.content ?? [])
+        .filter(c => typeof c?.text === 'string').map(c => c.text);
+      const text = texts.join('\n').trim();
+      if (text && !text.startsWith('<')) out.push({ role: p.role, text });
+    } else if ((row.type === 'user' || row.type === 'assistant') && !row.isSidechain) {
+      const c = row.message?.content;
+      const text = (typeof c === 'string' ? [c] : (c ?? [])
+        .filter(b => b?.type === 'text' && typeof b.text === 'string').map(b => b.text))
+        .join('\n').trim();
+      if (text && !text.startsWith('<')) out.push({ role: row.type, text });
+    }
+  }
+  return out;
+};
+
+const historyFiles = (engine, root) => {
+  const out = [];
+  const walk = (dir, depth) => {
+    if (depth > 6) return;
+    let items; try { items = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const it of items) {
+      const p = join(dir, it.name);
+      if (it.isDirectory()) walk(p, depth + 1);
+      else if (engine === 'codex' ? /^rollout-.*\.jsonl\.zst$/.test(it.name)
+          : depth === 1 && /\.jsonl$/.test(it.name)) out.push(p);
+    }
+  };
+  if (existsSync(root)) walk(root, 0);
+  return out;
+};
+
+if (cmd === 'history') {
+  const root = opt.root ?? '';
+  const engineName = opt.engine ?? '';
+  if (!['codex', 'claude'].includes(engineName) || !root) {
+    console.log(JSON.stringify({ ok: false, error: 'history requires --engine codex|claude --root <dir>' }));
+    process.exit(2);
+  }
+  try {
+    if (opt.file) {
+      const file = resolve(opt.file);
+      if (!file.startsWith(resolve(root) + sep)) fail('FILE_OUTSIDE_ROOT', 400);
+      const all = transcriptMessages(file);
+      const limit = Math.min(Math.max(Number(opt.limit) || 60, 1), 200);
+      const messages = all.slice(-limit).map(m => ({ role: m.role, text: m.text.slice(0, 3000) }));
+      console.log(JSON.stringify({ ok: true, file, total: all.length, messages,
+        truncated: all.length > limit }));
+    } else {
+      const limit = Math.min(Math.max(Number(opt.limit) || 10, 1), 50);
+      const files = historyFiles(engineName, root)
+        .map(f => { try { return { f, at: lstatSync(f).mtimeMs }; } catch { return null; } })
+        .filter(Boolean).sort((a, b) => b.at - a.at).slice(0, limit);
+      const sessions = files.map(({ f, at }) => {
+        let title = '';
+        try {
+          title = transcriptMessages(f)
+            .find(m => m.role === 'user' && !m.text.startsWith('# AGENTS.md'))?.text.slice(0, 80) ?? '';
+        }
+        catch { }
+        const id = (basename(f).match(/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/i) ?? [])[1]
+          ?? basename(f);
+        return { id, file: f, at: new Date(at).toISOString(), title };
+      });
+      console.log(JSON.stringify({ ok: true, sessions }));
+    }
+  } catch (error) {
+    console.log(JSON.stringify({ ok: false, error: String(error?.code ?? error?.message ?? error) }));
+    process.exit(2);
+  }
+  process.exit(0);
+}
 
 if (!ENGINES[ENGINE]) { console.error(`unknown --engine ${ENGINE}`); process.exit(2); }
 if (!STATE_DIR || !PORT || !PROJECT_DIR) { console.error('serve requires --state --port --project'); process.exit(2); }
@@ -691,6 +784,34 @@ const routes = (method, seg, taskId, body, query) => {
     }
     if (body.model !== undefined && !MODEL_CATALOG.some(m => m.modelRef === body.model)) fail('MODEL_REF_UNKNOWN', 400);
     if (body.effort !== undefined && !MODEL_CATALOG.some(m => m.modelRef === (body.model ?? MODEL) && (m.efforts ?? []).includes(body.effort))) fail('MODEL_EFFORT_UNSUPPORTED', 400);
+    // Adopt an existing vendor-CLI session (codex rollout / claude transcript):
+    // the task lands quiescent with the session's nativeSessionId preset and
+    // its messages imported, so the first follow-up runs through the engine's
+    // resume path (codex `exec resume`, claude `--resume`) instead of a fresh
+    // session. The file must live under the engine's session root; for claude
+    // it must also belong to this project (session slug = cwd slug).
+    let adoptId = null, adoptedMessages = null;
+    if (body.adoptSessionId !== undefined) {
+      if (typeof body.adoptSessionId !== 'string' || !/^[0-9a-f-]{6,64}$/i.test(body.adoptSessionId))
+        fail('INVALID_REQUEST', 400);
+      const root = ENGINE === 'codex' ? join(homedir(), '.codex', 'sessions')
+        : ENGINE === 'claude' ? join(homedir(), '.claude', 'projects') : null;
+      if (!root) fail('ADOPT_UNSUPPORTED', 400);
+      const file = historyFiles(ENGINE, root).find(f => basename(f).includes(body.adoptSessionId));
+      if (!file) fail('ADOPT_SESSION_NOT_FOUND', 404);
+      if (ENGINE === 'claude'
+          && basename(dirname(file)) !== PROJECT_DIR.replace(/[:\\/]/g, '-'))
+        fail('ADOPT_WRONG_PROJECT', 409);
+      adoptId = body.adoptSessionId;
+      const imported = transcriptMessages(file).slice(-300);
+      const at = new Date(lstatSync(file).mtimeMs).toISOString();
+      adoptedMessages = imported.map((m, i) => ({
+        messageId: 'adopted-' + (i + 1), sequence: String(i + 1), revision: '0',
+        role: m.role, text: m.text.slice(0, 3000),
+        status: m.role === 'user' ? 'CONSUMED' : 'COMPLETED',
+        occurredAt: at, updatedAt: at,
+      }));
+    }
     const prior = ledger.requests[body.requestKey];
     if (prior) {
       if (prior.hash !== digest({ i: body.instruction, p: body.projectId, e: body.engineId, m: body.model, f: body.effort })) {
@@ -701,11 +822,14 @@ const routes = (method, seg, taskId, body, query) => {
     const t = {
       taskId: 'native-' + randomUUID(), requestKey: body.requestKey,
       projectId: PROJECT_ID, engineId: ENGINE,
-      state: 'PREPARING', launchState: 'PREPARING', reasonCode: '', quiescent: false,
+      state: adoptId ? 'SUCCEEDED' : 'PREPARING',
+      launchState: adoptId ? 'COMPLETED' : 'PREPARING',
+      reasonCode: adoptId ? 'ADOPTED' : '', quiescent: adoptId !== null,
       generation: randomUUID(), segmentId: randomUUID(),
-      nativeSessionId: null, nativeTurnId: null, currentCommandId: body.requestKey,
+      nativeSessionId: adoptId, nativeTurnId: null, currentCommandId: body.requestKey,
       createdAt: now(), updatedAt: now(),
-      instruction: body.instruction, output: '', publicMessages: [], inputRequests: {},
+      instruction: body.instruction, output: '',
+      publicMessages: adoptedMessages ?? [], inputRequests: {},
       ...(body.model !== undefined ? { model: body.model } : {}),
       ...(body.effort !== undefined ? { effort: body.effort } : {}),
       baseline: [...inventory()].map(([p, v]) => ({ p, s: v.s, m: v.m })),
@@ -717,7 +841,7 @@ const routes = (method, seg, taskId, body, query) => {
       hash: digest({ i: body.instruction, p: body.projectId, e: body.engineId, m: body.model, f: body.effort }),
     };
     save();
-    dispatch(t, body.instruction, body.requestKey);
+    if (!adoptId) dispatch(t, body.instruction, body.requestKey);
     return { ...receipt(ledger.requests[body.requestKey]), taskId: t.taskId, engineId: ENGINE, engineVersion, state: 'ACCEPTED' };
   }
   if (rest[0] === 'tasks' && rest.length >= 2) {
