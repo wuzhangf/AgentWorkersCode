@@ -1,12 +1,6 @@
 #!/usr/bin/env node
 /**
  * cli-bridge — thin worker-local/1 host driving a stock vendor CLI.
- * Windows-specific fork (AgentWorkersCode-windows-link): the vendor-session
- * history readers below are Windows implementations — Devin sessions come from
- * the desktop app's state.vscdb ItemTable (no POSIX sessions.db exists), live
- * process scan goes through Win32_Process argv, and codex source detection
- * reads rollout `originator` (Codex Desktop vs cli). The generic fork only
- * reads ~/.local/share/devin/cli/sessions.db and ps/lsof.
  *
  * One process = one engine = one backendStoreId. Tasks spawn the installed CLI
  * (`claude -p --output-format stream-json`, `codex exec --json`) in the bound
@@ -24,10 +18,11 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync, lstatSync, realpathSync, appendFileSync, rmSync, openSync, readSync, closeSync, copyFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync, lstatSync, realpathSync, openSync, readSync, closeSync, rmSync, copyFileSync, appendFileSync } from 'node:fs';
 import { join, resolve, relative, sep, dirname, basename } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { zstdDecompressSync } from 'node:zlib';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -418,6 +413,22 @@ const ENGINES = {
   },
 };
 
+// ---- task material uploads (material-upload/1) -------------------------------
+// The phone's attach flow: bytes stage per uploadKey under materials/, each
+// chunk verified, and seal yields a material:// ref that a task's next
+// message may reference. target.taskId pins the upload to one conversation.
+const MAT_DIR = join(STATE_DIR, 'materials');
+const MAT_MAX_BYTES = 20 << 20;   // headroom over the phone's 5MiB cap
+const MAT_CHUNK_MAX = 256 << 10;
+
+const materialReceipt = (u) => ({
+  schemaVersion: 'material-upload/1', uploadKey: u.uploadKey, name: u.name,
+  mediaType: u.mediaType, sizeBytes: u.sizeBytes, sha256: u.sha256,
+  nextOffset: u.received, state: u.state,
+  ...(u.target ? { target: u.target } : {}),
+  ...(u.state === 'SEALED' ? { materialRef: u.materialRef } : {}),
+});
+
 // ---- local CLI history reader (read-only) -----------------------------------
 // `host.mjs history --engine codex|claude --root <dir> [--file <session>]`
 // Lists recent vendor session files or renders one file as normalized
@@ -431,9 +442,19 @@ const decodeSession = (file) => file.endsWith('.zst')
  * and claude `type:user|assistant` rows both map to {role, text}. Messages whose
  * whole body is a `<…>` snapshot (desktop env-context/app-event injections) are
  * noise for reading — dropped. */
-const transcriptMessages = (file) => {
+const transcriptMessages = (file, data = decodeSession(file)) => {
+  if (file.endsWith('.json')) {
+    const chat = JSON.parse(data);
+    return (Array.isArray(chat.messages) ? chat.messages : []).flatMap(message => {
+      if (!['user', 'gemini'].includes(message?.type)) return [];
+      const content = message.content;
+      const text = typeof content === 'string' ? content : Array.isArray(content)
+        ? content.map(part => typeof part?.text === 'string' ? part.text : '').join('\n') : '';
+      return text.trim() ? [{ role: message.type === 'user' ? 'user' : 'assistant', text }] : [];
+    });
+  }
   const out = [];
-  for (const line of decodeSession(file).split('\n')) {
+  for (const line of data.split('\n')) {
     if (!line.trim()) continue;
     let row; try { row = JSON.parse(line); } catch { continue; }
     const p = row.payload;
@@ -480,21 +501,17 @@ const SESSION_ROOTS = {
   gemini: () => join(homedir(), '.gemini', 'tmp'),
 };
 
-/** Devin's authoritative store is `<roaming>/Devin/cli/sessions.db` on Windows
- * (the POSIX path is `~/.local/share/devin/cli/sessions.db`) — sessions(
- * id,title,working_directory,last_activity_at,hidden) + message_nodes(
- * session_id,chat_message,created_at), WAL mode so read-only opens coexist
- * with the live app. The Windsurf-derived desktop shell ALSO mirrors a
- * session index into `User/globalStorage/state.vscdb` ItemTable; it is used
- * only when the cli store is absent. */
-const DEVIN_HOME = join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'Devin');
+/** Devin CLI/desktop keeps sessions in a SQLite store, not loose files —
+ * listed and transcript-harvested through these two helpers instead of
+ * historyFiles/sessionCwd. Read-only open; absent store reports empty.
+ * Store location differs by platform: win32 keeps it under Roaming
+ * `%APPDATA%\Devin\cli`, macOS under Application Support, Linux/other XDG
+ * under ~/.local/share — first existing file wins. */
 const DEVIN_DBS = process.platform === 'win32'
-  ? [join(DEVIN_HOME, 'cli', 'sessions.db'),
+  ? [join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'Devin', 'cli', 'sessions.db'),
      join(homedir(), '.local', 'share', 'devin', 'cli', 'sessions.db')]
-  : [join(homedir(), '.local', 'share', 'devin', 'cli', 'sessions.db')];
-const DEVIN_VSCDB = join(DEVIN_HOME, 'User', 'globalStorage', 'state.vscdb');
-const DEVIN_MSG_DIR = join(DEVIN_HOME, 'acp-messages');
-const DEVIN_SUMMARY_DIR = join(DEVIN_HOME, 'summaries');
+  : [join(homedir(), '.local', 'share', 'devin', 'cli', 'sessions.db'),
+     join(homedir(), 'Library', 'Application Support', 'Devin', 'cli', 'sessions.db')];
 const devinDb = () => {
   for (const file of DEVIN_DBS) {
     if (!existsSync(file)) continue;
@@ -502,177 +519,70 @@ const devinDb = () => {
   }
   return null;
 };
-const devinVscdb = () => {
-  if (!existsSync(DEVIN_VSCDB)) return null;
-  try { return new DatabaseSync(DEVIN_VSCDB, { readOnly: true }); } catch { return null; }
+/** sessions.last_activity_at / created_at are seconds-since-epoch; accept
+ * ms/µs/ns too so a unit change never degrades rows to January 1970. */
+const devinAt = (v) => {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const ms = n < 1e11 ? n * 1e3 : n < 1e14 ? n : n < 1e17 ? n / 1e3 : n / 1e6;
+  return new Date(ms).toISOString();
 };
-/** Titles the operator sees: cascade editor payloads carry resource→title. */
-const devinTitles = (db) => {
-  const titles = new Map();
-  try {
-    const row = db.prepare(
-      "SELECT value FROM ItemTable WHERE key = 'windsurfSpace.editorStates'").get();
-    if (!row) return titles;
-    const walk = (o) => {
-      if (Array.isArray(o)) { for (const x of o) walk(x); return; }
-      if (o && typeof o === 'object') {
-        if (o.id === 'workbench.input.cascadeEditor' && typeof o.value === 'string') {
-          try {
-            const v = JSON.parse(o.value);
-            const m = /cascade-acp\/(?:devin-cli|devin-cloud)\/([^/"]+)$/.exec(v?.resource ?? '');
-            if (m && typeof v?.title === 'string' && v.title) titles.set(m[1], v.title);
-          } catch { }
-        }
-        for (const x of Object.values(o)) walk(x);
-      }
-    };
-    walk(JSON.parse(row.value));
-  } catch { }
-  return titles;
+const sessionID = (file) => (basename(file).match(
+  /([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/i
+) ?? [])[1] ?? basename(file);
+const validSessionID = (id) => typeof id === 'string' && /^[0-9A-Za-z][0-9A-Za-z._-]{5,127}$/.test(id);
+const vendorFile = (engine, id) => {
+  const root = SESSION_ROOTS[engine]?.();
+  return root ? historyFiles(engine, root).find(file =>
+    sessionID(file) === id && lstatSync(file, { throwIfNoEntry: false })?.isFile()
+  ) : undefined;
 };
-const devinSessions = () => {
+const devinDate = (value) => {
+  const n = Number(value);
+  const date = value == null || value === '' ? new Date(NaN)
+    : new Date(Number.isFinite(n) ? (Math.abs(n) < 1e11 ? n * 1000 : n) : value);
+  return Number.isFinite(+date) ? date.toISOString() : '';
+};
+const devinSessions = ({ id, limit, before } = {}) => {
   const db = devinDb();
-  if (db) {
-    try {
-      return db.prepare(
-        `SELECT id, title, working_directory, last_activity_at FROM sessions
-         WHERE hidden = 0 ORDER BY last_activity_at DESC LIMIT 30`).all()
-        .map((r) => { const at = Number(r.last_activity_at);
-          // last_activity_at is seconds-since-epoch, not ms — the POSIX reader
-          // treated it as ms and every devin row landed in January 1970.
-          return { id: String(r.id), title: String(r.title ?? ''),
-            cwd: String(r.working_directory ?? ''),
-            at: new Date(at < 1e12 ? at * 1000 : at).toISOString() }; });
-    } catch { /* fall through to the vscdb mirror */ }
-    finally { try { db.close(); } catch {} }
-  }
-  return devinSessionsFromVscdb();
-};
-/** Desktop-shell mirror fallback — only used when cli/sessions.db is absent
- * (e.g. the GUI ran without the bundled CLI ever creating its store). */
-const devinSessionsFromVscdb = () => {
-  const db = devinVscdb();
   if (!db) return [];
   try {
-    const rows = db.prepare(
-      `SELECT key, value FROM ItemTable
-       WHERE key LIKE 'windsurf.acp.messageStore.session.acp/%'`).all();
-    const info = new Map();   // name → {cwd, createdAt}
-    for (const r of db.prepare(
-      `SELECT key, value FROM ItemTable
-       WHERE key LIKE 'windsurf.acp.sessioninfo.session.acp/%'`).all()) {
-      try {
-        const d = JSON.parse(r.value);
-        const name = String(r.key).split('/').pop();
-        info.set(name, { cwd: String(d?.info?.cwd ?? ''),
-          createdAt: String(d?.info?._meta?.['cognition.ai/createdAt'] ?? '') });
-      } catch { }
+    const args = [];
+    let sql = 'SELECT id, title, working_directory, last_activity_at FROM sessions WHERE hidden = 0';
+    if (id !== undefined) { sql += ' AND id = ?'; args.push(id); }
+    if (before) {
+      sql += ' AND (COALESCE(last_activity_at, 0) < ? OR (COALESCE(last_activity_at, 0) = ? AND id > ?))';
+      args.push(before.at, before.at, before.id);
     }
-    const startTimes = new Map(); // name → ISO
-    for (const r of db.prepare(
-      `SELECT key, value FROM ItemTable
-       WHERE key LIKE 'windsurf.acp.session/session_start_time/%'`).all())
-      startTimes.set(String(r.key).split('/').pop(), String(r.value ?? ''));
-    const flags = new Map(); // name → {archived,done,empty,folder}
-    for (const r of db.prepare(
-      `SELECT value FROM ItemTable
-       WHERE key LIKE 'devin.desktopShell.localSessionAnnotations.%'`).all()) {
-      try {
-        for (const [k, v] of Object.entries(JSON.parse(r.value))) {
-          const name = String(k).split('/').pop();
-          if (name && typeof v === 'object' && v) flags.set(name, v);
-        }
-      } catch { }
-    }
-    const titles = devinTitles(db);
-    const out = [];
-    for (const r of rows) {
-      const parts = String(r.key).split('/');
-      const provider = parts[parts.length - 2], name = parts[parts.length - 1];
-      if (!name || flags.get(name)?.empty === true) continue;
-      let meta = {};
-      try { meta = JSON.parse(r.value); } catch { continue; }
-      const at = Number(meta.lastUpdated)
-        ? new Date(Number(meta.lastUpdated)).toISOString()
-        : (info.get(name)?.createdAt || startTimes.get(name) || new Date(0).toISOString());
-      let title = titles.get(name) ?? '';
-      if (!title) {
-        try {
-          title = (readFileSync(join(DEVIN_SUMMARY_DIR, name + '.md'), 'utf8')
-            .split('\n').find((l) => l.trim() && !l.startsWith('#') && !l.startsWith('<'))
-            ?? '').trim().slice(0, 80);
-        } catch { }
-      }
-      out.push({ id: name, title: title || name.replaceAll('-', ' '),
-        cwd: info.get(name)?.cwd || String(flags.get(name)?.folder ?? ''),
-        at, provider });
-    }
-    out.sort((a, b) => b.at.localeCompare(a.at));
-    return out.slice(0, 30);
+    sql += ' ORDER BY COALESCE(last_activity_at, 0) DESC, id';
+    if (limit !== undefined) { sql += ' LIMIT ?'; args.push(limit); }
+    return db.prepare(sql).all(...args).map(r => ({
+      id: String(r.id), title: String(r.title ?? ''), cwd: String(r.working_directory ?? ''),
+      at: devinDate(r.last_activity_at), rawAt: r.last_activity_at ?? 0,
+    }));
   } catch { return []; }
   finally { try { db.close(); } catch {} }
 };
-/** Transcript for side-questions/adoption: the authoritative message_nodes
- * stream first, then the live acp-messages cache (best-effort table probe),
- * then the durable summary file. */
 const devinTranscript = (id) => {
   const db = devinDb();
-  if (db) {
-    try {
-      const rows = db.prepare(
-        `SELECT chat_message FROM message_nodes WHERE session_id = ? ORDER BY created_at`).all(id);
-      const msgs = rows.map((r) => { try { const m = JSON.parse(r.chat_message);
-          return { role: m.role, text: String(m.content ?? '') }; }
-        catch { return null; } })
-        .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.text.trim());
-      if (msgs.length) return msgs;
-    } catch { }
-    finally { try { db.close(); } catch {} }
-  }
-  const vdb = devinVscdb();
+  if (!db) return null;
   try {
-    const row = vdb?.prepare(
-      `SELECT value FROM ItemTable WHERE key LIKE 'windsurf.acp.messageStore.session.acp/%' || ?`)
-      .get('/' + id);
-    const uuid = row ? JSON.parse(row.value)?.uuid : null;
-    if (uuid) {
-      const file = join(DEVIN_MSG_DIR, uuid + '.db');
-      if (existsSync(file)) {
-        try {
-          const mdb = new DatabaseSync(file, { readOnly: true });
-          try {
-            const tables = mdb.prepare(
-              "SELECT name FROM sqlite_master WHERE type='table'").all().map((t) => t.name);
-            for (const table of tables) {
-              const cols = mdb.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
-              const textCol = cols.find((c) => /text|content|message|body/i.test(c));
-              const roleCol = cols.find((c) => /role|author|sender|type/i.test(c));
-              if (!textCol || !roleCol) continue;
-              const msgs = mdb.prepare(`SELECT * FROM ${table}`).all().map((r) => {
-                const role = /user|human/i.test(String(r[roleCol])) ? 'user' : 'assistant';
-                return { role, text: String(r[textCol] ?? '') };
-              }).filter((m) => m.text.trim());
-              if (msgs.length) return msgs;
-            }
-          } finally { try { mdb.close(); } catch {} }
-        } catch { }
-      }
-    }
-  } catch { }
-  finally { try { vdb?.close(); } catch {} }
-  try {
-    const md = readFileSync(join(DEVIN_SUMMARY_DIR, id + '.md'), 'utf8').trim();
-    if (md) return [{ role: 'assistant', text: 'Session summary:\n' + md }];
-  } catch { }
-  return null;
+    return db.prepare(
+      `SELECT chat_message FROM message_nodes WHERE session_id = ? ORDER BY created_at`).all(id)
+      .map((r) => { try { const m = JSON.parse(r.chat_message);
+        return { role: m.role, text: String(m.content ?? '') }; }
+      catch { return null; } })
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.text.trim());
+  } catch { return null; }
+  finally { try { db.close(); } catch {} }
 };
 
 /** Working directory a session file belongs to. Claude transcripts stamp cwd
  * on user/attachment rows; codex rollouts put it in session_meta. Filenames
  * and dir slugs are unreliable (dashes collide), so always read the content. */
-const sessionCwd = (file) => {
+const sessionCwd = (file, data) => {
   try {
-    for (const line of decodeSession(file).split('\n')) {
+    for (const line of (data ?? decodeSession(file)).split('\n')) {
       if (!line.trim()) continue;
       let row; try { row = JSON.parse(line); } catch { continue; }
       if (typeof row?.cwd === 'string' && row.cwd) return row.cwd;
@@ -1093,7 +1003,7 @@ const facts = (t) => ({
   capabilities: { stop: live.has(t.taskId), pause: live.has(t.taskId),
                   resume: t.state === 'PAUSED',
                   steer: live.has(t.taskId), followUp: t.quiescent === true || TERMINAL.has(t.state) },
-  configuredModel: 'vendor-cli',
+  configuredModel: t.model ?? MODEL_CATALOG[0]?.modelRef ?? 'vendor-cli',
 });
 
 const receipt = (r) => ({
@@ -1133,23 +1043,6 @@ const inventory = () => {
 };
 
 const hashBytes = (b) => createHash('sha256').update(b).digest('hex');
-
-// ---- task material uploads (material-upload/1) -------------------------------
-// The phone's attach flow: bytes stage per uploadKey under materials/, each
-// chunk is sha256-verified, and seal proves the whole file before handing out
-// a material:// ref that a task's next message may reference. target.taskId
-// pins which conversation may consume it.
-const MAT_DIR = join(STATE_DIR, 'materials');
-const MAT_MAX_BYTES = 20 << 20;   // headroom over the phone's 5MiB cap
-const MAT_CHUNK_MAX = 256 << 10;
-
-const materialReceipt = (u) => ({
-  schemaVersion: 'material-upload/1', uploadKey: u.uploadKey, name: u.name,
-  mediaType: u.mediaType, sizeBytes: u.sizeBytes, sha256: u.sha256,
-  nextOffset: u.received, state: u.state,
-  ...(u.target ? { target: u.target } : {}),
-  ...(u.state === 'SEALED' ? { materialRef: u.materialRef } : {}),
-});
 
 // ---- task event feed (worker-events/1) --------------------------------------
 /** Append a worker-events/1 item to the task's retained event window. The
@@ -1351,6 +1244,8 @@ const sweepFiles = () => {
 
 const fileExpired = (f) => (f.expiresAtMs ?? 0) <= Date.now();
 
+/** Public meta row — the same shape the card marker carries, so the phone
+ * parses list rows and <<FILE>> payloads identically. */
 /** Public row — list items, the meta answer and the <<FILE>> marker all
  * carry this shape (worker-local-file/1 fields the gateway + phone verify). */
 const fileMeta = (f) => ({
@@ -1550,116 +1445,20 @@ const routes = (method, seg, taskId, body, query) => {
       capabilities: { executionModes: ['WORKSPACE_TASK'], steer: true, followUp: true,
                       stop: true, pause: true, resume: true } }] };
   }
-  // /local/v1/history — this engine's on-disk sessions plus ones a live
-  // desktop/terminal CLI is still writing. The phone picks one and launches
-  // with adoptSessionId (+adoptEngine for a cross-engine handoff).
-  if (method === 'GET' && rest[0] === 'history' && rest.length === 1) {
-    const root = SESSION_ROOTS[ENGINE]?.();
-    const sessions = [];
-    if (root && existsSync(root)) {
-      const live = liveCliProcesses().filter((p) => p.engine === ENGINE);
-      // Sessions this bridge itself spawned are already tasks — offering them
-      // for adoption would create a duplicate of something the user has.
-      const own = new Set(Object.values(ledger.tasks).map((t) => t.nativeSessionId).filter(Boolean));
-      // Sessions spawned for phone tasks — our own plus sibling bridges'
-      // ledgers (dead bridges' task sessions stay adoptable but labeled).
-      const phoneIds = new Set();
-      try {
-        const parent = join(STATE_DIR, '..');
-        for (const w of readdirSync(parent)) {
-          try {
-            const l = JSON.parse(readFileSync(join(parent, w, 'ledger.json'), 'utf8'));
-            for (const t of Object.values(l.tasks ?? {})) if (t.nativeSessionId) phoneIds.add(t.nativeSessionId);
-          } catch { /* not a ledger dir */ }
-        }
-      } catch { /* workers parent unreadable */ }
-      // entrypoint stamps who spawned the session: claude `entrypoint:
-      // claude-desktop-*` → desktop app, `cli` → interactive terminal,
-      // `sdk-cli` → a headless -p turn. Codex rollouts record the same fact
-      // in session_meta as `originator` ("Codex Desktop" vs "codex_cli_rs").
-      const sessionEntrypoint = (f) => {
-        try {
-          for (const line of decodeSession(f).split('\n').slice(0, 80)) {
-            const m = line.match(/"(?:entrypoint|originator)"\s*:\s*"([^"]+)"/i);
-            if (m) return m[1];
-          }
-        } catch { }
-        return '';
-      };
-      const files = historyFiles(ENGINE, root)
-        .map((f) => { try { return { f, at: lstatSync(f).mtimeMs }; } catch { return null; } })
-        .filter(Boolean).sort((a, b) => b.at - a.at).slice(0, 40);
-      const seen = new Set();
-      for (const { f, at } of files) {
-        const cwd = sessionCwd(f);
-        const id = (basename(f).match(/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/i) ?? [])[1]
-          ?? basename(f);
-        if (seen.has(id) || own.has(id)) continue;
-        seen.add(id);
-        let title = '';
-        try {
-          const firstUser = transcriptMessages(f)
-            .find((m) => m.role === 'user' && !m.text.startsWith('# AGENTS.md'));
-          // Side-question spawns write real session files — they are our own
-          // machinery's debris, never something to adopt.
-          if (firstUser?.text.startsWith(SIDE_QUESTION_MARK)) continue;
-          title = firstUser?.text.slice(0, 80) ?? '';
-        } catch { }
-        // Desktop-app sessions carry an operator-set title in a sibling dir —
-        // prefer it over the raw first-prompt excerpt.
-        try {
-          const custom = JSON.parse(readFileSync(
-            join(dirname(f), basename(f, '.jsonl'), 'custom-title.json'), 'utf8'));
-          if (typeof custom?.customTitle === 'string' && custom.customTitle) title = custom.customTitle;
-        } catch { }
-        const owner = live.find((p) => p.cwd && cwd === p.cwd);
-        const ep = sessionEntrypoint(f);
-        const source = phoneIds.has(id) ? 'phone'
-          : /desktop/i.test(ep) ? 'desktop' : 'cli';
-        sessions.push({ id, title, at: new Date(at).toISOString(), engine: ENGINE, source,
-          ...(cwd ? { cwd } : {}), ...(owner ? { live: true, pid: owner.pid } : {}) });
-      }
-      // Devin sessions live in SQLite, not the vendor file store — one bridge
-      // (claude, always present) reports them so the phone doesn't see triples.
-      // engine='devin' keeps them out of own/seen id-space; source='devin'
-      // draws the badge.
-      if (ENGINE === 'claude') {
-        for (const s of devinSessions()) {
-          sessions.push({ id: s.id, title: s.title, at: s.at, engine: 'devin',
-            source: 'devin', ...(s.cwd ? { cwd: s.cwd } : {}) });
-        }
-      }
-    }
-    return { schemaVersion: 'worker-local-history/1', engineId: ENGINE, items: sessions };
-  }
-  // /local/v1/history/sessions/{id}?engine=&limit=&before= — one session's
-  // transcript for the phone's tap-through detail page, newest page first
-  // (`before` walks backwards through message ordinals). Same contract as
-  // the upstream bridge: worker-vendor-transcript/1. Read-only, never
-  // starts a turn.
   if (method === 'GET' && rest[0] === 'history' && rest[1] === 'sessions' && rest.length === 3) {
     const id = rest[2];
     const engine = query.get('engine') ?? ENGINE;
-    if (!/^[0-9A-Za-z._-]{6,80}$/.test(id)
-        || !(engine === ENGINE || ENGINE === 'claude' && engine === 'devin')) {
+    if (!validSessionID(id) || !(engine === ENGINE || ENGINE === 'claude' && engine === 'devin')) {
       fail('INVALID_REQUEST', 400);
     }
     const limit = Number(query.get('limit') ?? 15);
     const before = query.has('before') ? Number(query.get('before')) : undefined;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20
-        || before !== undefined && (!Number.isSafeInteger(before) || before < 1)) {
-      fail('INVALID_REQUEST', 400);
-    }
-    let messages = null;
-    if (engine === 'devin') {
-      if (!devinSessions().some((s) => s.id === id)) fail('SESSION_NOT_FOUND', 404);
-      messages = devinTranscript(id);
-    } else {
-      const root = SESSION_ROOTS[ENGINE]?.();
-      const file = root ? historyFiles(ENGINE, root).find((f) => basename(f).includes(id)) : null;
-      if (!file) fail('SESSION_NOT_FOUND', 404);
-      messages = transcriptMessages(file);
-    }
+        || before !== undefined && (!Number.isSafeInteger(before) || before < 1)) fail('INVALID_REQUEST', 400);
+    const file = engine !== 'devin' ? vendorFile(engine, id) : undefined;
+    const devin = engine === 'devin' && devinSessions({ id, limit: 1 }).length > 0;
+    if (!file && !devin) fail('SESSION_NOT_FOUND', 404);
+    const messages = file ? transcriptMessages(file) : devinTranscript(id);
     if (!messages) fail('LOCAL_SOURCE_UNAVAILABLE', 503);
     const end = Math.min(messages.length, before === undefined ? messages.length : before - 1);
     const start = Math.max(0, end - limit);
@@ -1671,6 +1470,88 @@ const routes = (method, seg, taskId, body, query) => {
       })),
       ...(start > 0 ? { before: String(start + 1) } : {}),
     };
+  }
+
+  if (method === 'GET' && rest[0] === 'history' && rest.length === 1) {
+    const paged = query.has('limit');
+    const limit = Number(query.get('limit') ?? 40);
+    const selected = query.get('engine');
+    const engines = [...(Object.hasOwn(SESSION_ROOTS, ENGINE) ? [ENGINE] : []),
+      ...(ENGINE === 'claude' ? ['devin'] : [])];
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50
+        || selected && !engines.includes(selected)) fail('INVALID_REQUEST', 400);
+    const needle = (query.get('q') ?? '').trim().toLowerCase();
+    const cursor = query.get('cursor');
+    let before;
+    if (cursor) {
+      try { before = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')); }
+      catch { fail('INVALID_REQUEST', 400); }
+      if (!selected || !before || before.engine !== selected || before.q !== needle
+          || !validSessionID(before.id) || !['number', 'string'].includes(typeof before.at)) fail('INVALID_REQUEST', 400);
+    }
+    const matches = (record) => !needle || [record.title, record.cwd, record.id]
+      .some(value => value.toLowerCase().includes(needle));
+    const items = [];
+    const pages = [];
+    for (const engine of selected ? [selected] : engines) {
+      const pageLimit = !paged && engine === 'devin' ? 30 : limit;
+      const records = [];
+      if (engine === 'devin') {
+        const found = devinSessions({ before, limit: needle ? undefined : pageLimit + 1 });
+        for (const { rawAt, ...item } of found) {
+          if (matches(item)) records.push({ item: { ...item, engine, source: 'devin' }, at: rawAt });
+          if (records.length > pageLimit) break;
+        }
+      } else {
+        const own = new Set(Object.values(ledger.tasks).map(t => t.nativeSessionId).filter(Boolean));
+        const phoneIds = new Set();
+        try {
+          const parent = join(STATE_DIR, '..');
+          for (const worker of readdirSync(parent)) {
+            try {
+              const sibling = JSON.parse(readFileSync(join(parent, worker, 'ledger.json'), 'utf8'));
+              for (const t of Object.values(sibling.tasks ?? {})) if (t.nativeSessionId) phoneIds.add(t.nativeSessionId);
+            } catch { /* Not a readable worker ledger. */ }
+          }
+        } catch { /* Workers parent unavailable. */ }
+        const liveOwners = liveCliProcesses().filter(p => p.engine === ENGINE);
+        const files = historyFiles(engine, SESSION_ROOTS[engine]()).flatMap(file => {
+          const stat = lstatSync(file, { throwIfNoEntry: false });
+          return stat?.isFile() ? [{ file, id: sessionID(file), at: stat.mtimeMs }] : [];
+        }).sort((a, b) => b.at - a.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+        const seen = new Set();
+        for (const { file, id, at } of files) {
+          if (!validSessionID(id) || seen.has(id) || own.has(id)) continue;
+          seen.add(id);
+          if (before && (at > before.at || (at === before.at && id <= before.id))) continue;
+          try {
+            const data = decodeSession(file);
+            const first = transcriptMessages(file, data).find(m => m.role === 'user' && !m.text.startsWith('# AGENTS.md'));
+            if (first?.text.startsWith(SIDE_QUESTION_MARK)) continue;
+            let title = first?.text.slice(0, 80) ?? '';
+            try {
+              const custom = JSON.parse(readFileSync(join(dirname(file), basename(file, '.jsonl'), 'custom-title.json'), 'utf8'));
+              if (typeof custom?.customTitle === 'string' && custom.customTitle) title = custom.customTitle.slice(0, 512);
+            } catch { /* No user title. */ }
+            const cwd = sessionCwd(file, data);
+            const desktop = /"entrypoint"\s*:\s*"claude-desktop/.test(data.split('\n', 80).join('\n'));
+            const source = phoneIds.has(id) ? 'phone' : desktop ? 'desktop' : 'cli';
+            const item = { id, title, at: new Date(at).toISOString(), engine, source, cwd,
+              live: Boolean(cwd && liveOwners.some(owner => owner.cwd === cwd)) };
+            if (matches(item)) records.push({ item, at });
+          } catch { /* A missing or unreadable transcript may disappear during a scan. */ }
+          if (records.length > pageLimit) break;
+        }
+      }
+      const visible = records.slice(0, pageLimit);
+      const last = visible.at(-1);
+      items.push(...visible.map(row => row.item));
+      pages.push({ engine, ...(records.length > pageLimit && last ? {
+        cursor: Buffer.from(JSON.stringify({ engine, q: needle, at: last.at, id: last.item.id })).toString('base64url'),
+      } : {}) });
+    }
+    return { schemaVersion: paged ? 'worker-local-history/2' : 'worker-local-history/1',
+      engineId: ENGINE, items, ...(paged ? { pages } : {}) };
   }
   // /local/v1/material-uploads — task-bound attachments (material-upload/1).
   // Begin creates a staged upload keyed by uploadKey; chunks must arrive in
@@ -1769,15 +1650,27 @@ const routes = (method, seg, taskId, body, query) => {
       items.sort((a, b) => (b.askedAt ?? '').localeCompare(a.askedAt ?? ''));
       return { schemaVersion: 'worker-local-questions/1', items: items.slice(0, 100) };
     }
+    if (method === 'GET' && rest.length === 3) {
+      const key = rest[2];
+      const request = ledger.requests[key];
+      if (request?.operation === 'SESSION_QUESTION') return receipt(request);
+      for (const [sessionId, questions] of Object.entries(ledger.sessionQuestions)) {
+        const question = questions.find(row => row.questionId === key);
+        if (question) return { ...question, sessionId };
+      }
+      fail('NOT_FOUND', 404);
+    }
     if (method === 'POST' && rest.length === 2) {
       if (!body || typeof body.requestKey !== 'string' || typeof body.sessionId !== 'string'
-          || !/^[0-9A-Za-z._-]{6,80}$/.test(body.sessionId)
+          || !validSessionID(body.sessionId)
           || typeof body.question !== 'string' || !body.question.trim()) fail('INVALID_REQUEST', 400);
       if (Buffer.byteLength(body.question, 'utf8') > 4096) fail('REQUEST_TOO_LARGE', 413);
+      const fingerprint = { s: body.sessionId, q: body.question, e: body.engine ?? null };
+      const hash = digest({ ...fingerprint, model: body.model ?? null });
       const prior = ledger.requests[body.requestKey];
       if (prior) {
         if (prior.operation !== 'SESSION_QUESTION'
-            || prior.hash !== digest({ s: body.sessionId, q: body.question, e: body.engine ?? null })) {
+            || (prior.hash !== hash && prior.hash !== digest(fingerprint))) {
           fail('IDEMPOTENCY_PAYLOAD_MISMATCH', 409);
         }
         return receipt(prior);
@@ -1786,12 +1679,11 @@ const routes = (method, seg, taskId, body, query) => {
       // or the devin store only the claude bridge reports.
       let sessionEngine = null, transcript = null, sessionCwdValue = null;
       if (ENGINE === 'claude') {
-        const row = devinSessions().find((s) => s.id === body.sessionId);
+        const row = devinSessions({ id: body.sessionId, limit: 1 })[0];
         if (row) { sessionEngine = 'devin'; transcript = devinTranscript(row.id) ?? []; sessionCwdValue = row.cwd ?? null; }
       }
       if (sessionEngine === null) {
-        const root = SESSION_ROOTS[ENGINE]?.();
-        const file = root ? historyFiles(ENGINE, root).find((f) => basename(f).includes(body.sessionId)) : null;
+        const file = vendorFile(ENGINE, body.sessionId);
         if (!file) fail('SESSION_NOT_FOUND', 404);
         sessionEngine = ENGINE; transcript = transcriptMessages(file); sessionCwdValue = sessionCwd(file);
       }
@@ -1815,7 +1707,7 @@ const routes = (method, seg, taskId, body, query) => {
       ledger.requests[body.requestKey] = {
         requestKey: body.requestKey, operation: 'SESSION_QUESTION',
         state: 'SUCCEEDED', result: { questionId: q.questionId, sessionId: body.sessionId },
-        hash: digest({ s: body.sessionId, q: body.question, e: body.engine ?? null }),
+        hash,
       };
       save();
       // Stub task: the transcript plays publicMessages, engine/cwd label the
@@ -1862,13 +1754,13 @@ const routes = (method, seg, taskId, body, query) => {
     // agent of the codebase the session was actually about.
     let adoptId = null, adoptedMessages = null, adoption = null;
     if (body.adoptSessionId !== undefined) {
-      if (typeof body.adoptSessionId !== 'string' || !/^[0-9A-Za-z._-]{6,80}$/.test(body.adoptSessionId))
+      if (typeof body.adoptSessionId !== 'string' || !validSessionID(body.adoptSessionId))
         fail('INVALID_REQUEST', 400);
       const source = body.adoptEngine === undefined ? ENGINE : body.adoptEngine;
       if (source === 'devin') {
         // Devin's store is SQLite — transcript handoff is the only possible
         // path (no vendor CLI can resume a Devin session id).
-        const row = devinSessions().find((s) => s.id === body.adoptSessionId);
+        const row = devinSessions({ id: body.adoptSessionId, limit: 1 })[0];
         const imported = row ? devinTranscript(row.id)?.slice(-300) : null;
         if (!imported?.length) fail('ADOPT_SESSION_NOT_FOUND', 404);
         adoptId = body.adoptSessionId;
@@ -1883,8 +1775,7 @@ const routes = (method, seg, taskId, body, query) => {
         if (row.cwd) adoption.cwd = row.cwd;
       } else {
       if (!Object.keys(SESSION_ROOTS).includes(source)) fail('ADOPT_UNSUPPORTED', 400);
-      const root = SESSION_ROOTS[source]();
-      const file = historyFiles(source, root).find(f => basename(f).includes(body.adoptSessionId));
+      const file = vendorFile(source, body.adoptSessionId);
       if (!file) fail('ADOPT_SESSION_NOT_FOUND', 404);
       adoptId = body.adoptSessionId;
       const imported = transcriptMessages(file).slice(-300);
@@ -1903,9 +1794,15 @@ const routes = (method, seg, taskId, body, query) => {
       if (cwd) adoption.cwd = cwd;
       }
     }
+    const launchSelection = { i: body.instruction, p: body.projectId, e: body.engineId, m: body.model, f: body.effort };
+    const launchHash = adoptId
+      ? digest({ ...launchSelection, sessionId: adoptId, source: adoption.from }) : digest(launchSelection);
     const prior = ledger.requests[body.requestKey];
     if (prior) {
-      if (prior.hash !== digest({ i: body.instruction, p: body.projectId, e: body.engineId, m: body.model, f: body.effort })) {
+      const original = ledger.tasks[prior.taskId]?.adoption;
+      const legacyAdoption = original?.sessionId === adoptId && original?.from === adoption?.from
+        && prior.hash === digest(launchSelection);
+      if (prior.operation !== 'LAUNCH' || (prior.hash !== launchHash && !legacyAdoption)) {
         fail('IDEMPOTENCY_PAYLOAD_MISMATCH', 409);
       }
       return receipt(prior);
@@ -1931,7 +1828,7 @@ const routes = (method, seg, taskId, body, query) => {
     ledger.requests[body.requestKey] = {
       requestKey: body.requestKey, taskId: t.taskId, operation: 'LAUNCH',
       state: 'ACCEPTED', result: { taskId: t.taskId, engineId: ENGINE, engineVersion, state: 'ACCEPTED' },
-      hash: digest({ i: body.instruction, p: body.projectId, e: body.engineId, m: body.model, f: body.effort }),
+      hash: launchHash,
     };
     save();
     if (!adoptId) dispatch(t, body.instruction, body.requestKey);
