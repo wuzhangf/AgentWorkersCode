@@ -1331,6 +1331,46 @@ const routes = (method, seg, taskId, body, query) => {
     }
     return { schemaVersion: 'worker-local-history/1', engineId: ENGINE, items: sessions };
   }
+  // /local/v1/history/sessions/{id}?engine=&limit=&before= — one session's
+  // transcript for the phone's tap-through detail page, newest page first
+  // (`before` walks backwards through message ordinals). Same contract as
+  // the upstream bridge: worker-vendor-transcript/1. Read-only, never
+  // starts a turn.
+  if (method === 'GET' && rest[0] === 'history' && rest[1] === 'sessions' && rest.length === 3) {
+    const id = rest[2];
+    const engine = query.get('engine') ?? ENGINE;
+    if (!/^[0-9A-Za-z._-]{6,80}$/.test(id)
+        || !(engine === ENGINE || ENGINE === 'claude' && engine === 'devin')) {
+      fail('INVALID_REQUEST', 400);
+    }
+    const limit = Number(query.get('limit') ?? 15);
+    const before = query.has('before') ? Number(query.get('before')) : undefined;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20
+        || before !== undefined && (!Number.isSafeInteger(before) || before < 1)) {
+      fail('INVALID_REQUEST', 400);
+    }
+    let messages = null;
+    if (engine === 'devin') {
+      if (!devinSessions().some((s) => s.id === id)) fail('SESSION_NOT_FOUND', 404);
+      messages = devinTranscript(id);
+    } else {
+      const root = SESSION_ROOTS[ENGINE]?.();
+      const file = root ? historyFiles(ENGINE, root).find((f) => basename(f).includes(id)) : null;
+      if (!file) fail('SESSION_NOT_FOUND', 404);
+      messages = transcriptMessages(file);
+    }
+    if (!messages) fail('LOCAL_SOURCE_UNAVAILABLE', 503);
+    const end = Math.min(messages.length, before === undefined ? messages.length : before - 1);
+    const start = Math.max(0, end - limit);
+    return {
+      schemaVersion: 'worker-vendor-transcript/1', sessionId: id, engine,
+      items: messages.slice(start, end).map((m, index) => ({
+        id: String(start + index + 1), role: m.role, text: m.text.slice(0, 4000),
+        truncated: m.text.length > 4000,
+      })),
+      ...(start > 0 ? { before: String(start + 1) } : {}),
+    };
+  }
   // /local/v1/history/questions — a side question about a vendor SESSION (not
   // a task): the session's own transcript is the read-only context, answered
   // by one detached turn on whichever engine the asker picked. Adopt-only
