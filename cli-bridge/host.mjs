@@ -224,6 +224,7 @@ const ENGINES = {
         ...(SKIP === 'off' ? [] : ['--dangerously-skip-permissions']),
         ...(task?.model ?? MODEL ? ['--model', task?.model ?? MODEL] : []),
         ...(sessionId ? ['--resume', sessionId] : []),
+        ...filesMcpArgv(task),
       ];
     },
     bin: 'claude',
@@ -298,6 +299,7 @@ const ENGINES = {
         '--dangerously-bypass-hook-trust',
         '--model', (task?.model ?? MODEL) || CODEX_DEFAULT_MODEL,
         ...(task?.effort ? ['-c', `model_reasoning_effort=${task.effort}`] : []),
+        ...filesMcpArgv(task),
       ];
     },
     bin: 'codex',
@@ -810,6 +812,14 @@ if (!ledger.tasks) ledger.tasks = {};
 if (!ledger.requests) ledger.requests = {};
 if (!ledger.sessionQuestions) ledger.sessionQuestions = {};
 if (!ledger.materialUploads) ledger.materialUploads = {};
+// The files.key credential lets a spawned CLI's MCP child reach the single
+// files-stage route without ever seeing WORKER_LOCAL_TOKEN (same trust level
+// as the on-disk ledger — it unlocks staging, nothing else).
+if (typeof ledger.filesKey !== 'string' || ledger.filesKey.length < 24) {
+  ledger.filesKey = randomUUID() + randomUUID();
+}
+const FILES_KEY_FILE = join(STATE_DIR, 'files.key');
+try { writeFileSync(FILES_KEY_FILE, ledger.filesKey); } catch {}
 
 const save = () => {
   const tmp = LEDGER + '.tmp';
@@ -1139,6 +1149,232 @@ const materialReceipt = (u) => ({
   ...(u.target ? { target: u.target } : {}),
   ...(u.state === 'SEALED' ? { materialRef: u.materialRef } : {}),
 });
+
+// ---- task event feed (worker-events/1) --------------------------------------
+/** Append a worker-events/1 item to the task's retained event window. The
+ * paged /events route is the reconciliation channel the phone already polls;
+ * rows are {cursor, kind, occurredAt, ...payload} so the client's fold sees
+ * the payload fields directly. */
+const EVENT_KEEP = 200;
+const emitEvent = (t, kind, payload) => {
+  const seq = (t.eventSeq ?? 0) + 1;
+  t.eventSeq = seq;
+  t.events = [...(t.events ?? []), { cursor: String(seq), kind, occurredAt: now(), ...payload }].slice(-EVENT_KEEP);
+};
+
+/** Post one file-card/1 event + the <<FILE>> marker row — the two channels a
+ * phone consumes: events reconcile/notify, the marker row is the durable
+ * inline card inside the message stream. */
+const postFileCard = (t, meta) => {
+  const expiresAt = new Date(meta.expiresAtMs).toISOString();
+  addMessage(t, 'assistant', `<<FILE ${JSON.stringify(meta)}>>`);
+  emitEvent(t, 'FILE_CARD', {
+    schemaVersion: 'file-card/1',
+    file: { id: meta.id, name: meta.name, size: meta.size, mime: meta.mime ?? 'application/octet-stream', sha256: meta.sha256 },
+    staged: { at: meta.storage ?? 'pc', expiresAt },
+  });
+};
+
+// ---- files_stage MCP wiring --------------------------------------------------
+// The CLI's MCP child gets: a stdio server (written into state/mcp on demand),
+// the loopback port, the task id, the store pin and the files.key path — every
+// one of those is non-secret, so codex may carry them in argv (-c overrides)
+// and claude in a per-task --mcp-config file. The actual credential stays in
+// files.key, readable only by this user account like the ledger itself.
+const MCP_DIR = join(STATE_DIR, 'mcp');
+const MCP_FILES_SOURCE = `#!/usr/bin/env node
+// pac-files MCP server (stdio JSON-RPC, newline-delimited). Spawned by the
+// vendor CLI — offers files_stage(path) so an agent can hand a workspace file
+// to the user's phone and return immediately (delivery is the bridge's job).
+import { readFileSync } from 'node:fs';
+
+const PORT = Number(process.env.PAC_BRIDGE_PORT ?? 0);
+const TASK = process.env.PAC_TASK_ID ?? '';
+const STORE = process.env.PAC_STORE_ID ?? '';
+const KEYFILE = process.env.PAC_FILES_KEY_FILE ?? '';
+
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
+const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
+const failure = (id, code, message) => send({ jsonrpc: '2.0', id, error: { code, message } });
+const toolText = (id, text, isError) => reply(id, {
+  content: [{ type: 'text', text }], ...(isError ? { isError: true } : {}),
+});
+
+const stage = async (args) => {
+  const key = readFileSync(KEYFILE, 'utf8').trim();
+  const res = await fetch('http://127.0.0.1:' + PORT + '/local/v1/tasks/' + TASK + '/files', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer ' + key,
+      'x-worker-local-store': STORE,
+    },
+    body: JSON.stringify({ path: args?.path, name: args?.name }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.code ?? ('HTTP_' + res.status));
+  return data;
+};
+
+const handle = async (msg) => {
+  const id = msg.id;
+  const method = msg.method ?? '';
+  if (id === undefined || id === null) return; // notifications get no reply
+  if (method === 'initialize') {
+    return reply(id, {
+      protocolVersion: msg.params?.protocolVersion ?? '2024-11-05',
+      capabilities: { tools: {} },
+      serverInfo: { name: 'pac-files', version: '1.0.0' },
+    });
+  }
+  if (method === 'ping') return reply(id, {});
+  if (method === 'tools/list') {
+    return reply(id, { tools: [{
+      name: 'files_stage',
+      description: 'Stage a file from this workspace for delivery to the user phone. ' +
+        'Returns a fileId immediately and posts a download card into this task - ' +
+        'the agent does not need to wait for the phone. Use after producing a ' +
+        'file the user should receive (report, export, build output). path may ' +
+        'be relative to the workspace root or absolute inside it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Workspace file to deliver (relative or absolute, must stay inside the workspace).' },
+          name: { type: 'string', description: 'Optional display name on the phone card.' },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    }] });
+  }
+  if (method === 'tools/call') {
+    if (msg.params?.name !== 'files_stage') {
+      return toolText(id, 'unknown tool: ' + String(msg.params?.name), true);
+    }
+    try {
+      const out = await stage(msg.params?.arguments ?? {});
+      return toolText(id, 'Staged for the user phone: ' + out.name + ' (' + out.size +
+        ' bytes, fileId ' + out.fileId + ', expires ' + out.expiresAt + '). ' +
+        'A download card was posted to this task - nothing else to do.');
+    } catch (e) {
+      return toolText(id, 'files_stage failed: ' + String(e?.message ?? e), true);
+    }
+  }
+  return failure(id, -32601, 'method not found: ' + method);
+};
+
+let buf = '';
+process.stdin.on('data', (d) => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i).trim();
+    buf = buf.slice(i + 1);
+    if (!line) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch { continue; }
+    handle(msg).catch(() => {});
+  }
+});
+`;
+
+/** Materialise the embedded MCP server once; restarts rewrite it when the
+ * bundled source changed so old bridges never run stale helpers. */
+const mcpFilesEntry = () => {
+  const entry = join(MCP_DIR, 'files.mjs');
+  try {
+    if (!existsSync(entry) || readFileSync(entry, 'utf8') !== MCP_FILES_SOURCE) {
+      mkdirSync(MCP_DIR, { recursive: true });
+      const tmp = entry + '.tmp';
+      writeFileSync(tmp, MCP_FILES_SOURCE);
+      renameSync(tmp, entry);
+    }
+    return entry;
+  } catch { return entry; }
+};
+
+const filesMcpArgv = (t) => {
+  if (!t?.taskId) return [];
+  const env = {
+    PAC_BRIDGE_PORT: String(PORT),
+    PAC_TASK_ID: t.taskId,
+    PAC_STORE_ID: ledger.storeId,
+    PAC_FILES_KEY_FILE: FILES_KEY_FILE,
+  };
+  if (ENGINE === 'codex') {
+    const esc = (s) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    return [
+      '-c', `mcp_servers.files.command="${esc(process.execPath)}"`,
+      '-c', `mcp_servers.files.args=["${esc(mcpFilesEntry())}"]`,
+      ...Object.entries(env).flatMap(([k, v]) => ['-c', `mcp_servers.files.env.${k}="${esc(v)}"`]),
+    ];
+  }
+  if (ENGINE === 'claude') {
+    const cfg = join(MCP_DIR, `files-${t.taskId}.json`);
+    try {
+      mkdirSync(MCP_DIR, { recursive: true });
+      writeFileSync(cfg, JSON.stringify({
+        mcpServers: { files: { command: process.execPath, args: [mcpFilesEntry()], env } },
+      }));
+    } catch { return []; }
+    return ['--mcp-config', cfg];
+  }
+  return [];
+};
+
+// Direct-stage cap for explicit calls (files_stage MCP / POST files): well
+// above the chunked-artifact ceiling so phone delivery stays one request
+// class; outbox drops keep their own larger budget for local pickups.
+const FILES_STAGE_MAX = 64 << 20;
+
+/** Explicit stage (MCP files_stage / POST /files): resolve a path inside the
+ * task's working directory, copy it into the shared FILES_DIR pool and post
+ * the file card onto the task. Content-hash dedup is shared with the outbox
+ * harvest — re-staging identical bytes refreshes expiry and re-posts the card
+ * (a deliberate second send), never duplicates storage. */
+const stagePathForTask = (t, body) => {
+  const src = typeof body?.path === 'string' ? body.path.trim() : '';
+  if (!src || /[\x00-\x1f]/.test(src)) fail('INVALID_REQUEST', 400);
+  const root = realpathSync(t.cwd ?? PROJECT_DIR);
+  let real;
+  try { real = realpathSync(resolve(root, src)); } catch { fail('FILE_NOT_FOUND', 404); }
+  const rel = relative(root, real);
+  if (rel === '' || rel === '..' || rel.startsWith('..' + sep)) fail('FILE_OUTSIDE_WORKSPACE', 403);
+  const s = lstatSync(real);
+  if (!s.isFile() || s.size <= 0) fail('FILE_NOT_FOUND', 404);
+  if (s.size > FILES_STAGE_MAX) fail('FILE_TOO_LARGE', 413);
+  // Same bounded secret window as artifacts: headers/config live up front.
+  const probe = Buffer.alloc(Math.min(s.size, 524288));
+  const pf = openSync(real, 'r');
+  try { if (readSync(pf, probe, 0, probe.length, 0) !== probe.length) fail('FILE_CHANGED', 409); }
+  finally { closeSync(pf); }
+  const scanned = probe.toString('utf8');
+  if (knownSecrets.some((x) => scanned.includes(x)) || SECRET_RE.test(scanned)) fail('FILE_SECRET', 403);
+  const meta = stageFile(real, t.taskId);
+  if (!meta) {
+    // Content already staged — refresh expiry so a deliberate re-send extends
+    // the pickup window, then post a fresh card for this task.
+    const sha256 = hashBytes(readFileSync(real));
+    const existing = loadFileIndex()['f_' + sha256.slice(0, 24)];
+    if (!existing) fail('FILE_CHANGED', 409);
+    const idx = loadFileIndex();
+    existing.expiresAtMs = Date.now() + FILE_TTL_MS;
+    idx[existing.id] = existing;
+    saveFileIndex(idx);
+    return existing;
+  }
+  const name = typeof body?.name === 'string' && body.name.trim() && !/[/\\\x00-\x1f]/.test(body.name)
+    ? body.name.trim().slice(0, 160) : null;
+  const mime = typeof body?.mime === 'string' && body.mime ? body.mime.slice(0, 100) : null;
+  if (name || mime) {
+    const idx = loadFileIndex();
+    if (name) idx[meta.id].name = name;
+    if (mime) idx[meta.id].mime = mime;
+    saveFileIndex(idx);
+    return idx[meta.id];
+  }
+  return meta;
+};
 
 const sealArtifacts = (t) => {
   if (t.artifactManifest) return t.artifactManifest;
@@ -1709,7 +1945,33 @@ const routes = (method, seg, taskId, body, query) => {
       }
       if (sub === 'input-requests') return { items: Object.values(t.inputRequests ?? {}) };
       if (sub === 'artifacts') return sealArtifacts(t);
-      if (sub === 'events') return { items: [], nextCursor: null };
+      if (sub === 'events') {
+        // worker-events/1 paged reconciliation — the same feed the phone's
+        // poll folds item-by-item; cursor is the consumed sequence position.
+        const all = t.events ?? [];
+        const num = (k) => (query.has(k) ? Number(query.get(k)) : null);
+        const cursor = num('cursor');
+        const limit = Math.min(Math.max(num('limit') ?? 100, 1), 100);
+        const items = all
+          .filter((e) => cursor === null || Number(e.cursor) > cursor)
+          .slice(0, limit);
+        const oldest = all.length ? Number(all[0].cursor) : null;
+        const expired = cursor !== null && oldest !== null && oldest > cursor + 1;
+        const next = items.length
+          ? Number(items[items.length - 1].cursor)
+          : cursor ?? (oldest !== null ? oldest - 1 : 0);
+        return { schemaVersion: 'worker-events/1', taskId: t.taskId, items,
+          cursor: String(next), nextCursor: String(next),
+          ...(expired ? { cursorExpired: true } : {}) };
+      }
+      if (sub === 'files') {
+        // Task-scoped view of the shared staged pool — same rows the
+        // top-level /files list serves, filtered to this task's cards.
+        const idx = gcFiles(loadFileIndex());
+        return { schemaVersion: 'worker-files/1', taskId: t.taskId,
+          items: Object.values(idx).filter((m) => m.taskId === t.taskId)
+            .sort((a, b) => (b.stagedAtMs ?? 0) - (a.stagedAtMs ?? 0)) };
+      }
       if (sub === 'metrics') return { cost: null, costCoverage: 'UNKNOWN', usageCoverage: 'NATIVE_TASK_TOTAL', configuredModel: 'vendor-cli' };
       if (sub === 'questions') {
         return { schemaVersion: 'worker-local-questions/1', taskId: t.taskId,
@@ -1918,9 +2180,17 @@ http.createServer((req, res) => {
     res.end(data);
   };
   (async () => {
-    if (req.headers.authorization !== 'Bearer ' + TOKEN) return send(401, { code: 'LOCAL_AUTH_REQUIRED' });
     const url = new URL(req.url, 'http://127.0.0.1');
     const seg = url.pathname.split('/').filter(Boolean);
+    // files.key — a bridge-scoped staging credential the spawned CLIs' MCP
+    // children can read from disk — opens exactly one route: POST files into
+    // a task's staged pool. Everything else keeps requiring the full token.
+    const filesStageOnly = req.method === 'POST' && seg.length === 5
+      && seg[0] === 'local' && seg[1] === 'v1' && seg[2] === 'tasks' && seg[4] === 'files';
+    const bearer = String(req.headers.authorization ?? '').replace(/^Bearer /, '');
+    if (bearer !== TOKEN && !(filesStageOnly && bearer === ledger.filesKey)) {
+      return send(401, { code: 'LOCAL_AUTH_REQUIRED' });
+    }
     const isIdentity = seg.join('/') === 'local/v1/identity';
     if (!isIdentity) {
       const store = req.headers['x-worker-local-store'];
