@@ -570,6 +570,7 @@ const loadAdapters = async () => {
       }
       const id = ad?.manifest?.id ?? d.name;
       if (!ADAPTER_ID.test(id)) { adapterProblems.push(`${d.name}: bad manifest id`); continue; }
+      adapterManifests.set(id, ad.manifest ?? {});
       if (typeof ad?.supported === 'function') {
         let verdict;
         try { verdict = ad.supported(adapterCtx()); } catch (e) { verdict = e?.message ?? 'check failed'; }
@@ -603,6 +604,9 @@ const loadAdapters = async () => {
 };
 /** Engine ids → adapter-provided extra bin candidates (wellKnownCliPaths). */
 const ADAPTER_BINS = new Map();
+/** Loaded adapter manifests keyed by engine id — `detect` reports these so
+ * hosts can seed registerable engines without vendor knowledge of their own. */
+const adapterManifests = new Map();
 /** Live-badge process matchers — built-ins for the compiled engines, adapters
  * append their manifest.detect.process entries at load. */
 const LIVE_PROCS = [
@@ -682,6 +686,35 @@ const liveCliProcesses = () => {
 // Adapters register into ENGINES/STORES/LIVE_PROCS before any command path
 // consults them — a directory scan with no side effects beyond registration.
 await loadAdapters();
+
+// `detect` reports what each loaded adapter can see on this machine — resolved
+// binary for spawn engines, existing data dirs for stores. Hosts consume the
+// JSON to seed registerable engines without carrying vendor knowledge of
+// their own (worker-adapter/1 §detect).
+if (cmd === 'detect') {
+  const engines = [];
+  for (const [id, manifest] of adapterManifests) {
+    const det = manifest.detect ?? {};
+    const row = { id, kind: manifest.kind ?? 'store', displayName: manifest.displayName ?? id };
+    const bin = ENGINES[id]?.bin;
+    if (bin) {
+      const exe = resolveBin(bin);
+      if (exe) { row.bin = exe; if (!exe.pre?.length) row.binPath = exe.cmd; }
+    }
+    if (Array.isArray(det.configDirs)) {
+      const found = det.configDirs.filter(p => { try { return existsSync(p); } catch { return false; } });
+      if (found.length) row.dataDirs = found;
+    }
+    if (Array.isArray(det.installDirs)) {
+      const found = det.installDirs.filter(p => { try { return existsSync(p); } catch { return false; } });
+      if (found.length) row.installDirs = found;
+    }
+    if (STORES[id]?.unsupported) row.unsupported = STORES[id].unsupported;
+    engines.push(row);
+  }
+  console.log(JSON.stringify({ ok: true, engines }));
+  process.exit(0);
+}
 
 if (cmd === 'history') {
   const root = opt.root ?? '';
