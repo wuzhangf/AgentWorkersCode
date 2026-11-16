@@ -100,3 +100,67 @@ test('vendor history supports independent Agent pages, old Devin lookup and read
   assert.equal(task.configuredModel, 'opus');
   assert.equal(task.quiescent, true);
 });
+
+test('a follow-up updates the sealed file digest under the same artifact identity', async t => {
+  const fixture = await mkdtemp(join(tmpdir(), 'cli-file-versions-'));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const project = join(fixture, 'project');
+  await mkdir(project);
+  const executable = join(fixture, 'test-claude');
+  await writeFile(executable, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo fixture; exit 0; fi
+if [ -f report.md ]; then printf 'report version two\\n' > report.md
+else printf 'report version one\\n' > report.md; printf 'log file\\n' > log.txt; fi
+printf '%s\\n' '{"type":"system","subtype":"init","session_id":"session-fixture"}'
+`, { mode: 0o700 });
+  const listener = createServer().listen(0, '127.0.0.1');
+  await once(listener, 'listening');
+  const port = listener.address().port;
+  await new Promise(resolve => listener.close(resolve));
+  const token = randomBytes(24).toString('hex');
+  const child = spawn(process.execPath, [
+    new URL('../cli-bridge/host.mjs', import.meta.url).pathname,
+    'serve', '--engine', 'claude', '--state', join(fixture, 'state'),
+    '--project', project, '--port', String(port), '--executable', executable,
+  ], { env: { ...process.env, WORKER_LOCAL_TOKEN: token }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const stopped = once(child, 'exit');
+  t.after(async () => { child.kill(); await stopped; });
+  const ready = await Promise.race([once(child.stdout, 'data'), stopped]);
+  assert.match(String(ready[0]), /127\.0\.0\.1/);
+  const request = async (path, body) => {
+    const response = await fetch('http://127.0.0.1:' + port + '/local/v1' + path, {
+      method: body ? 'POST' : 'GET',
+      headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    assert.equal(response.status, 200, path);
+    return response.json();
+  };
+  const launched = await request('/tasks', {
+    requestKey: 'create-files', projectId: 'workspace', engineId: 'claude', instruction: 'create files',
+  });
+  const path = '/tasks/' + launched.taskId;
+  const completed = async () => {
+    for (let i = 0; i < 60; i += 1) {
+      const facts = await request(path);
+      if (facts.state === 'SUCCEEDED') return facts;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.fail('execution did not finish');
+  };
+  const first = await completed();
+  assert.equal(first.sessionFiles.complete, true);
+  const initial = (await request(path + '/artifacts')).items;
+  const report = initial.find(row => row.path === 'report.md');
+  const log = initial.find(row => row.path === 'log.txt');
+  await request(path + '/messages', {
+    requestKey: 'update-report', kind: 'NATIVE_FOLLOW_UP', content: 'update report',
+    generation: first.generation, nativeSessionId: first.nativeSessionId,
+    nativeTurnId: first.nativeTurnId, targetCommandId: first.currentCommandId,
+  });
+  const second = await completed();
+  const refreshed = second.sessionFiles.artifacts;
+  assert.equal(refreshed.length, 2);
+  assert.notEqual(refreshed.find(row => row.artifactId === report.artifactId).sha256, report.sha256);
+  assert.equal(refreshed.find(row => row.artifactId === log.artifactId).sha256, log.sha256);
+});
