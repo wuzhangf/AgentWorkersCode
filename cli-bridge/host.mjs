@@ -685,12 +685,15 @@ if (cmd === 'history') {
   process.exit(0);
 }
 
-if (!ENGINES[ENGINE]) { console.error(`unknown --engine ${ENGINE}`); process.exit(2); }
+// 'devin' is a read-only store engine: it never spawns a CLI of its own —
+// it serves the Devin desktop session db for listing/transcripts/adoption and
+// answers side questions through whichever real engine the asker picks.
+if (!ENGINES[ENGINE] && ENGINE !== 'devin') { console.error(`unknown --engine ${ENGINE}`); process.exit(2); }
 if (!STATE_DIR || !PORT || !PROJECT_DIR) { console.error('serve requires --state --port --project'); process.exit(2); }
 if (TOKEN.length < 24) { console.error('WORKER_LOCAL_TOKEN must be at least 24 chars'); process.exit(2); }
 if (cmd !== 'serve') { console.error('usage: host.mjs serve ...'); process.exit(2); }
 
-const engine = ENGINES[ENGINE];
+const engine = ENGINES[ENGINE] ?? null;
 // An explicit --executable still goes through the .cmd shim unwrap so npm
 // shims picked in the UI spawn as `node <entry.js>`, never via a shell.
 const resolvePath = (p) => {
@@ -704,11 +707,13 @@ const resolvePath = (p) => {
   }
   return { cmd: p, pre: [] };
 };
-const resolved = EXECUTABLE ? resolvePath(EXECUTABLE) : resolveBin(engine.bin);
-let engineVersion = 'unknown';
-try {
-  engineVersion = execFileSync(resolved.cmd, [...resolved.pre, '--version'], { encoding: 'utf8' }).trim();
-} catch { console.error(`${EXECUTABLE || engine.bin} not runnable`); process.exit(2); }
+const resolved = EXECUTABLE ? resolvePath(EXECUTABLE) : engine ? resolveBin(engine.bin) : null;
+let engineVersion = 'read-only';
+if (resolved) {
+  try {
+    engineVersion = execFileSync(resolved.cmd, [...resolved.pre, '--version'], { encoding: 'utf8' }).trim();
+  } catch { console.error(`${EXECUTABLE || engine.bin} not runnable`); process.exit(2); }
+}
 
 // ---- durable ledger ------------------------------------------------------------
 
@@ -946,6 +951,10 @@ const runSideQuestion = (t, q) => {
   const chunks = [];
   const collect = (role, text) => { if (role === 'assistant' && text.trim()) chunks.push(text); };
   let stderr = '';
+  // A missing CLI (e.g. asking on a read-only bridge with no engines
+  // installed) surfaces as an async spawn 'error' — without a listener it
+  // would take the whole bridge down.
+  child.on('error', (e) => { stderr += `${q.engine} 不可用：${e.message}`; });
   child.stderr.on('data', (d) => { stderr += d; if (stderr.length > 4096) stderr = stderr.slice(-4096); });
   let buf = '';
   child.stdout.on('data', (d) => {
@@ -1440,15 +1449,19 @@ const routes = (method, seg, taskId, body, query) => {
       availability: 'AVAILABLE', headRevision: null, hasUncommittedChanges: false, kind: 'WORKSPACE' }] };
   }
   if (method === 'GET' && rest[0] === 'engines' && rest.length === 1) {
-    return { ...identity(), items: [{ engineId: ENGINE, engineVersion, version: engineVersion,
+    // A read-only store bridge (devin) launches nothing — empty scope keeps it
+    // off the phone's task-target and answering-engine pickers.
+    return { ...identity(), items: engine ? [{ engineId: ENGINE, engineVersion, version: engineVersion,
       availability: 'AVAILABLE', profileId: 'MANAGED', sourceKind: 'cli',
       capabilities: { executionModes: ['WORKSPACE_TASK'], steer: true, followUp: true,
-                      stop: true, pause: true, resume: true } }] };
+                      stop: true, pause: true, resume: true } }] : [] };
   }
   if (method === 'GET' && rest[0] === 'history' && rest[1] === 'sessions' && rest.length === 3) {
     const id = rest[2];
     const engine = query.get('engine') ?? ENGINE;
-    if (!validSessionID(id) || !(engine === ENGINE || ENGINE === 'claude' && engine === 'devin')) {
+    // The devin store is shared local data — any bridge may serve a read;
+    // only the devin bridge REPORTS devin sessions (see /local/v1/history).
+    if (!validSessionID(id) || !(engine === ENGINE || engine === 'devin')) {
       fail('INVALID_REQUEST', 400);
     }
     const limit = Number(query.get('limit') ?? 15);
@@ -1476,8 +1489,10 @@ const routes = (method, seg, taskId, body, query) => {
     const paged = query.has('limit');
     const limit = Number(query.get('limit') ?? 40);
     const selected = query.get('engine');
+    // Devin sessions are reported by the dedicated devin bridge only —
+    // reporting them from every bridge would duplicate rows on the phone.
     const engines = [...(Object.hasOwn(SESSION_ROOTS, ENGINE) ? [ENGINE] : []),
-      ...(ENGINE === 'claude' ? ['devin'] : [])];
+      ...(ENGINE === 'devin' ? ['devin'] : [])];
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50
         || selected && !engines.includes(selected)) fail('INVALID_REQUEST', 400);
     const needle = (query.get('q') ?? '').trim().toLowerCase();
@@ -1675,10 +1690,11 @@ const routes = (method, seg, taskId, body, query) => {
         }
         return receipt(prior);
       }
-      // Locate the session being asked about: this bridge's own vendor root,
-      // or the devin store only the claude bridge reports.
+      // Locate the session being asked about: the devin store is readable on
+      // every bridge (adopt-only sessions answer by transcript, not a live
+      // vendor handle), then this bridge's own vendor root.
       let sessionEngine = null, transcript = null, sessionCwdValue = null;
-      if (ENGINE === 'claude') {
+      {
         const row = devinSessions({ id: body.sessionId, limit: 1 })[0];
         if (row) { sessionEngine = 'devin'; transcript = devinTranscript(row.id) ?? []; sessionCwdValue = row.cwd ?? null; }
       }
@@ -1737,6 +1753,9 @@ const routes = (method, seg, taskId, body, query) => {
         || body.engineId !== ENGINE || typeof body.instruction !== 'string' || !body.instruction.trim()) {
       fail('INVALID_REQUEST', 400);
     }
+    // Read-only store engines (devin) serve history/questions/adopt-source
+    // only — there is no CLI to spawn a turn on.
+    if (!engine) fail('ENGINE_READ_ONLY', 409);
     if (body.optionsRevision !== undefined && body.optionsRevision !== preflight().optionsRevision) {
       fail('PREFLIGHT_CHANGED', 409);
     }
