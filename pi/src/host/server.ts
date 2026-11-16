@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { Store, type Row, id, digest, exact, now, hash, publicText } from './store.js';
 import { git, gitBytes, inspectProject, artifacts, artifact } from './artifacts.js';
 import { Materials, MATERIAL_CHUNK_MAX } from './materials.js';
+import { FilesPool } from './files.js';
 import { WindowsJob } from '../control/ownership.js';
 import { MacOwnership, MAC_QUIESCENCE_METHOD } from '../control/macos-ownership.js';
 import { executionProfile, IN_PROCESS_PROFILE, RUNNER_PROFILE, isNoForkProfile, SANDBOX_EXEC, NO_FORK_POLICY } from '../control/profiles.js';
@@ -59,7 +60,7 @@ const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catc
 // Budget caps arrive as contract decimal strings; safe integers are tolerated.
 const budgetCap = (v: any) => { const n = typeof v === 'string' && /^(0|[1-9][0-9]*)$/.test(v) ? Number(v) : v; return Number.isSafeInteger(n) && n > 0 ? n : null; };
 export class PiHost {
-  readonly store: Store; readonly bootId = randomUUID(); private live = new Map<string, Live>(); private auxLive = new Map<string, AuxLive>(); private collabLive = new Map<string, CollabLive>(); private terminals = new Map<string, Terminal>(); private sseConnections = new Set<Socket>(); private closed = false; private storageClosed = false; private materialsManager?: Materials;
+  readonly store: Store; readonly bootId = randomUUID(); private live = new Map<string, Live>(); private auxLive = new Map<string, AuxLive>(); private collabLive = new Map<string, CollabLive>(); private terminals = new Map<string, Terminal>(); private sseConnections = new Set<Socket>(); private closed = false; private storageClosed = false; private materialsManager?: Materials; private files!: FilesPool; private boundPort = 0;
   // A slot belongs to a turn admitted by this host, including preparation and
   // the interval between dispatch and acknowledgement. Idle sessions and
   // persisted process-ownership evidence have separate lifetimes.
@@ -95,6 +96,9 @@ export class PiHost {
     const boundProfile = this.store.getMeta('execution-profile') ?? (existingStore ? 'native' : this.executionProfile);
     if (boundProfile !== this.executionProfile) { this.store.close(); throw new Error('EXECUTION_PROFILE_CHANGED'); }
     this.store.setMeta('execution-profile', boundProfile);
+    // Staged-deliverables pool lives beside the task store: worker-local-files/1
+    // rows and staged bytes must outlive the agent session that produced them.
+    this.files = new FilesPool(this.store.directory);
     for (const task of this.store.tasks()) {
       if (task.state === 'PAUSED' && task.checkpointManifest && (process.platform === 'win32' || task.quiescent && task.stopProof?.method === this.quiescenceMethod)) {
         // Windows owns kill-on-close Jobs. macOS requires a prior durable no-fork
@@ -350,6 +354,15 @@ export class PiHost {
     return { profile: this.executionProfile, profileId: this.profileId, sandbox, osSandboxClaimed: isNoForkProfile(this.executionProfile), approvalPolicy: 'HUMAN_VIA_ASK_USER_TOOL', toolAdmission: task.writeScope || task.budget ? 'AWAITED_GATE_CHECK' : 'NATIVE', writeScope: { effective: task.writeScope ?? null, default: 'UNDECLARED', enforcement: task.writeScope ? 'FILE_MUTATING_TOOLS_GATE_SHELL_PATHS_NOT_ATTRIBUTED' : 'UNDECLARED' }, environmentBinding: task.environmentBinding ?? null, toolAllowlist: task.toolAllowlist ?? null, policyPreset: task.policyPreset ?? null, frozen: true, semanticsNote: 'Frozen at launch; running-task policy changes are not implemented (new presets affect future tasks only)' };
   }
   private update(taskId: string, fn: (task: Row) => void) { const task = this.store.task(taskId); fn(task); this.store.save(task); return task; }
+  /** Durable staged-file card: the <<FILE>> marker lands inline in the message
+   *  stream and FILE_CARD on the events feed — the phone consumes both, and the
+   *  marker row stays meaningful after reconcile (same shape as cli-bridge). */
+  private postFileCard(taskId: string, row: Row) {
+    this.update(taskId, t => {
+      (t.publicMessages ??= []).push({ role: 'assistant', text: '<<FILE ' + JSON.stringify(row) + '>>', commandId: t.currentCommandId, nativeTurnId: t.nativeTurnId, occurredAt: now() });
+      this.store.event(t, 'FILE_CARD', { schemaVersion: 'file-card/1', file: { id: row.id, name: row.name, size: row.size, mime: row.mime, sha256: row.sha256 }, staged: { at: row.storage ?? 'pc', expiresAt: row.expiresAt } });
+    });
+  }
   /** Effective execution window for a task: a bounded per-task deadlineMs set
    *  at admission wins; otherwise the host --task-deadline-ms value applies
    *  (600000 preserves the original fixed window). Reused wherever a fresh
@@ -398,7 +411,16 @@ export class PiHost {
     this.admitQueue();
     const taskId = 'native-' + randomUUID(); const queued = this.activeTasks.size >= this.maxActive();
     const effectiveDeadlineMs = deadlineMs ?? this.taskDeadlineMs();
-    const task: Row = { taskId, executionMode: mode, engineId: ENGINE_ID, engineVersion: PI_VERSION, projectId: body.projectId, baseCommit: checked.headRevision, profileId: this.profileId, executionProfile: this.executionProfile, workspace: join(this.store.directory, 'workspaces', taskId), sessionDir: join(this.store.directory, 'sessions', taskId), goal: body.instruction, modelBinding: model, configuredModel: model.name, configuredProvider: 'worker-model', generation: randomUUID(), nativeSessionId: null, nativeTurnId: null, segmentId: randomUUID(), currentCommandId: body.requestKey, ownerEpoch: '1', launchState: queued ? 'QUEUED' : 'PREPARING', state: queued ? 'QUEUED' : 'PREPARING', quiescent: queued, createdAt: now(), deadlineMs: effectiveDeadlineMs, deadlineEpochMillis: String(Date.now() + effectiveDeadlineMs), turns: {}, inputRequests: {}, publicMessages: [], output: '', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, usageLedger: [], budget, writeScope, environment, mcpServers, declaredSkills: skills, declaredExtensions: extensions, bootId: this.bootId };
+    // Host-injected files_stage bridge: every workspace task gets the
+    // worker-local-files/1 lane without the caller wiring MCP itself. Stored on
+    // the task row so pauses/resumes keep the binding and it stays auditable;
+    // a caller-declared 'files' server wins (never shadowed).
+    const taskMcpServers = [...(mcpServers ?? [])];
+    if (mode === 'WORKSPACE_TASK' && !taskMcpServers.some((s: Row) => s.id === 'files')) {
+      const filesSpec = this.files.mcpServer(taskId, this.store.identity.storeId);
+      if (filesSpec) taskMcpServers.push(filesSpec);
+    }
+    const task: Row = { taskId, executionMode: mode, engineId: ENGINE_ID, engineVersion: PI_VERSION, projectId: body.projectId, baseCommit: checked.headRevision, profileId: this.profileId, executionProfile: this.executionProfile, workspace: join(this.store.directory, 'workspaces', taskId), sessionDir: join(this.store.directory, 'sessions', taskId), goal: body.instruction, modelBinding: model, configuredModel: model.name, configuredProvider: 'worker-model', generation: randomUUID(), nativeSessionId: null, nativeTurnId: null, segmentId: randomUUID(), currentCommandId: body.requestKey, ownerEpoch: '1', launchState: queued ? 'QUEUED' : 'PREPARING', state: queued ? 'QUEUED' : 'PREPARING', quiescent: queued, createdAt: now(), deadlineMs: effectiveDeadlineMs, deadlineEpochMillis: String(Date.now() + effectiveDeadlineMs), turns: {}, inputRequests: {}, publicMessages: [], output: '', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, usageLedger: [], budget, writeScope, environment, mcpServers: taskMcpServers, declaredSkills: skills, declaredExtensions: extensions, bootId: this.bootId };
     if (checked.policyPreset) {
       task.policyPreset = { presetId: checked.policyPreset.presetId, revision: checked.policyPreset.revision, effectiveRange: checked.policyPreset.effectiveRange, frozenAt: now() };
       if (Array.isArray(checked.policyPreset.frozenParameters?.toolAllowlist)) task.toolAllowlist = checked.policyPreset.frozenParameters.toolAllowlist;
@@ -2896,7 +2918,7 @@ export class PiHost {
     timer.unref();
     req.on('close', drop); res.on('close', drop);
   }
-  async listen(port = 0) { await new Promise<void>(done => this.server.listen(port, '127.0.0.1', done)); return (this.server.address() as any).port as number; }
+  async listen(port = 0) { await new Promise<void>(done => this.server.listen(port, '127.0.0.1', done)); const bound = (this.server.address() as any).port as number; this.boundPort = bound; this.files.port = bound; return bound; }
   async close() {
     if (this.closed) return;
     this.closed = true;
@@ -2935,7 +2957,14 @@ export class PiHost {
     const send = (status: number, body: any) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
     try {
       const wanted = Buffer.from('Bearer ' + this.config.token), auth = Buffer.from(req.headers.authorization ?? '');
-      if (auth.length !== wanted.length || !timingSafeEqual(auth, wanted)) { send(401, { code: 'LOCAL_AUTH_REQUIRED' }); return; }
+      let authed = auth.length === wanted.length && timingSafeEqual(auth, wanted);
+      // files_stage MCP children carry the loopback files.key, never the worker
+      // token — it opens exactly one route: POST /tasks/{t}/files.
+      if (!authed && req.method === 'POST' && /^\/local\/v1\/tasks\/[^/?]+\/files$/.test(req.url ?? '')) {
+        const filesKey = Buffer.from('Bearer ' + this.files.key());
+        authed = auth.length === filesKey.length && timingSafeEqual(auth, filesKey);
+      }
+      if (!authed) { send(401, { code: 'LOCAL_AUTH_REQUIRED' }); return; }
       if (!/^(127\.0\.0\.1|localhost):\d+$/.test(req.headers.host ?? '') || !['127.0.0.1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress ?? '')) throw new Error('LOOPBACK_REQUIRED');
       if (req.headers.origin) throw new Error('BROWSER_ORIGIN_DENIED');
       if (req.headers['x-worker-local-store'] && req.headers['x-worker-local-store'] !== this.store.identity.storeId) throw new Error('STORE_IDENTITY_CHANGED');
@@ -3010,6 +3039,9 @@ export class PiHost {
           case 'metrics': result = { cost: null, costCoverage: 'UNKNOWN', usageCoverage: 'NATIVE_TASK_TOTAL', configuredModel: task.configuredModel, ...Object.fromEntries(Object.entries(task.usage).map(([k, v]) => ['usage.' + k, String(v)])) }; break;
           case 'input-requests': result = { items: Object.values(task.inputRequests) }; break;
           case 'artifacts': result = artifacts(this.store, task); break;
+          // worker-local-files/1: staged-deliverables listing — the reconcile
+          // view the phone pulls alongside the FILE_CARD events feed.
+          case 'files': result = this.files.list(task.taskId); break;
           case 'terminals': { const items = new Map<string, Row>(); for (const s of Object.values(task.terminals ?? {}) as Row[]) items.set(s.terminalId, s); for (const t of [...this.terminals.values()].filter(t => t.taskId === task.taskId)) items.set(t.terminalId, this.terminalPublic(t)); result = { items: [...items.values()] }; break; }
           case 'context-packages': result = { items: Object.values(task.contextPackages ?? {}).map((p: any) => this.packageMeta(p)), coverage: 'FROZEN_AT_CREATION' }; break;
           case 'auxiliary-sessions': result = { items: Object.values(task.auxSessions ?? {}).map((a: any) => this.auxPublic(a)), coverage: 'ISOLATED_SNAPSHOT_READ_ONLY' }; break;
@@ -3020,6 +3052,7 @@ export class PiHost {
         }
         if (method === 'GET' && path.length === 4) {
           if (path[2] === 'artifacts') result = artifact(this.store, task, id(path[3]));
+          if (path[2] === 'files' && /^file-[a-f0-9]{64}$/.test(path[3])) result = this.files.get(task.taskId, path[3]);
           if (path[2] === 'context-packages') result = this.contextPackageDetail(task, path[3]);
           if (path[2] === 'auxiliary-sessions') { const aux = task.auxSessions?.[id(path[3])]; if (!aux) throw new Error('AUX_SESSION_NOT_FOUND'); result = this.auxPublic(aux); }
           if (path[2] === 'collaborations') { const collab = task.collaborations?.[id(path[3])]; if (!collab) throw new Error('COLLABORATION_NOT_FOUND'); result = this.collabPublic(collab); }
@@ -3032,12 +3065,19 @@ export class PiHost {
         if (method === 'GET' && path.length === 6 && path[2] === 'collaborations' && path[4] === 'previews') result = this.collaborationPreviewGet(task, path[3], path[5]);
         if (method === 'GET' && path.length === 7 && path[2] === 'collaborations' && path[4] === 'children' && path[6] === 'messages') result = this.collabChildMessages(task, path[3], path[5], url.searchParams);
         if (method === 'GET' && path.length === 7 && path[2] === 'handoff-export' && path[4] === 'chunks') result = this.handoffChunk(task, path[3], path[5], path[6]);
+        // Staged-file chunked pull — worker-local-file-chunk/1 slices,
+        // 262144-aligned with per-chunk digest (the shape the gateway verifies).
+        if (method === 'GET' && path.length === 7 && path[2] === 'files' && path[4] === 'chunks' && /^file-[a-f0-9]{64}$/.test(path[3])) result = this.files.chunk(task.taskId, path[3], path[5], path[6]);
         if (method === 'POST' && path.length === 3) {
           if (path[2] === 'messages') { exact(body, ['requestKey', 'kind', 'content', 'materials', 'model', 'effort', 'context', 'generation', 'nativeSessionId', 'nativeTurnId', 'targetCommandId']); result = this.interact(task.taskId, body); status = 202; }
           if (path[2] === 'commands') { const fields = ['requestKey', 'intent', 'generation', 'nativeSessionId', 'nativeTurnId', 'targetCommandId']; exact(body, body.intent === 'EXTEND_BUDGET' ? [...fields, 'budget'] : fields); result = { kind: 'WORKER_LOCAL', ...(await this.command(task.taskId, body)) }; status = 202; }
           if (path[2] === 'terminals') { result = this.createTerminal(task.taskId, body); status = 202; }
           if (path[2] === 'context-packages') { result = this.createContextPackage(task.taskId, body); status = 202; }
           if (path[2] === 'auxiliary-sessions') { result = this.createAuxSession(task.taskId, body); status = 202; }
+          // Explicit stage — files_stage MCP children (files.key bearer) and
+          // local tooling POST here; the path must live inside this task's
+          // workspace and the card posts onto this task's stream + events feed.
+          if (path[2] === 'files') { const row = this.files.meta(this.files.stage(task, body)); this.postFileCard(task.taskId, row); result = { ...row }; status = 202; }
           if (path[2] === 'collaborations') { result = this.createCollaboration(task.taskId, body); status = 202; }
           if (path[2] === 'transitions') { result = { kind: 'WORKER_LOCAL', ...(await this.transition(task.taskId, body)) }; status = 202; }
           if (path[2] === 'source-seals') { result = await this.sourceSeal(task.taskId, body); status = 202; }
