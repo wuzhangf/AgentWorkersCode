@@ -981,6 +981,11 @@ delete CHILD_ENV.WORKER_LOCAL_TOKEN;
 const spawnCwd = (t) => t.cwd && existsSync(t.cwd) ? t.cwd
   : existsSync(PROJECT_DIR) ? PROJECT_DIR : homedir();
 const dispatch = (t, instruction, requestKey, displayText) => {
+  // Capture changes during this execution. Keep the prior sealed files
+  // readable while a follow-up is running.
+  if (!t.cwd || t.cwd === PROJECT_DIR) {
+    t.baseline = [...inventory()].map(([p, v]) => ({ p, s: v.s, m: v.m }));
+  }
   const argv = engine.argv(instruction, t.nativeSessionId, t);
   const child = spawn(resolved.cmd, [...resolved.pre, ...argv], {
     cwd: spawnCwd(t),
@@ -1029,7 +1034,7 @@ const dispatch = (t, instruction, requestKey, displayText) => {
     live.delete(t.taskId);
     t.quiescent = true;
     t.updatedAt = now();
-    if (t.state === 'CANCELLED' || t.state === 'PAUSED') { save(); return; }
+    if (t.state === 'CANCELLED' || t.state === 'PAUSED') { sealTurnFiles(t); save(); return; }
     if (!t.output) {
       t.output = t.publicMessages.filter((m) => m.role === 'assistant').map((m) => m.text).join('\n');
     }
@@ -1048,6 +1053,7 @@ const dispatch = (t, instruction, requestKey, displayText) => {
       if (tail && !t.publicMessages.some((m) => m.role === 'assistant')) addMessage(t, 'assistant', tail, undefined, 'FAILED');
     }
     t.pendingVerdict = undefined;
+    sealTurnFiles(t);
     save();
   });
   save();
@@ -1177,6 +1183,7 @@ const facts = (t) => ({
   ...(t.adoption ? { adoption: { from: t.adoption.from, sessionId: t.adoption.sessionId,
       ...(t.adoption.cwd ? { cwd: t.adoption.cwd } : {}) } } : {}),
   sideQuestionCount: (t.sideQuestions ?? []).length,
+  sessionFiles: sessionFiles(t),
   capabilities: { stop: live.has(t.taskId), pause: live.has(t.taskId),
                   resume: t.state === 'PAUSED',
                   steer: live.has(t.taskId), followUp: t.quiescent === true || TERMINAL.has(t.state) },
@@ -1486,9 +1493,32 @@ const stagePathForTask = (t, body) => {
   return f;
 };
 
-const sealArtifacts = (t) => {
-  if (t.artifactManifest) return t.artifactManifest;
-  if (!t.quiescent) return { items: [], reasonCode: 'STOP_TO_SEAL_RESULTS' };
+const listedTaskFiles = (t) => Object.values(ledger.files)
+  .filter((f) => f.taskId === t.taskId && !fileExpired(f) && existsSync(f.staged));
+
+const sessionFiles = (t) => {
+  const artifacts = t.artifactManifest?.items ?? [];
+  const staged = listedTaskFiles(t);
+  if (!t.artifactManifest && staged.length === 0) return null;
+  return {
+    schemaVersion: 'worker-session-files/1',
+    complete: !!t.artifactManifest && !t.artifactManifest.bounded,
+    artifacts: artifacts.map(({ artifactId, status, sha256 }) => ({ artifactId, status, sha256 })),
+    staged: staged.map(({ id, sha256 }) => ({ id, sha256 })),
+  };
+};
+
+const sealTurnFiles = (t) => {
+  if (t.cwd && t.cwd !== PROJECT_DIR) return;
+  try { sealArtifacts(t, true); }
+  catch { /* file inventory failure must not change the execution verdict */ }
+};
+
+const sealArtifacts = (t, closedTurn = false) => {
+  if (!closedTurn && t.artifactManifest) return t.artifactManifest;
+  if (!t.quiescent || live.has(t.taskId) || (t.cwd && t.cwd !== PROJECT_DIR)) {
+    return { items: [], reasonCode: 'STOP_TO_SEAL_RESULTS' };
+  }
   const root = realpathSync(PROJECT_DIR);
   const current = inventory();
   const before = new Map((t.baseline ?? []).map((r) => [r.p, r]));
@@ -1531,7 +1561,11 @@ const sealArtifacts = (t) => {
       writeFileSync(join(ART_DIR, t.taskId, row.artifactId), bytes);
     } catch { row.status = 'WITHHELD_UNREADABLE'; }
   }
-  const manifest = { items, bounded: names.size > items.length, coverage: 'CHANGED_OWNED_FILES', segmentId: t.segmentId };
+  const previous = (t.artifactManifest?.items ?? []).filter((row) => !names.has(row.path));
+  const combined = items.concat(previous).filter((row) => row.status !== 'DELETED');
+  const manifest = { items: combined.slice(0, 100),
+    bounded: names.size > items.length || combined.length > 100,
+    coverage: 'CHANGED_OWNED_FILES', segmentId: t.segmentId };
   t.artifactManifest = manifest; save(); return manifest;
 };
 
