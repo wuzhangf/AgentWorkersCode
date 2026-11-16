@@ -36,39 +36,47 @@ test('vendor history supports independent Agent pages, old Devin lookup and read
   const preload = join(fixture, 'fixture-home.mjs');
   await writeFile(preload, `import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module';
     os.homedir = () => ${JSON.stringify(fixture)}; syncBuiltinESMExports();`);
-  const listener = createServer().listen(0, '127.0.0.1');
-  await once(listener, 'listening');
-  const port = listener.address().port;
-  await new Promise(resolve => listener.close(resolve));
-  const token = randomBytes(24).toString('hex');
-  const child = spawn(process.execPath, [
-    '--import', preload, new URL('../cli-bridge/host.mjs', import.meta.url).pathname,
-    'serve', '--engine', 'claude', '--state', join(fixture, 'workers', 'claude'),
-    '--project', fixture, '--port', String(port), '--executable', process.execPath,
-  ], { env: { ...process.env, WORKER_LOCAL_TOKEN: token }, stdio: ['ignore', 'pipe', 'pipe'] });
-  const stopped = once(child, 'exit');
-  t.after(async () => { child.kill(); await stopped; });
-  const ready = await Promise.race([once(child.stdout, 'data'), stopped]);
-  assert.match(String(ready[0]), /127\.0\.0\.1/);
-  const base = 'http://127.0.0.1:' + port + '/local/v1';
-  const request = (path, body) => fetch(base + path, {
-    method: body ? 'POST' : 'GET',
-    headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
-    ...(body ? { body: JSON.stringify(body) } : {}),
-  });
-  const read = async path => {
-    const response = await request(path);
-    assert.equal(response.status, 200, path);
-    return response.json();
+  const startBridge = async (engine, executable) => {
+    const listener = createServer().listen(0, '127.0.0.1');
+    await once(listener, 'listening');
+    const port = listener.address().port;
+    await new Promise(resolve => listener.close(resolve));
+    const token = randomBytes(24).toString('hex');
+    const child = spawn(process.execPath, [
+      '--import', preload, new URL('../cli-bridge/host.mjs', import.meta.url).pathname,
+      'serve', '--engine', engine, '--state', join(fixture, 'workers', engine),
+      '--project', fixture, '--port', String(port),
+      ...(executable ? ['--executable', executable] : []),
+    ], { env: { ...process.env, WORKER_LOCAL_TOKEN: token }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const stopped = once(child, 'exit');
+    t.after(async () => { child.kill(); await stopped; });
+    const ready = await Promise.race([once(child.stdout, 'data'), stopped]);
+    assert.match(String(ready[0]), /127\.0\.0\.1/);
+    const base = 'http://127.0.0.1:' + port + '/local/v1';
+    const request = (path, body) => fetch(base + path, {
+      method: body ? 'POST' : 'GET',
+      headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const read = async path => {
+      const response = await request(path);
+      assert.equal(response.status, 200, path);
+      return response.json();
+    };
+    return { read, request };
   };
-  const first = await read('/history?limit=20');
-  assert.equal(first.schemaVersion, 'worker-local-history/2');
-  assert.equal(first.items.length, 40);
-  for (const [engine, count] of [['devin', 220], ['claude', 215]]) {
-    let cursor = first.pages.find(page => page.engine === engine).cursor;
-    const ids = first.items.filter(item => item.engine === engine).map(item => item.id);
+  const claude = await startBridge('claude', process.execPath);
+  const devin = await startBridge('devin');
+  for (const [engine, count, bridge] of [['devin', 220, devin], ['claude', 215, claude]]) {
+    const first = await bridge.read('/history?limit=20');
+    assert.equal(first.schemaVersion, 'worker-local-history/2');
+    assert.deepEqual(first.pages.map(page => page.engine), [engine]);
+    assert.equal(first.items.length, 20);
+    assert.ok(first.items.every(item => item.engine === engine));
+    let cursor = first.pages[0].cursor;
+    const ids = first.items.map(item => item.id);
     while (cursor) {
-      const page = await read('/history?limit=20&engine=' + engine + '&cursor=' + cursor);
+      const page = await bridge.read('/history?limit=20&engine=' + engine + '&cursor=' + cursor);
       ids.push(...page.items.map(item => item.id));
       cursor = page.pages[0].cursor;
     }
@@ -76,26 +84,29 @@ test('vendor history supports independent Agent pages, old Devin lookup and read
     assert.equal(new Set(ids).size, count);
     if (engine === 'devin') assert.ok(ids.includes('devin-12'));
   }
-  const search = await read('/history?limit=20&q=' + encodeURIComponent('独立恢复'));
+  assert.deepEqual((await devin.read('/engines')).items, []);
+  const search = await devin.read('/history?limit=20&q=' + encodeURIComponent('独立恢复'));
   assert.deepEqual(search.items.map(item => item.id), ['devin-12']);
   assert.match(search.items[0].at, /^2026-/);
 
-  const latest = await read('/history/sessions/devin-12?engine=devin&limit=10');
+  const latestPath = '/history/sessions/devin-12?engine=devin&limit=10';
+  const latest = await devin.read(latestPath);
   assert.equal(latest.items[0].id, '7');
   assert.equal(latest.items.at(-1).text, 'message 15');
-  const earlier = await read('/history/sessions/devin-12?engine=devin&before=' + latest.before);
+  assert.deepEqual((await claude.read(latestPath)).items, latest.items);
+  const earlier = await devin.read('/history/sessions/devin-12?engine=devin&before=' + latest.before);
   assert.equal(earlier.items.length, 6);
-  assert.equal((await request('/history/sessions/devin-hidden?engine=devin')).status, 404);
+  assert.equal((await devin.request('/history/sessions/devin-hidden?engine=devin')).status, 404);
 
-  const preflight = await request('/task-preflights', { projectId: 'workspace', engineId: 'claude' });
+  const preflight = await claude.request('/task-preflights', { projectId: 'workspace', engineId: 'claude' });
   assert.equal(preflight.status, 200);
   const options = await preflight.json();
-  const launch = await request('/tasks', {
+  const launch = await claude.request('/tasks', {
     requestKey: 'test-adopt-1', projectId: 'workspace', engineId: 'claude', optionsRevision: options.optionsRevision,
     instruction: '独立恢复记录', adoptSessionId: 'devin-12', adoptEngine: 'devin', model: 'opus',
   });
   assert.equal(launch.status, 200);
-  const task = await read('/tasks/' + (await launch.json()).taskId);
+  const task = await claude.read('/tasks/' + (await launch.json()).taskId);
   assert.equal(task.adoption.from, 'devin');
   assert.equal(task.configuredModel, 'opus');
   assert.equal(task.quiescent, true);
