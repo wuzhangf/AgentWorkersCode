@@ -22,7 +22,7 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdir
 import { join, resolve, relative, sep, dirname, basename } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { zstdDecompressSync } from 'node:zlib';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -137,6 +137,8 @@ const fail = (code, status) => { const e = new Error(code); e.code = code; e.sta
 const wellKnownCliPaths = (name) => {
   if (process.platform !== 'win32') return [];
   const out = [];
+  // Adapter-declared discovery: each adapter owns its install-dir knowledge.
+  try { out.push(...(ADAPTER_BINS.get(name)?.() ?? [])); } catch {}
   if (name === 'codex' && process.env.LOCALAPPDATA) {
     const root = join(process.env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin');
     try {
@@ -149,19 +151,6 @@ const wellKnownCliPaths = (name) => {
   if (name === 'claude' && process.env.USERPROFILE) {
     const p = join(process.env.USERPROFILE, '.local', 'bin', 'claude.exe');
     if (existsSync(p)) out.push(p);
-  }
-  if (name === 'opencode' && process.env.LOCALAPPDATA) {
-    // No standalone CLI install — the OpenCode desktop app ships
-    // resources\opencode-cli.exe under %LOCALAPPDATA%\Programs\@opencode-*,
-    // including side-by-side .update-<hash> folders from the updater.
-    const root = join(process.env.LOCALAPPDATA, 'Programs');
-    try {
-      for (const e of readdirSync(root, { withFileTypes: true }).sort((a, b) => b.name.localeCompare(a.name))) {
-        if (!e.isDirectory() || !e.name.startsWith('@opencode')) continue;
-        const p = join(root, e.name, 'resources', 'opencode-cli.exe');
-        if (existsSync(p)) out.push(p);
-      }
-    } catch {}
   }
   return out;
 };
@@ -424,40 +413,7 @@ const ENGINES = {
       return null;
     },
   },
-  opencode: {
-    argv: (instruction, sessionId, task) => [
-      'run', instruction, '--format', 'json',
-      // --standalone: a private per-run server — never hand the desktop app's
-      // background service our headless sessions.
-      '--standalone',
-      // Headless runs share the same opencode.db the desktop app and our
-      // store reader list — archive keeps them out of "native session" rows
-      // (adoption/standalone title still makes them identifiable).
-      '--archived',
-      ...(task?.taskId ? ['--title', `agent-link ${task.taskId}`] : []),
-      // Always --auto: headless has no channel to answer permission prompts
-      // (gemini's yolo reasoning). Routing opencode's permission asks to the
-      // phone is adapter-level future work; SKIP=off cannot sandbox here.
-      '--auto',
-      ...(task?.model ?? MODEL ? ['--model', task?.model ?? MODEL] : []),
-      ...(sessionId ? ['--session', sessionId] : []),
-    ],
-    bin: 'opencode',
-    /** opencode run --format json: every event carries sessionID; `text` parts
-     * arrive complete per block; step_finish ends the turn; `error` fails it. */
-    onEvent: (row, task, addMessage) => {
-      if (typeof row.sessionID === 'string') task.nativeSessionId = row.sessionID;
-      if (row.type === 'text' && typeof row.part?.text === 'string' && row.part.text.trim()) {
-        addMessage('assistant', row.part.text);
-      }
-      if (row.type === 'error') {
-        task.output = String(row.error?.data?.message ?? row.error?.message ?? 'opencode 运行失败');
-        return 'FAILED';
-      }
-      if (row.type === 'step_finish') return 'SUCCEEDED';
-      return null;
-    },
-  },
+  // opencode lives in adapters/opencode — loaded like any community adapter.
 };
 
 // ---- task material uploads (material-upload/1) -------------------------------
@@ -548,32 +504,6 @@ const SESSION_ROOTS = {
   gemini: () => join(homedir(), '.gemini', 'tmp'),
 };
 
-/** Devin CLI/desktop keeps sessions in a SQLite store, not loose files —
- * listed and transcript-harvested through these two helpers instead of
- * historyFiles/sessionCwd. Read-only open; absent store reports empty.
- * Store location differs by platform: win32 keeps it under Roaming
- * `%APPDATA%\Devin\cli`, macOS under Application Support, Linux/other XDG
- * under ~/.local/share — first existing file wins. */
-const DEVIN_DBS = process.platform === 'win32'
-  ? [join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'Devin', 'cli', 'sessions.db'),
-     join(homedir(), '.local', 'share', 'devin', 'cli', 'sessions.db')]
-  : [join(homedir(), '.local', 'share', 'devin', 'cli', 'sessions.db'),
-     join(homedir(), 'Library', 'Application Support', 'Devin', 'cli', 'sessions.db')];
-const devinDb = () => {
-  for (const file of DEVIN_DBS) {
-    if (!existsSync(file)) continue;
-    try { return new DatabaseSync(file, { readOnly: true }); } catch { continue; }
-  }
-  return null;
-};
-/** sessions.last_activity_at / created_at are seconds-since-epoch; accept
- * ms/µs/ns too so a unit change never degrades rows to January 1970. */
-const devinAt = (v) => {
-  const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  const ms = n < 1e11 ? n * 1e3 : n < 1e14 ? n : n < 1e17 ? n / 1e3 : n / 1e6;
-  return new Date(ms).toISOString();
-};
 const sessionID = (file) => (basename(file).match(
   /([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/i
 ) ?? [])[1] ?? basename(file);
@@ -584,158 +514,83 @@ const vendorFile = (engine, id) => {
     sessionID(file) === id && lstatSync(file, { throwIfNoEntry: false })?.isFile()
   ) : undefined;
 };
-const devinDate = (value) => {
-  const n = Number(value);
-  const date = value == null || value === '' ? new Date(NaN)
-    : new Date(Number.isFinite(n) ? (Math.abs(n) < 1e11 ? n * 1000 : n) : value);
-  return Number.isFinite(+date) ? date.toISOString() : '';
-};
-const devinSessions = ({ id, limit, before } = {}) => {
-  const db = devinDb();
-  if (!db) return [];
-  try {
-    const args = [];
-    let sql = 'SELECT id, title, working_directory, last_activity_at FROM sessions WHERE hidden = 0';
-    if (id !== undefined) { sql += ' AND id = ?'; args.push(id); }
-    if (before) {
-      sql += ' AND (COALESCE(last_activity_at, 0) < ? OR (COALESCE(last_activity_at, 0) = ? AND id > ?))';
-      args.push(before.at, before.at, before.id);
-    }
-    sql += ' ORDER BY COALESCE(last_activity_at, 0) DESC, id';
-    if (limit !== undefined) { sql += ' LIMIT ?'; args.push(limit); }
-    return db.prepare(sql).all(...args).map(r => ({
-      id: String(r.id), title: String(r.title ?? ''), cwd: String(r.working_directory ?? ''),
-      at: devinDate(r.last_activity_at), rawAt: r.last_activity_at ?? 0,
-    }));
-  } catch { return []; }
-  finally { try { db.close(); } catch {} }
-};
-const devinTranscript = (id) => {
-  const db = devinDb();
-  if (!db) return null;
-  try {
-    return db.prepare(
-      `SELECT chat_message FROM message_nodes WHERE session_id = ? ORDER BY created_at`).all(id)
-      .map((r) => { try { const m = JSON.parse(r.chat_message);
-        return { role: m.role, text: String(m.content ?? '') }; }
-      catch { return null; } })
-      .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.text.trim());
-  } catch { return null; }
-  finally { try { db.close(); } catch {} }
-};
-
-/** OpenCode keeps sessions in one XDG-data SQLite store on every platform —
- * ~/.local/share/opencode/opencode.db (the desktop app shares it). Read-only
- * open; absent store reports empty. */
-const OPENCODE_DBS = [join(homedir(), '.local', 'share', 'opencode', 'opencode.db')];
-const opencodeDb = () => {
-  for (const file of OPENCODE_DBS) {
-    if (!existsSync(file)) continue;
-    try { return new DatabaseSync(file, { readOnly: true }); } catch { continue; }
-  }
-  return null;
-};
-/** The store has two generations side by side: pre-v2 rows in
- * session/message/part and the current schema session_v2/session_message
- * (session_part exists but stays empty; content lives inline in
- * session_message.data). Reads union both, deduped by id — the exact "old
- * and new data structures coexist" case adapters are expected to own. */
-const opencodeTableExists = (db, name) =>
-  db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name) !== undefined;
-const opencodeSessions = ({ id, limit, before } = {}) => {
-  const db = opencodeDb();
-  if (!db) return [];
-  try {
-    // parent_id rows are sub-agent side sessions; time_archived rows are our
-    // own --archived headless runs — neither is a "native session" to offer.
-    const rows = new Map();
-    for (const table of ['session_v2', 'session']) {
-      if (!opencodeTableExists(db, table)) continue;
-      const args = [];
-      let sql = `SELECT id, title, directory AS cwd, time_updated FROM ${table}
-                 WHERE parent_id IS NULL AND time_archived IS NULL`;
-      if (id !== undefined) { sql += ' AND id = ?'; args.push(id); }
-      for (const r of db.prepare(sql).all(...args)) {
-        if (!rows.has(r.id)) rows.set(r.id, r);
-      }
-    }
-    let out = [...rows.values()];
-    if (before) out = out.filter(r =>
-      (r.time_updated ?? 0) < before.at || ((r.time_updated ?? 0) === before.at && r.id > before.id));
-    out.sort((a, b) => (b.time_updated ?? 0) - (a.time_updated ?? 0)
-      || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-    if (limit !== undefined) out = out.slice(0, limit);
-    return out.map(r => ({
-      id: String(r.id), title: String(r.title ?? ''), cwd: String(r.cwd ?? ''),
-      at: devinDate(r.time_updated), rawAt: r.time_updated ?? 0,
-    }));
-  } catch { return []; }
-  finally { try { db.close(); } catch {} }
-};
-const opencodeTranscript = (id) => {
-  const db = opencodeDb();
-  if (!db) return null;
-  try {
-    const items = [];
-    // v1: message.data carries role; part.data carries typed blocks — text
-    // parts only. part.session_id denormalizes the join key.
-    if (opencodeTableExists(db, 'message') && opencodeTableExists(db, 'part')) {
-      for (const r of db.prepare(
-        `SELECT p.time_created AS t,
-                json_extract(m.data, '$.role') AS role,
-                json_extract(p.data, '$.text') AS text
-         FROM part p JOIN message m ON m.id = p.message_id
-         WHERE p.session_id = ? AND json_extract(p.data, '$.type') = 'text'
-         ORDER BY p.time_created, p.id`).all(id)) {
-        if ((r.role === 'user' || r.role === 'assistant')
-            && typeof r.text === 'string' && r.text.trim())
-          items.push({ t: r.t ?? 0, role: r.role, text: r.text });
-      }
-    }
-    // v2: session_message.type carries the role; user data holds .text,
-    // assistant data holds a content[] array whose 'text' items carry prose
-    // ('reasoning' and 'tool' items are skipped, matching the v1 filter).
-    if (opencodeTableExists(db, 'session_message')) {
-      for (const r of db.prepare(
-        `SELECT time_created AS t, type, data
-         FROM session_message WHERE session_id = ?
-         ORDER BY COALESCE(seq, time_created), id`).all(id)) {
-        let d;
-        try { d = JSON.parse(r.data); } catch { continue; }
-        if (r.type === 'user' && typeof d.text === 'string' && d.text.trim()) {
-          items.push({ t: r.t ?? 0, role: 'user', text: d.text });
-        } else if (r.type === 'assistant') {
-          for (const c of d.content ?? []) {
-            if (c.type === 'text' && typeof c.text === 'string' && c.text.trim())
-              items.push({ t: r.t ?? 0, role: 'assistant', text: c.text });
-          }
-        }
-      }
-    }
-    items.sort((a, b) => a.t - b.t);
-    return items.map(({ role, text }) => ({ role, text }));
-  } catch { return null; }
-  finally { try { db.close(); } catch {} }
-};
-
 /** SQLite-backed session stores — one row per vendor. sessions() pages and
  * searches like the file-based historyFiles path; transcript() returns
  * {role,text}[]; row() fetches one session's listing record for adopt/ask.
  * A store engine with no ENGINES entry is a read-only bridge (devin); a store
  * keyed under a spawn engine name reports that engine's own sessions
  * (opencode). */
-const STORES = {
-  devin: {
-    sessions: devinSessions,
-    transcript: devinTranscript,
-    row: (id) => devinSessions({ id, limit: 1 })[0],
-  },
-  opencode: {
-    sessions: opencodeSessions,
-    transcript: opencodeTranscript,
-    row: (id) => opencodeSessions({ id, limit: 1 })[0],
-  },
+const STORES = {};
+
+// ---- worker-adapter/1 loader ------------------------------------------------
+// Adapters are self-contained ES modules — bundled ones ship under
+// <bridge-dir>/adapters/<id>/adapter.mjs, user-installed ones under
+// <workers-root>/adapters/<id>/adapter.mjs (trust = whoever can write the
+// state dir). Each default-exports:
+//   manifest: { id, kind:'spawn'|'store'|'both', displayName?,
+//               detect?: { process?: { exe, posix?, excludeArgv? },
+//                          binCandidates?: () => string[], configDirs? } }
+//   spawn?:  { bin, argv(instruction, sessionId, task, ctx), onEvent(row, task, add) }
+//   store?:  { sessions({id?,limit?,before?}), transcript(id), row(id) }
+// The host owns no vendor knowledge — an engine exists here only because an
+// adapter module said so. shape checks only; adapter failures never take the
+// bridge down (they surface as "engine absent").
+const ADAPTER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const adapterRoots = () => {
+  const roots = [join(dirname(fileURLToPath(import.meta.url)), 'adapters')];
+  if (STATE_DIR) roots.push(join(STATE_DIR, '..', 'adapters'));
+  return roots;
 };
+const adapterProblems = [];
+const loadAdapters = async () => {
+  for (const root of adapterRoots()) {
+    let entries;
+    try { entries = readdirSync(root, { withFileTypes: true }); } catch { continue; }
+    for (const d of entries) {
+      if (!d.isDirectory() || !ADAPTER_ID.test(d.name)) continue;
+      const file = join(root, d.name, 'adapter.mjs');
+      if (!existsSync(file)) continue;
+      let ad;
+      try { ad = (await import(pathToFileURL(file).href)).default; } catch (e) {
+        adapterProblems.push(`${d.name}: ${e?.message ?? e}`); continue;
+      }
+      const id = ad?.manifest?.id ?? d.name;
+      if (!ADAPTER_ID.test(id)) { adapterProblems.push(`${d.name}: bad manifest id`); continue; }
+      if (ad?.store && typeof ad.store.sessions === 'function'
+          && typeof ad.store.transcript === 'function' && typeof ad.store.row === 'function') {
+        STORES[id] = ad.store;
+      }
+      if (ad?.spawn && typeof ad.spawn.argv === 'function' && typeof ad.spawn.onEvent === 'function'
+          && typeof ad.spawn.bin === 'string' && ad.spawn.bin) {
+        ENGINES[id] = ad.spawn;
+      }
+      const det = ad?.manifest?.detect?.process;
+      if (det?.exe) {
+        try {
+          LIVE_PROCS.push({ engine: id,
+            exe: new RegExp(`^(${det.exe})([-\\w]*)?\\.(exe|cmd|bat|com)?$`, 'i'),
+            posix: det.posix ? new RegExp(det.posix)
+              : new RegExp(`(?:^|[/\\s])(${det.exe})(?:\\s|$)`),
+            exclude: det.excludeArgv ? new RegExp(det.excludeArgv) : null });
+        } catch (e) { adapterProblems.push(`${d.name}: bad detect regex — ${e?.message ?? e}`); }
+      }
+      if (typeof ad?.manifest?.detect?.binCandidates === 'function')
+        ADAPTER_BINS.set(ad?.spawn?.bin ?? id, ad.manifest.detect.binCandidates);
+    }
+  }
+};
+/** Engine ids → adapter-provided extra bin candidates (wellKnownCliPaths). */
+const ADAPTER_BINS = new Map();
+/** Live-badge process matchers — built-ins for the compiled engines, adapters
+ * append their manifest.detect.process entries at load. */
+const LIVE_PROCS = [
+  { engine: 'claude', exe: /^claude([-\w]*)?\.(exe|cmd|bat|com)?$/i,
+    posix: /(?:^|[/\s])claude(?:\s|$)/, exclude: /\s(-p\b|exec\b|login\b|e\b)/ },
+  { engine: 'codex', exe: /^codex([-\w]*)?\.(exe|cmd|bat|com)?$/i,
+    posix: /(?:^|[/\s])codex(?:\s|$)/, exclude: /\s(exec|login|e)\s/ },
+  { engine: 'gemini', exe: /^gemini([-\w]*)?\.(exe|cmd|bat|com)?$/i,
+    posix: /(?:^|[/\s])gemini(?:\s|$)/, exclude: /\s-p(\s|$)/ },
+];
 
 /** Working directory a session file belongs to. Claude transcripts stamp cwd
  * on user/attachment rows; codex rollouts put it in session_meta. Filenames
@@ -771,11 +626,11 @@ const winLiveCliProcesses = () => {
   const out = [];
   for (const p of Array.isArray(rows) ? rows : [rows]) {
     const name = String(p?.Name ?? ''), args = String(p?.CommandLine ?? '');
-    if (!/^(claude|codex|gemini)([-\w]*)?\.(exe|cmd|bat|com)?$/i.test(name)) continue;
-    if (/\s(-p\b|exec\b|login\b|e\b)/.test(args)) continue;
+    const proc = LIVE_PROCS.find(e => e.exe.test(name));
+    if (!proc) continue;
+    if (proc.exclude?.test(args)) continue;
     const m = /(?:^|\s)(?:-C|--cd|--cwd|--directory)[=\s]+"?([^"\s]+)"?/.exec(args);
-    out.push({ pid: Number(p.ProcessId), engine: name.split('.')[0].replace(/-.*$/, '').toLowerCase(),
-      cwd: m?.[1] ?? '' });
+    out.push({ pid: Number(p.ProcessId), engine: proc.engine, cwd: m?.[1] ?? '' });
   }
   return out;
 };
@@ -789,11 +644,9 @@ const liveCliProcesses = () => {
     const m = line.trim().match(/^(\d+)\s+(.+)$/);
     if (!m) continue;
     const args = m[2];
-    const engine = /(?:^|[/\s])claude(?:\s|$)/.test(args) && !/\s-p(\s|$)/.test(args) ? 'claude'
-      : /(?:^|[/\s])codex(?:\s|$)/.test(args) && !/\s(exec|login|e)\s/.test(args) ? 'codex'
-      : /(?:^|[/\s])gemini(?:\s|$)/.test(args) && !/\s-p(\s|$)/.test(args) ? 'gemini'
-      : null;
-    if (!engine) continue;
+    const proc = LIVE_PROCS.find(e => e.posix.test(args) && !(e.exclude?.test(args)));
+    if (!proc) continue;
+    const engine = proc.engine;
     let cwd = '';
     try {
       const lsof = execFileSync('lsof', ['-a', '-p', m[1], '-d', 'cwd', '-Fn'], { encoding: 'utf8' });
@@ -804,11 +657,15 @@ const liveCliProcesses = () => {
   return out;
 };
 
+// Adapters register into ENGINES/STORES/LIVE_PROCS before any command path
+// consults them — a directory scan with no side effects beyond registration.
+await loadAdapters();
+
 if (cmd === 'history') {
   const root = opt.root ?? '';
   const engineName = opt.engine ?? '';
-  if (!['codex', 'claude'].includes(engineName) || !root) {
-    console.log(JSON.stringify({ ok: false, error: 'history requires --engine codex|claude --root <dir>' }));
+  if (!SESSION_ROOTS[engineName] || !root) {
+    console.log(JSON.stringify({ ok: false, error: 'history requires a file-history engine and --root <dir>' }));
     process.exit(2);
   }
   try {
@@ -869,6 +726,9 @@ const resolvePath = (p) => {
   return { cmd: p, pre: [] };
 };
 const resolved = EXECUTABLE ? resolvePath(EXECUTABLE) : engine ? resolveBin(engine.bin) : null;
+// Context adapters may consult (model default, dirs, skip posture) without
+// reaching into host internals — argv's optional 4th parameter.
+const SPAWN_CTX = { model: MODEL, stateDir: STATE_DIR, projectDir: PROJECT_DIR, skip: SKIP };
 let engineVersion = 'read-only';
 if (resolved) {
   try {
@@ -986,7 +846,7 @@ const dispatch = (t, instruction, requestKey, displayText) => {
   if (!t.cwd || t.cwd === PROJECT_DIR) {
     t.baseline = [...inventory()].map(([p, v]) => ({ p, s: v.s, m: v.m }));
   }
-  const argv = engine.argv(instruction, t.nativeSessionId, t);
+  const argv = engine.argv(instruction, t.nativeSessionId, t, SPAWN_CTX);
   const child = spawn(resolved.cmd, [...resolved.pre, ...argv], {
     cwd: spawnCwd(t),
     env: CHILD_ENV,
@@ -1114,7 +974,7 @@ const runSideQuestion = (t, q) => {
   const stub = q.engine === ENGINE
     ? (q.model || q.effort ? { ...t, ...(q.model ? { model: q.model } : {}), ...(q.effort ? { effort: q.effort } : {}) } : t)
     : { model: q.model ?? '', effort: q.effort };
-  const argv = eng.argv(instruction, null, stub);
+  const argv = eng.argv(instruction, null, stub, SPAWN_CTX);
   // Stream-capable engines call growLive/sealLive on the probe — give it a
   // throwaway message list so delta handling works without a real task row.
   const probe = { publicMessages: [] };
@@ -1628,6 +1488,7 @@ const identity = () => ({
   bootId: BOOT_ID, currentAvailability: 'AVAILABLE',
   engine: { id: ENGINE, version: engineVersion },
   skipPermissions: ENGINE === 'codex' ? SKIP === 'on' : SKIP !== 'off',
+  ...(adapterProblems.length ? { adapterProblems } : {}),
   contracts: ['worker-host/1', 'worker-local/1'],
   supportedPaths: ['/local/v1', '/worker-host/v1/manifest'],
   capabilities: { items: [] },
@@ -2436,6 +2297,7 @@ http.createServer((req, res) => {
     const result = routes(req.method, seg, null, body, url.searchParams);
     send(200, result);
   })().catch((e) => {
+    if (!e.status) console.error('route error:', e);
     send(e.status ?? 500, { code: e.code ?? 'LOCAL_SOURCE_UNAVAILABLE' });
   });
 }).listen(PORT, '127.0.0.1', () => {

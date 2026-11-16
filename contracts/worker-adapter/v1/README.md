@@ -9,7 +9,8 @@ vendor 知识全部封在适配器内；第三方交付物 = 一个适配器目�
 | 部分 | 状态 |
 |---|---|
 | 桥 API 面（§5）、`store` 只读语义、`ENGINE_READ_ONLY`、devin 参考实现 | **已落地**（`cli-bridge/host.mjs`） |
-| manifest 字段（§3）、发现流程（§4）、版本协商（§6） | **草案**——字段已冻结讨论稿，装载器未实现；当前 `ENGINES` 仍是编译期表 |
+| 目录装载器、adapter.mjs 交付形态、`detect.process`/`binCandidates`（§2–§4） | **已落地**——devin/opencode 是前两个目录装载适配器（`cli-bridge/adapters/`） |
+| `adapter.json` manifest 形式、`versions[]` 版本协商（§6）、`UNSUPPORTED_VERSION` | **草案**——当前 manifest 是 adapter.mjs 内联对象，版本协商未实现 |
 
 标注「草案」的部分是适配器作者应遵循的目标形态；落地前任何字段改名都会
 走本文件版本号（worker-adapter/2），不静默漂移。
@@ -28,19 +29,60 @@ vendor 知识全部封在适配器内；第三方交付物 = 一个适配器目�
 （不上任务目标选择器）；对任务提交回 `ENGINE_READ_ONLY`（409）。
 旁支提问/接管导入由**调用方选择的某个 spawn 引擎**执行——`store` 自己不答题。
 
-## 2. 适配器交付形态（草案）
+## 2. 适配器交付形态（已落地）
 
 ```
 adapters/<id>/
-  adapter.json        # manifest，§3
-  <impl>.mjs          # 实现，导出 manifest 声明的 ops
-  README.md           # vendor 数据结构说明、版本覆盖范围
+  adapter.mjs         # 单文件 ESM，default-exports { manifest, spawn?, store? }
+  README.md           # vendor 数据结构说明、版本覆盖范围（可选）
 ```
 
-放置位置：内置 `components/adapters/`；社区/第三方 `<state>\adapters\`。
-目录扫描装载，宿主重启即生效；新增/升级适配器**不改宿主**。
+放置位置（装载器扫描两处，先到先得）：
 
-## 3. manifest（草案）
+- 内置：`<bridge-dir>/adapters/<id>/`——安装包内为
+  `components/cli-bridge/adapters/<id>/`，随桥分发
+- 用户/第三方：`<workers-root>/adapters/<id>/`——即托管桥 `--state` 目录的
+  同级 `adapters/`（托管安装下为 `<state-root>\agents\adapters\`）
+
+目录扫描装载，桥进程启动即生效；新增/升级适配器**不改宿主**。
+适配器加载失败只记入 `identity.adapterProblems`，不拖垮桥。
+
+```js
+// adapter.mjs 实际形态（当前实现，JS 模块内联 manifest）
+export default {
+  manifest: {
+    id: 'devin',                  // ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$，全局唯一
+    kind: 'store',                // spawn | store | both
+    displayName: 'Devin',
+    detect: {                     // 全部可选；spawn 类通常要 bin/process
+      process: {                  // live 徽标进程匹配
+        exe: 'opencode|opencode-cli',   // Win exe 名正则（不含扩展名）
+        posix: '...',                   // POSIX argv 正则（可选，默认由 exe 推导）
+        excludeArgv: '\\s(run|serve)\\b' // 我方无头子命令排除项（可选）
+      },
+      binCandidates: () => [...],  // ()=>绝对路径数组，resolveBin 附加候选
+      configDirs: [...],           // 宣告用；宿主不消费（§4 草案扩展位）
+    },
+  },
+  // spawn 类：即 ENGINES 条目形状
+  spawn: {
+    bin: 'opencode',                             // resolveBin 的逻辑名
+    argv: (instruction, sessionId, task, ctx) => [...],  // ctx={model,stateDir,projectDir,skip}
+    onEvent: (row, task, addMessage) => 'SUCCEEDED'|'FAILED'|null,
+  },
+  // store 类：即 STORES 条目形状
+  store: {
+    sessions: ({ id, limit, before } = {}) => [{ id, title, cwd, at, rawAt }],
+    transcript: (id) => [{ role: 'user'|'assistant', text }] | null,
+    row: (id) => <sessions 单行> | undefined,
+  },
+};
+```
+
+## 3. manifest（部分草案）
+
+当前 manifest 为 adapter.mjs 内联对象（见 §2）——`adapter.json` 分离形式
+与 `versions[]`/`capabilities` 声明面仍是草案，见 §6。
 
 ```jsonc
 {
@@ -48,12 +90,6 @@ adapters/<id>/
   "id": "devin",                  // [a-z0-9][a-z0-9-]{1,31}，全局唯一
   "kind": "store",                // spawn | store
   "display": { "name": "Devin", "iconHint": "sparkle" },
-  "detect": {                     // 发现 hint，见 §4；store 类可省略 processes/bin
-    "processes": ["Devin.exe"],
-    "installDirs": ["%LOCALAPPDATA%/Programs/Devin"],
-    "configDirs": ["%APPDATA%/Devin/cli", "~/.local/share/devin/cli"],
-    "bin": "devin"                // spawn 类必填：PATH 可执行名
-  },
   "versions": [                   // 数据结构版本，新→旧排列，见 §6
     { "id": "devin-db/1", "match": "sessions.db:schema>=1" }
   ],
@@ -64,17 +100,21 @@ adapters/<id>/
 }
 ```
 
-## 4. 发现流程（草案）
+## 4. 发现流程（部分已落地）
 
 宿主收集器按以下顺序、且只做以下事——**禁止全盘遍历**：
 
-1. **进程扫描**：遍历进程表匹配 `detect.processes` → 发现「运行中但未托管」的
-   agent（可在托盘提示接管）。
-2. **声明路径 stat**：逐个检查 `installDirs`/`configDirs`（含环境变量与 `~`
-   展开），存在即取为候选 `installRoot`/`configRoot`。
-3. **用户覆盖**：`<state>\agents.json` 条目可带 `paths: {configRoot, executable}`
-   ——个性化/非默认安装位置的唯一正解，优先级高于扫描结果。
-4. **结果**：`{installed, installRoot?, configRoot?, executable?, running}`。
+1. **进程扫描**【已落地】：`LIVE_PROCS` 表驱动，编译内置 claude/codex/gemini
+   三条，适配器 `manifest.detect.process` 在装载时追加——进程名/argv 正则与
+   headless 排除全在适配器声明里，宿主不做 vendor 判断。
+2. **bin 候选**【已落地】：`resolveBin` 依次查 PATH、`binCandidates()`（适配器
+   函数，安装目录扫描归它管）、`.cmd` shim 解包——opencode 的
+   `@opencode-*\resources\opencode-cli.exe` 发现即此路径。
+3. **声明路径 stat**【草案】：`installDirs`/`configDirs` 声明式扫描尚未进
+   注册侧（注册仍走 `agents.json`/worker-card）。
+4. **用户覆盖**【草案】：`<state>\agents.json` 条目可带 `paths: {configRoot,
+   executable}`——个性化/非默认安装位置的唯一正解，优先级高于扫描结果。
+5. **结果**：`{installed, installRoot?, configRoot?, executable?, running}`。
    `store` 类以 `configRoot` 存在为可用条件；`spawn` 类还要求 `executable` 可运行
    （`--version` 探测即当前实现，见 host.mjs `execFileSync(...,'--version')`）。
 
@@ -112,18 +152,18 @@ vendor 升级改格式是常态。规则：
 
 ## 7. 信任边界
 
-- `<state>\adapters\` 下的适配器 = 用户自装代码，以用户权限运行，自负——
-  与「用户手动放了个 CLI 在 PATH」同级信任。
-- `components/adapters\`（随安装包发布）才涉及签名/审核，本契约不定义。
+- `<workers-root>\adapters\` 下的适配器 = 用户自装代码，以用户权限运行，
+  自负——与「用户手动放了个 CLI 在 PATH」同级信任。
+- `components\cli-bridge\adapters\`（随安装包发布）才涉及签名/审核，本契约不定义。
 
 ## 8. 参考实现
 
-`devin`（store 类）：`cli-bridge/host.mjs` 中 `DEVIN_DBS`（多平台 configDirs
-候选，首个命中）→ `devinSessions()`（分页/搜索）→ `devinTranscript()`；
+`devin`（store 类）：`cli-bridge/adapters/devin/adapter.mjs`——多平台
+configDirs 候选首个命中 → `sessions()`（分页/搜索）→ `transcript()`；
 `ENGINE === 'devin'` 时 `engine = null` 路径即「无 spawn 的 store」形态——
 `/engines` 一行只读 scope 行、`POST /tasks` 回 `ENGINE_READ_ONLY`、questions 经
 `q.engine` 委托给所选真实引擎（缺失 CLI 以 spawn 'error' 软失败，不拖垮桥）。
-当前以编译期代码存在，是把 §3–§6 草案落成目录装载时的迁移目标。
+**第一个目录装载适配器**，证明 §2 形态可行。
 
 `opencode`（spawn+store 双形态试点）：桌面版自带
 `%LOCALAPPDATA%\Programs\@opencode-*\resources\opencode-cli.exe`
