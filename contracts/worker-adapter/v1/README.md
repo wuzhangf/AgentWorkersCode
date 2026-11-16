@@ -9,7 +9,8 @@ vendor 知识全部封在适配器内；第三方交付物 = 一个适配器目�
 | 部分 | 状态 |
 |---|---|
 | 桥 API 面（§5）、`store` 只读语义、`ENGINE_READ_ONLY`、devin 参考实现 | **已落地**（`cli-bridge/host.mjs`） |
-| 目录装载器、adapter.mjs 交付形态、`detect.process`/`binCandidates`（§2–§4） | **已落地**——devin/opencode 是前两个目录装载适配器（`cli-bridge/adapters/`） |
+| 目录装载器、adapter.mjs 交付形态、`detect.process`/`binCandidates`/`configDirs`（§2–§4） | **已落地**——devin/opencode 是前两个目录装载适配器（`cli-bridge/adapters/`） |
+| `supported(ctx)` 版本闸、`cli-bridge detect` 注册侧发现（§4.3、§6） | **已落地**——两宿主（Windows ManagedAgents / Mac service.mjs）均已消费 |
 | `adapter.json` manifest 形式、`versions[]` 版本协商（§6）、`UNSUPPORTED_VERSION` | **草案**——当前 manifest 是 adapter.mjs 内联对象，版本协商未实现 |
 
 标注「草案」的部分是适配器作者应遵循的目标形态；落地前任何字段改名都会
@@ -110,8 +111,12 @@ export default {
 2. **bin 候选**【已落地】：`resolveBin` 依次查 PATH、`binCandidates()`（适配器
    函数，安装目录扫描归它管）、`.cmd` shim 解包——opencode 的
    `@opencode-*\resources\opencode-cli.exe` 发现即此路径。
-3. **声明路径 stat**【草案】：`installDirs`/`configDirs` 声明式扫描尚未进
-   注册侧（注册仍走 `agents.json`/worker-card）。
+3. **声明路径 stat**【已落地】：`cli-bridge.mjs detect` 输出每个已装载
+   适配器的 `{id, kind, bin, binPath, dataDirs, installDirs}`——`configDirs`
+   中存在的报 `dataDirs`。宿主消费：Windows `ManagedAgents.DetectOnceAsync`
+   按 `kind` 分流（store+dataDirs→播种 store 行；spawn/both+bin→bin 进
+   可执行解析；both 无 bin 有数据→退化为 store 行），Mac `service.mjs
+   detectOnce` 同语义播种 + 用 `binPath` 补 UI 探测漏掉的 executable。
 4. **用户覆盖**【草案】：`<state>\agents.json` 条目可带 `paths: {configRoot,
    executable}`——个性化/非默认安装位置的唯一正解，优先级高于扫描结果。
 5. **结果**：`{installed, installRoot?, configRoot?, executable?, running}`。
@@ -136,7 +141,8 @@ export default {
 
 错误码沿用 worker-local/1：`INVALID_REQUEST` `SESSION_NOT_FOUND`
 `LOCAL_SOURCE_UNAVAILABLE` `ENGINE_READ_ONLY`；本契约新增
-`UNSUPPORTED_VERSION`（§6，草案，尚未由桥发出）。
+`UNSUPPORTED_VERSION`（§6，已落地——`supported()` 不通过的引擎以
+409 应答 history/questions/adopt，`identity.adapterProblems` 带原因）。
 
 ## 6. 数据结构版本（部分已落地）
 
