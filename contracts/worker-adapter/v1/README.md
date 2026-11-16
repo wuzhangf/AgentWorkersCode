@@ -22,7 +22,10 @@ vendor 知识全部封在适配器内；第三方交付物 = 一个适配器目�
 | `store` | 只读消费一个本地数据源，不 spawn | 桥进程本体即全部，无子进程 | devin（Devin 桌面会话库） |
 
 `store` 必须满足：零 vendor 可执行依赖（目标 CLI 没装也能跑）、`/engines`
-返回空表（不上任务目标选择器）、对任务提交回 `ENGINE_READ_ONLY`（409）。
+返回**一行只读 scope 行**而非空表——`availability:'AVAILABLE'`（使 scope 可授，
+否则无 launchScope 的后端连 `/history` 都被设备授权拦下）配合
+`available:false` + `reasonCode:'ENGINE_READ_ONLY'` + 全 false 能力表
+（不上任务目标选择器）；对任务提交回 `ENGINE_READ_ONLY`（409）。
 旁支提问/接管导入由**调用方选择的某个 spawn 引擎**执行——`store` 自己不答题。
 
 ## 2. 适配器交付形态（草案）
@@ -84,7 +87,7 @@ adapters/<id>/
 | 路由 | spawn | store | 说明 |
 |---|---|---|---|
 | `GET /local/v1/identity` | ✔ | ✔ | 桥身份 |
-| `GET /local/v1/engines` | 1 项 | **空表** | store 必须空，防入选题器 |
+| `GET /local/v1/engines` | 1 项 | 1 行只读 scope 行 | `available:false` 防入选题器；空表会让会话失去授权入口 |
 | `GET /local/v1/projects` | ✔ | ✔ | |
 | `GET /local/v1/history?engine=` | 本引擎 | `devin` | 分页/搜索游标语义不变 |
 | `GET /local/v1/history/sessions/{id}?engine=` | ✔ | ✔ | transcript；`SESSION_NOT_FOUND`/`LOCAL_SOURCE_UNAVAILABLE` |
@@ -118,7 +121,7 @@ vendor 升级改格式是常态。规则：
 `devin`（store 类）：`cli-bridge/host.mjs` 中 `DEVIN_DBS`（多平台 configDirs
 候选，首个命中）→ `devinSessions()`（分页/搜索）→ `devinTranscript()`；
 `ENGINE === 'devin'` 时 `engine = null` 路径即「无 spawn 的 store」形态——
-`/engines` 空表、`POST /tasks` 回 `ENGINE_READ_ONLY`、questions 经
+`/engines` 一行只读 scope 行、`POST /tasks` 回 `ENGINE_READ_ONLY`、questions 经
 `q.engine` 委托给所选真实引擎（缺失 CLI 以 spawn 'error' 软失败，不拖垮桥）。
 当前以编译期代码存在，是把 §3–§6 草案落成目录装载时的迁移目标。
 

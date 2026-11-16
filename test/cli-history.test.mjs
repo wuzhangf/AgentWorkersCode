@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { once } from 'node:events';
 import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
@@ -13,7 +14,11 @@ test('vendor history supports independent Agent pages, old Devin lookup and read
   const fixture = await mkdtemp(join(tmpdir(), 'cli-history-'));
   t.after(() => rm(fixture, { recursive: true, force: true }));
   const history = join(fixture, '.claude', 'projects', 'fixture');
-  const database = join(fixture, '.local', 'share', 'devin', 'cli');
+  // DEVIN_DBS prefers %APPDATA%\Devin\cli on win32 — homedir alone does not
+  // redirect it, so the db must live where the child's APPDATA points.
+  const database = process.platform === 'win32'
+    ? join(fixture, 'AppData', 'Roaming', 'Devin', 'cli')
+    : join(fixture, '.local', 'share', 'devin', 'cli');
   await Promise.all([mkdir(history, { recursive: true }), mkdir(database, { recursive: true })]);
 
   const db = new DatabaseSync(join(database, 'sessions.db'));
@@ -43,11 +48,20 @@ test('vendor history supports independent Agent pages, old Devin lookup and read
     await new Promise(resolve => listener.close(resolve));
     const token = randomBytes(24).toString('hex');
     const child = spawn(process.execPath, [
-      '--import', preload, new URL('../cli-bridge/host.mjs', import.meta.url).pathname,
+      // Windows needs file:// URLs for --import and fileURLToPath for script
+      // args — a bare C:\ path reads as scheme 'c:' and pathname keeps a
+      // leading slash POSIX doesn't have.
+      '--import', pathToFileURL(preload).href,
+      fileURLToPath(new URL('../cli-bridge/host.mjs', import.meta.url)),
       'serve', '--engine', engine, '--state', join(fixture, 'workers', engine),
       '--project', fixture, '--port', String(port),
       ...(executable ? ['--executable', executable] : []),
-    ], { env: { ...process.env, WORKER_LOCAL_TOKEN: token }, stdio: ['ignore', 'pipe', 'pipe'] });
+    ], { env: { ...process.env, WORKER_LOCAL_TOKEN: token,
+      // Redirect the win32-preferred store location into the fixture too —
+      // homedir() alone leaves %APPDATA%\Devin\cli pointing at the real db.
+      ...(process.platform === 'win32'
+        ? { APPDATA: join(fixture, 'AppData', 'Roaming') } : {}) },
+      stdio: ['ignore', 'pipe', 'pipe'] });
     const stopped = once(child, 'exit');
     t.after(async () => { child.kill(); await stopped; });
     const ready = await Promise.race([once(child.stdout, 'data'), stopped]);
@@ -84,7 +98,17 @@ test('vendor history supports independent Agent pages, old Devin lookup and read
     assert.equal(new Set(ids).size, count);
     if (engine === 'devin') assert.ok(ids.includes('devin-12'));
   }
-  assert.deepEqual((await devin.read('/engines')).items, []);
+  // A store bridge still needs one scope row: launchScopes are generated
+  // from catalog engines and /history is gated per-backend — an empty table
+  // would orphan its sessions. available:false + ENGINE_READ_ONLY keeps it
+  // off launch pickers while 'AVAILABLE' leaves the row grantable.
+  assert.deepEqual((await devin.read('/engines')).items, [{
+    engineId: 'devin', engineVersion: 'read-only', version: 'read-only',
+    availability: 'AVAILABLE', available: false, reasonCode: 'ENGINE_READ_ONLY',
+    profileId: 'STORE', sourceKind: 'store',
+    capabilities: { executionModes: [], steer: false, followUp: false,
+                    stop: false, pause: false, resume: false },
+  }]);
   const search = await devin.read('/history?limit=20&q=' + encodeURIComponent('独立恢复'));
   assert.deepEqual(search.items.map(item => item.id), ['devin-12']);
   assert.match(search.items[0].at, /^2026-/);
@@ -117,20 +141,33 @@ test('a follow-up updates the sealed file digest under the same artifact identit
   t.after(() => rm(fixture, { recursive: true, force: true }));
   const project = join(fixture, 'project');
   await mkdir(project);
-  const executable = join(fixture, 'test-claude');
-  await writeFile(executable, `#!/bin/sh
+  // POSIX runs the fake CLI as a sh script; Windows needs a .cmd shim that
+  // resolvePath unwraps to `node <entry.js>` — same body in CJS.
+  const executable = join(fixture,
+    process.platform === 'win32' ? 'test-claude.cmd' : 'test-claude');
+  if (process.platform === 'win32') {
+    await writeFile(executable, '@node "%~dp0\\test-claude.js" %*\r\n');
+    await writeFile(join(fixture, 'test-claude.js'), `const fs = require('node:fs');
+if (process.argv[2] === '--version') { console.log('fixture'); process.exit(0); }
+if (fs.existsSync('report.md')) fs.writeFileSync('report.md', 'report version two\\n');
+else { fs.writeFileSync('report.md', 'report version one\\n'); fs.writeFileSync('log.txt', 'log file\\n'); }
+console.log('{"type":"system","subtype":"init","session_id":"session-fixture"}');
+`);
+  } else {
+    await writeFile(executable, `#!/bin/sh
 if [ "$1" = "--version" ]; then echo fixture; exit 0; fi
 if [ -f report.md ]; then printf 'report version two\\n' > report.md
 else printf 'report version one\\n' > report.md; printf 'log file\\n' > log.txt; fi
 printf '%s\\n' '{"type":"system","subtype":"init","session_id":"session-fixture"}'
 `, { mode: 0o700 });
+  }
   const listener = createServer().listen(0, '127.0.0.1');
   await once(listener, 'listening');
   const port = listener.address().port;
   await new Promise(resolve => listener.close(resolve));
   const token = randomBytes(24).toString('hex');
   const child = spawn(process.execPath, [
-    new URL('../cli-bridge/host.mjs', import.meta.url).pathname,
+    fileURLToPath(new URL('../cli-bridge/host.mjs', import.meta.url)),
     'serve', '--engine', 'claude', '--state', join(fixture, 'state'),
     '--project', project, '--port', String(port), '--executable', executable,
   ], { env: { ...process.env, WORKER_LOCAL_TOKEN: token }, stdio: ['ignore', 'pipe', 'pipe'] });
