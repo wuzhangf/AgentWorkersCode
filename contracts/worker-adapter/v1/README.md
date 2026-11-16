@@ -138,17 +138,27 @@ export default {
 `LOCAL_SOURCE_UNAVAILABLE` `ENGINE_READ_ONLY`；本契约新增
 `UNSUPPORTED_VERSION`（§6，草案，尚未由桥发出）。
 
-## 6. 数据结构版本（草案）
+## 6. 数据结构版本（部分已落地）
 
-vendor 升级改格式是常态。规则：
+vendor 升级改格式是常态。当前实现把协商压缩成一个问题：
 
-- `versions[]` 新→旧排列；`match` 由适配器自评（它才认识自己的格式——
-  sqlite 版本表、文件布局、magic 都行）。
-- 装载时取**第一个 match 为真**的版本实现；全不匹配 → 上报
-  `UNSUPPORTED_VERSION`（携带检测到的版本线索），托盘显示「适配器待更新」，
-  **不得静默当空数据**。
-- 新旧并存期间多版本条目共存；旧版下线由适配器作者决定，与宿主无关。
-- 宿主只提供只读打开助手（sqlite/JSONL），不提供任何格式知识。
+```js
+// adapter.mjs
+supported: (ctx) => true | '原因串'
+//   ctx = { home, platform, exists(p), openSqlite(file) }
+```
+
+- 适配器自检自己的数据源（它才认识自己的格式——sqlite 表存在性、文件
+  布局、magic 都行），返回 `true` 或一条原因。
+- 装载时不通过 → 该引擎注册为 UNSUPPORTED 存根：`/history`、`/history/
+  sessions/{id}`、questions/adopt 回 `UNSUPPORTED_VERSION`(409)，
+  `identity.adapterProblems` 携带原因——**绝不静默当空数据**。
+  数据源缺席（没装）≠ 不识（装了但格式变了）：前者仍 `supported→true`，
+  store 如实报空。
+- `versions[]` 声明式多实现（每版本一套 ops）仍是草案——opencode 的
+  v1/v2 union 已证明「新旧并存归适配器内部处理」，多数适配器一个
+  `supported` 就够。
+- 宿主只提供 `openSqlite` 等只读助手，不提供任何格式知识。
 
 ## 7. 信任边界
 

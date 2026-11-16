@@ -72,6 +72,23 @@ export default {
     displayName: 'Devin',
     detect: { configDirs: DBS },
   },
+  /** devin-db/1: sessions + message_nodes are the two tables we read. An
+   * absent store means Devin is not installed (store reports empty); a
+   * present-but-unrecognizable one is a schema upgrade → UNSUPPORTED. */
+  supported: (ctx) => {
+    for (const file of DBS) {
+      if (!ctx.exists(file)) continue;
+      try {
+        const handle = ctx.openSqlite(file);
+        const has = (name) => handle.prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name) !== undefined;
+        const ok = has('sessions') && has('message_nodes');
+        handle.close();
+        return ok || 'sessions.db 表结构不识（可能 Devin 新版改了格式）';
+      } catch { return 'sessions.db 打开失败'; }
+    }
+    return true;
+  },
   store: {
     sessions,
     transcript,

@@ -140,6 +140,24 @@ export default {
       configDirs: DBS,
     },
   },
+  /** opencode-db/2 (session_v2) or /1 (session+message+part) — either
+   * generation counts as understood since the store unions both. An absent
+   * db just means no sessions yet; a present one with neither generation
+   * is a schema break → UNSUPPORTED instead of silently listing nothing. */
+  supported: (ctx) => {
+    for (const file of DBS) {
+      if (!ctx.exists(file)) continue;
+      try {
+        const handle = ctx.openSqlite(file);
+        const has = (name) => handle.prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name) !== undefined;
+        const ok = has('session_v2') || (has('session') && has('message') && has('part'));
+        handle.close();
+        return ok || 'opencode.db 表结构不识（可能新版改了存储格式）';
+      } catch { return 'opencode.db 打开失败'; }
+    }
+    return true;
+  },
   spawn: {
     bin: 'opencode',
     argv: (instruction, sessionId, task, ctx) => [

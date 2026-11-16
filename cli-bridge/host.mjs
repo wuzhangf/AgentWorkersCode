@@ -542,6 +542,20 @@ const adapterRoots = () => {
   return roots;
 };
 const adapterProblems = [];
+/** §6 in one question: the adapter inspects its own data source and answers
+ * true ("I understand this format") or a reason string. Anything else → the
+ * engine registers as UNSUPPORTED — routes answer UNSUPPORTED_VERSION instead
+ * of pretending the store is empty, which is how silent breakage looked. */
+const unsupportedStore = (id, reason) => {
+  const err = () => fail('UNSUPPORTED_VERSION', 409);
+  adapterProblems.push(`${id}: UNSUPPORTED_VERSION — ${reason}`);
+  return { sessions: err, transcript: err, row: () => undefined, unsupported: reason };
+};
+const adapterCtx = () => ({
+  home: homedir(), platform: process.platform,
+  exists: (p) => existsSync(p),
+  openSqlite: (file) => new DatabaseSync(file, { readOnly: true }),
+});
 const loadAdapters = async () => {
   for (const root of adapterRoots()) {
     let entries;
@@ -556,6 +570,14 @@ const loadAdapters = async () => {
       }
       const id = ad?.manifest?.id ?? d.name;
       if (!ADAPTER_ID.test(id)) { adapterProblems.push(`${d.name}: bad manifest id`); continue; }
+      if (typeof ad?.supported === 'function') {
+        let verdict;
+        try { verdict = ad.supported(adapterCtx()); } catch (e) { verdict = e?.message ?? 'check failed'; }
+        if (verdict !== true) {
+          STORES[id] = unsupportedStore(id, typeof verdict === 'string' ? verdict : 'data format not recognized');
+          continue;
+        }
+      }
       if (ad?.store && typeof ad.store.sessions === 'function'
           && typeof ad.store.transcript === 'function' && typeof ad.store.row === 'function') {
         STORES[id] = ad.store;
