@@ -150,6 +150,19 @@ const wellKnownCliPaths = (name) => {
     const p = join(process.env.USERPROFILE, '.local', 'bin', 'claude.exe');
     if (existsSync(p)) out.push(p);
   }
+  if (name === 'opencode' && process.env.LOCALAPPDATA) {
+    // No standalone CLI install — the OpenCode desktop app ships
+    // resources\opencode-cli.exe under %LOCALAPPDATA%\Programs\@opencode-*,
+    // including side-by-side .update-<hash> folders from the updater.
+    const root = join(process.env.LOCALAPPDATA, 'Programs');
+    try {
+      for (const e of readdirSync(root, { withFileTypes: true }).sort((a, b) => b.name.localeCompare(a.name))) {
+        if (!e.isDirectory() || !e.name.startsWith('@opencode')) continue;
+        const p = join(root, e.name, 'resources', 'opencode-cli.exe');
+        if (existsSync(p)) out.push(p);
+      }
+    } catch {}
+  }
   return out;
 };
 
@@ -411,6 +424,40 @@ const ENGINES = {
       return null;
     },
   },
+  opencode: {
+    argv: (instruction, sessionId, task) => [
+      'run', instruction, '--format', 'json',
+      // --standalone: a private per-run server — never hand the desktop app's
+      // background service our headless sessions.
+      '--standalone',
+      // Headless runs share the same opencode.db the desktop app and our
+      // store reader list — archive keeps them out of "native session" rows
+      // (adoption/standalone title still makes them identifiable).
+      '--archived',
+      ...(task?.taskId ? ['--title', `agent-link ${task.taskId}`] : []),
+      // Always --auto: headless has no channel to answer permission prompts
+      // (gemini's yolo reasoning). Routing opencode's permission asks to the
+      // phone is adapter-level future work; SKIP=off cannot sandbox here.
+      '--auto',
+      ...(task?.model ?? MODEL ? ['--model', task?.model ?? MODEL] : []),
+      ...(sessionId ? ['--session', sessionId] : []),
+    ],
+    bin: 'opencode',
+    /** opencode run --format json: every event carries sessionID; `text` parts
+     * arrive complete per block; step_finish ends the turn; `error` fails it. */
+    onEvent: (row, task, addMessage) => {
+      if (typeof row.sessionID === 'string') task.nativeSessionId = row.sessionID;
+      if (row.type === 'text' && typeof row.part?.text === 'string' && row.part.text.trim()) {
+        addMessage('assistant', row.part.text);
+      }
+      if (row.type === 'error') {
+        task.output = String(row.error?.data?.message ?? row.error?.message ?? 'opencode 运行失败');
+        return 'FAILED';
+      }
+      if (row.type === 'step_finish') return 'SUCCEEDED';
+      return null;
+    },
+  },
 };
 
 // ---- task material uploads (material-upload/1) -------------------------------
@@ -577,6 +624,119 @@ const devinTranscript = (id) => {
   finally { try { db.close(); } catch {} }
 };
 
+/** OpenCode keeps sessions in one XDG-data SQLite store on every platform —
+ * ~/.local/share/opencode/opencode.db (the desktop app shares it). Read-only
+ * open; absent store reports empty. */
+const OPENCODE_DBS = [join(homedir(), '.local', 'share', 'opencode', 'opencode.db')];
+const opencodeDb = () => {
+  for (const file of OPENCODE_DBS) {
+    if (!existsSync(file)) continue;
+    try { return new DatabaseSync(file, { readOnly: true }); } catch { continue; }
+  }
+  return null;
+};
+/** The store has two generations side by side: pre-v2 rows in
+ * session/message/part and the current schema session_v2/session_message
+ * (session_part exists but stays empty; content lives inline in
+ * session_message.data). Reads union both, deduped by id — the exact "old
+ * and new data structures coexist" case adapters are expected to own. */
+const opencodeTableExists = (db, name) =>
+  db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name) !== undefined;
+const opencodeSessions = ({ id, limit, before } = {}) => {
+  const db = opencodeDb();
+  if (!db) return [];
+  try {
+    // parent_id rows are sub-agent side sessions; time_archived rows are our
+    // own --archived headless runs — neither is a "native session" to offer.
+    const rows = new Map();
+    for (const table of ['session_v2', 'session']) {
+      if (!opencodeTableExists(db, table)) continue;
+      const args = [];
+      let sql = `SELECT id, title, directory AS cwd, time_updated FROM ${table}
+                 WHERE parent_id IS NULL AND time_archived IS NULL`;
+      if (id !== undefined) { sql += ' AND id = ?'; args.push(id); }
+      for (const r of db.prepare(sql).all(...args)) {
+        if (!rows.has(r.id)) rows.set(r.id, r);
+      }
+    }
+    let out = [...rows.values()];
+    if (before) out = out.filter(r =>
+      (r.time_updated ?? 0) < before.at || ((r.time_updated ?? 0) === before.at && r.id > before.id));
+    out.sort((a, b) => (b.time_updated ?? 0) - (a.time_updated ?? 0)
+      || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    if (limit !== undefined) out = out.slice(0, limit);
+    return out.map(r => ({
+      id: String(r.id), title: String(r.title ?? ''), cwd: String(r.cwd ?? ''),
+      at: devinDate(r.time_updated), rawAt: r.time_updated ?? 0,
+    }));
+  } catch { return []; }
+  finally { try { db.close(); } catch {} }
+};
+const opencodeTranscript = (id) => {
+  const db = opencodeDb();
+  if (!db) return null;
+  try {
+    const items = [];
+    // v1: message.data carries role; part.data carries typed blocks — text
+    // parts only. part.session_id denormalizes the join key.
+    if (opencodeTableExists(db, 'message') && opencodeTableExists(db, 'part')) {
+      for (const r of db.prepare(
+        `SELECT p.time_created AS t,
+                json_extract(m.data, '$.role') AS role,
+                json_extract(p.data, '$.text') AS text
+         FROM part p JOIN message m ON m.id = p.message_id
+         WHERE p.session_id = ? AND json_extract(p.data, '$.type') = 'text'
+         ORDER BY p.time_created, p.id`).all(id)) {
+        if ((r.role === 'user' || r.role === 'assistant')
+            && typeof r.text === 'string' && r.text.trim())
+          items.push({ t: r.t ?? 0, role: r.role, text: r.text });
+      }
+    }
+    // v2: session_message.type carries the role; user data holds .text,
+    // assistant data holds a content[] array whose 'text' items carry prose
+    // ('reasoning' and 'tool' items are skipped, matching the v1 filter).
+    if (opencodeTableExists(db, 'session_message')) {
+      for (const r of db.prepare(
+        `SELECT time_created AS t, type, data
+         FROM session_message WHERE session_id = ?
+         ORDER BY COALESCE(seq, time_created), id`).all(id)) {
+        let d;
+        try { d = JSON.parse(r.data); } catch { continue; }
+        if (r.type === 'user' && typeof d.text === 'string' && d.text.trim()) {
+          items.push({ t: r.t ?? 0, role: 'user', text: d.text });
+        } else if (r.type === 'assistant') {
+          for (const c of d.content ?? []) {
+            if (c.type === 'text' && typeof c.text === 'string' && c.text.trim())
+              items.push({ t: r.t ?? 0, role: 'assistant', text: c.text });
+          }
+        }
+      }
+    }
+    items.sort((a, b) => a.t - b.t);
+    return items.map(({ role, text }) => ({ role, text }));
+  } catch { return null; }
+  finally { try { db.close(); } catch {} }
+};
+
+/** SQLite-backed session stores — one row per vendor. sessions() pages and
+ * searches like the file-based historyFiles path; transcript() returns
+ * {role,text}[]; row() fetches one session's listing record for adopt/ask.
+ * A store engine with no ENGINES entry is a read-only bridge (devin); a store
+ * keyed under a spawn engine name reports that engine's own sessions
+ * (opencode). */
+const STORES = {
+  devin: {
+    sessions: devinSessions,
+    transcript: devinTranscript,
+    row: (id) => devinSessions({ id, limit: 1 })[0],
+  },
+  opencode: {
+    sessions: opencodeSessions,
+    transcript: opencodeTranscript,
+    row: (id) => opencodeSessions({ id, limit: 1 })[0],
+  },
+};
+
 /** Working directory a session file belongs to. Claude transcripts stamp cwd
  * on user/attachment rows; codex rollouts put it in session_meta. Filenames
  * and dir slugs are unreliable (dashes collide), so always read the content. */
@@ -685,10 +845,11 @@ if (cmd === 'history') {
   process.exit(0);
 }
 
-// 'devin' is a read-only store engine: it never spawns a CLI of its own —
-// it serves the Devin desktop session db for listing/transcripts/adoption and
-// answers side questions through whichever real engine the asker picks.
-if (!ENGINES[ENGINE] && ENGINE !== 'devin') { console.error(`unknown --engine ${ENGINE}`); process.exit(2); }
+// A STORES engine with no ENGINES entry is a read-only store bridge (devin):
+// it never spawns a CLI of its own — it serves the vendor's session db for
+// listing/transcripts/adoption and answers side questions through whichever
+// real engine the asker picks.
+if (!ENGINES[ENGINE] && !STORES[ENGINE]) { console.error(`unknown --engine ${ENGINE}`); process.exit(2); }
 if (!STATE_DIR || !PORT || !PROJECT_DIR) { console.error('serve requires --state --port --project'); process.exit(2); }
 if (TOKEN.length < 24) { console.error('WORKER_LOCAL_TOKEN must be at least 24 chars'); process.exit(2); }
 if (cmd !== 'serve') { console.error('usage: host.mjs serve ...'); process.exit(2); }
@@ -815,10 +976,14 @@ const addMessage = (t, role, text, requestKey, status) => {
 // user's normal environment minus worker credentials.
 const CHILD_ENV = { ...process.env };
 delete CHILD_ENV.WORKER_LOCAL_TOKEN;
+// A task/adopted session's recorded cwd may have been deleted since — spawn
+// with a missing cwd fails ENOENT and looks like "engine unavailable".
+const spawnCwd = (t) => t.cwd && existsSync(t.cwd) ? t.cwd
+  : existsSync(PROJECT_DIR) ? PROJECT_DIR : homedir();
 const dispatch = (t, instruction, requestKey, displayText) => {
   const argv = engine.argv(instruction, t.nativeSessionId, t);
   const child = spawn(resolved.cmd, [...resolved.pre, ...argv], {
-    cwd: t.cwd ?? PROJECT_DIR,
+    cwd: spawnCwd(t),
     env: CHILD_ENV,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -920,7 +1085,10 @@ const SIDE_QUESTION_MARK = 'You are answering a side question';
 const runSideQuestion = (t, q) => {
   const eng = ENGINES[q.engine];
   let bin;
-  try { bin = resolveBin(eng.bin); }
+  // Same-engine questions spawn this bridge's own resolved executable —
+  // the managed registration's explicit path wins over PATH discovery,
+  // which can hit a stale side-by-side update folder.
+  try { bin = q.engine === ENGINE && resolved ? resolved : resolveBin(eng.bin); }
   catch {
     q.state = 'FAILED'; q.answer = `${q.engine} CLI 不在这台电脑上`; q.answeredAt = now();
     save(); return;
@@ -945,7 +1113,7 @@ const runSideQuestion = (t, q) => {
   // throwaway message list so delta handling works without a real task row.
   const probe = { publicMessages: [] };
   const child = spawn(bin.cmd, [...bin.pre, ...argv], {
-    cwd: t.cwd ?? PROJECT_DIR, env: CHILD_ENV, stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: spawnCwd(t), env: CHILD_ENV, stdio: ['ignore', 'pipe', 'pipe'],
   });
   liveQuestions.set(q.questionId, child);
   const chunks = [];
@@ -1449,29 +1617,37 @@ const routes = (method, seg, taskId, body, query) => {
       availability: 'AVAILABLE', headRevision: null, hasUncommittedChanges: false, kind: 'WORKSPACE' }] };
   }
   if (method === 'GET' && rest[0] === 'engines' && rest.length === 1) {
-    // A read-only store bridge (devin) launches nothing — empty scope keeps it
-    // off the phone's task-target and answering-engine pickers.
-    return { ...identity(), items: engine ? [{ engineId: ENGINE, engineVersion, version: engineVersion,
+    // A read-only store bridge (devin) still needs a scope row: launchScopes
+    // are detected from catalog engines, and /history is gated per-backend —
+    // no engine row would orphan its sessions. `available:false` keeps it off
+    // launch pickers while 'AVAILABLE' keeps the row grantable.
+    return { ...identity(), items: [engine ? { engineId: ENGINE, engineVersion, version: engineVersion,
       availability: 'AVAILABLE', profileId: 'MANAGED', sourceKind: 'cli',
       capabilities: { executionModes: ['WORKSPACE_TASK'], steer: true, followUp: true,
-                      stop: true, pause: true, resume: true } }] : [] };
+                      stop: true, pause: true, resume: true } }
+    : STORES[ENGINE] ? { engineId: ENGINE, engineVersion, version: engineVersion,
+      availability: 'AVAILABLE', available: false, reasonCode: 'ENGINE_READ_ONLY',
+      profileId: 'STORE', sourceKind: 'store',
+      capabilities: { executionModes: [], steer: false, followUp: false,
+                      stop: false, pause: false, resume: false } }
+    : null].filter(Boolean) };
   }
   if (method === 'GET' && rest[0] === 'history' && rest[1] === 'sessions' && rest.length === 3) {
     const id = rest[2];
     const engine = query.get('engine') ?? ENGINE;
-    // The devin store is shared local data — any bridge may serve a read;
-    // only the devin bridge REPORTS devin sessions (see /local/v1/history).
-    if (!validSessionID(id) || !(engine === ENGINE || engine === 'devin')) {
+    // SQLite stores are shared local data — any bridge may serve a read;
+    // only the store's own bridge REPORTS them (see /local/v1/history).
+    if (!validSessionID(id) || !(engine === ENGINE || STORES[engine])) {
       fail('INVALID_REQUEST', 400);
     }
     const limit = Number(query.get('limit') ?? 15);
     const before = query.has('before') ? Number(query.get('before')) : undefined;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20
         || before !== undefined && (!Number.isSafeInteger(before) || before < 1)) fail('INVALID_REQUEST', 400);
-    const file = engine !== 'devin' ? vendorFile(engine, id) : undefined;
-    const devin = engine === 'devin' && devinSessions({ id, limit: 1 }).length > 0;
-    if (!file && !devin) fail('SESSION_NOT_FOUND', 404);
-    const messages = file ? transcriptMessages(file) : devinTranscript(id);
+    const file = !STORES[engine] ? vendorFile(engine, id) : undefined;
+    const stored = STORES[engine]?.row(id);
+    if (!file && !stored) fail('SESSION_NOT_FOUND', 404);
+    const messages = file ? transcriptMessages(file) : STORES[engine].transcript(id);
     if (!messages) fail('LOCAL_SOURCE_UNAVAILABLE', 503);
     const end = Math.min(messages.length, before === undefined ? messages.length : before - 1);
     const start = Math.max(0, end - limit);
@@ -1489,10 +1665,10 @@ const routes = (method, seg, taskId, body, query) => {
     const paged = query.has('limit');
     const limit = Number(query.get('limit') ?? 40);
     const selected = query.get('engine');
-    // Devin sessions are reported by the dedicated devin bridge only —
-    // reporting them from every bridge would duplicate rows on the phone.
-    const engines = [...(Object.hasOwn(SESSION_ROOTS, ENGINE) ? [ENGINE] : []),
-      ...(ENGINE === 'devin' ? ['devin'] : [])];
+    // Each bridge reports only its own session surface — file-store engines
+    // their session roots, sqlite-store engines their db. Reporting a shared
+    // store from every bridge would duplicate rows on the phone.
+    const engines = Object.hasOwn(SESSION_ROOTS, ENGINE) || STORES[ENGINE] ? [ENGINE] : [];
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50
         || selected && !engines.includes(selected)) fail('INVALID_REQUEST', 400);
     const needle = (query.get('q') ?? '').trim().toLowerCase();
@@ -1509,12 +1685,12 @@ const routes = (method, seg, taskId, body, query) => {
     const items = [];
     const pages = [];
     for (const engine of selected ? [selected] : engines) {
-      const pageLimit = !paged && engine === 'devin' ? 30 : limit;
+      const pageLimit = !paged && STORES[engine] ? 30 : limit;
       const records = [];
-      if (engine === 'devin') {
-        const found = devinSessions({ before, limit: needle ? undefined : pageLimit + 1 });
+      if (STORES[engine]) {
+        const found = STORES[engine].sessions({ before, limit: needle ? undefined : pageLimit + 1 });
         for (const { rawAt, ...item } of found) {
-          if (matches(item)) records.push({ item: { ...item, engine, source: 'devin' }, at: rawAt });
+          if (matches(item)) records.push({ item: { ...item, engine, source: engine }, at: rawAt });
           if (records.length > pageLimit) break;
         }
       } else {
@@ -1690,13 +1866,18 @@ const routes = (method, seg, taskId, body, query) => {
         }
         return receipt(prior);
       }
-      // Locate the session being asked about: the devin store is readable on
+      // Locate the session being asked about: SQLite stores are readable on
       // every bridge (adopt-only sessions answer by transcript, not a live
       // vendor handle), then this bridge's own vendor root.
       let sessionEngine = null, transcript = null, sessionCwdValue = null;
-      {
-        const row = devinSessions({ id: body.sessionId, limit: 1 })[0];
-        if (row) { sessionEngine = 'devin'; transcript = devinTranscript(row.id) ?? []; sessionCwdValue = row.cwd ?? null; }
+      for (const [storeEngine, store] of Object.entries(STORES)) {
+        const row = store.row(body.sessionId);
+        if (row) {
+          sessionEngine = storeEngine;
+          transcript = store.transcript(row.id) ?? [];
+          sessionCwdValue = row.cwd ?? null;
+          break;
+        }
       }
       if (sessionEngine === null) {
         const file = vendorFile(ENGINE, body.sessionId);
@@ -1776,11 +1957,11 @@ const routes = (method, seg, taskId, body, query) => {
       if (typeof body.adoptSessionId !== 'string' || !validSessionID(body.adoptSessionId))
         fail('INVALID_REQUEST', 400);
       const source = body.adoptEngine === undefined ? ENGINE : body.adoptEngine;
-      if (source === 'devin') {
-        // Devin's store is SQLite — transcript handoff is the only possible
-        // path (no vendor CLI can resume a Devin session id).
-        const row = devinSessions({ id: body.adoptSessionId, limit: 1 })[0];
-        const imported = row ? devinTranscript(row.id)?.slice(-300) : null;
+      if (STORES[source] && source !== ENGINE) {
+        // A foreign sqlite store — transcript handoff is the only possible
+        // path (this bridge's CLI cannot resume another vendor's session id).
+        const row = STORES[source].row(body.adoptSessionId);
+        const imported = row ? STORES[source].transcript(row.id)?.slice(-300) : null;
         if (!imported?.length) fail('ADOPT_SESSION_NOT_FOUND', 404);
         adoptId = body.adoptSessionId;
         adoptedMessages = imported.map((m, i) => ({
@@ -1789,7 +1970,24 @@ const routes = (method, seg, taskId, body, query) => {
           status: m.role === 'user' ? 'CONSUMED' : 'COMPLETED',
           occurredAt: row.at, updatedAt: row.at,
         }));
-        adoption = { from: 'devin', sessionId: adoptId, injected: false,
+        adoption = { from: source, sessionId: adoptId, injected: false,
+          messages: imported.slice(-40).map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`) };
+        if (row.cwd) adoption.cwd = row.cwd;
+      } else if (STORES[source] && source === ENGINE) {
+        // Same-engine store adoption (e.g. opencode bridge adopting its own
+        // db session): the CLI can resume the native id — preset it and let
+        // the first follow-up run the engine's resume path.
+        const row = STORES[source].row(body.adoptSessionId);
+        const imported = row ? STORES[source].transcript(row.id)?.slice(-300) : null;
+        if (!imported?.length) fail('ADOPT_SESSION_NOT_FOUND', 404);
+        adoptId = body.adoptSessionId;
+        adoptedMessages = imported.map((m, i) => ({
+          messageId: 'adopted-' + (i + 1), sequence: String(i + 1), revision: '0',
+          role: m.role, text: m.text.slice(0, 3000),
+          status: m.role === 'user' ? 'CONSUMED' : 'COMPLETED',
+          occurredAt: row.at, updatedAt: row.at,
+        }));
+        adoption = { from: source, sessionId: adoptId, injected: true,
           messages: imported.slice(-40).map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`) };
         if (row.cwd) adoption.cwd = row.cwd;
       } else {
