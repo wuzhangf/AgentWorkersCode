@@ -121,3 +121,26 @@ vendor 升级改格式是常态。规则：
 `/engines` 空表、`POST /tasks` 回 `ENGINE_READ_ONLY`、questions 经
 `q.engine` 委托给所选真实引擎（缺失 CLI 以 spawn 'error' 软失败，不拖垮桥）。
 当前以编译期代码存在，是把 §3–§6 草案落成目录装载时的迁移目标。
+
+`opencode`（spawn+store 双形态试点）：桌面版自带
+`%LOCALAPPDATA%\Programs\@opencode-*\resources\opencode-cli.exe`
+（含 `.update-<hash>` 并排目录，发现按目录名倒序取新）；任务跑
+`opencode run --format json --standalone --archived --auto`（无头不碰桌面
+后台服务，`--archived` 使托管运行不进"原生会话"列表，`--auto` 因无头没有
+权限问答通道）；store 读 `~/.local/share/opencode/opencode.db`，同时覆盖
+`session/message/part` 与 `session_v2/session_message` 两代结构、按 id 去重
+——即 §6"新旧并存"的现实样例。同引擎 store 接管走 `--session` 原生续接。
+
+## 9. 试点暴露的宿主义务（已落地修复）
+
+第一批第三方接入（opencode）实测暴露出两条与 vendor 无关的宿主责任，
+写进契约防止适配器重复踩坑：
+
+- **spawn cwd 必须经宿主校验存在性**：会话/接管记录里的 cwd 可能已被删
+  （会话活得比目录久），缺 cwd 的 spawn 报 ENOENT、表现成"引擎不可用"。
+  宿主统一回退 `项目目录 → 用户主目录`（`spawnCwd`），适配器不负责兜底。
+- **同引擎派生调用用注册的可执行路径**：旁支提问/接管续跑这类"同一引擎再
+  起一个进程"的调用，优先用托管注册时解析出的 `resolved`（含显式
+  `executable`），而不是重新 PATH 探测——后者会命中更新器留下的旧版
+  并排目录。跨引擎调用（如在 opencode 桥上问 claude）才走 PATH/已知目录
+  发现，且应容忍缺失（软失败，不拖垮桥）。
