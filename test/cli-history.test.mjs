@@ -130,10 +130,18 @@ test('vendor history supports independent Agent pages, old Devin lookup and read
     instruction: '独立恢复记录', adoptSessionId: 'devin-12', adoptEngine: 'devin', model: 'opus',
   });
   assert.equal(launch.status, 200);
-  const task = await claude.read('/tasks/' + (await launch.json()).taskId);
+  let task = await claude.read('/tasks/' + (await launch.json()).taskId);
   assert.equal(task.adoption.from, 'devin');
   assert.equal(task.configuredModel, 'opus');
+  // The adopted instruction dispatches as a real first turn now — wait for
+  // that spawned round to close instead of expecting a silently settled row.
+  for (let i = 0; i < 100 && !task.quiescent; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    task = await claude.read('/tasks/' + task.taskId);
+  }
   assert.equal(task.quiescent, true);
+  assert.notEqual(task.nativeTurnId, null);
+  assert.ok(['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(task.state));
 });
 
 test('a follow-up updates the sealed file digest under the same artifact identity', async t => {
