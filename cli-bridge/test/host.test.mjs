@@ -193,7 +193,9 @@ test('§2 resume during wind-down is refused; after close it runs cleanly', asyn
     h.setConf({ hold, pipeHoldMs: 1500 });
     const r = await h.launch('pausable task');
     const id = r.body.taskId;
-    await wait(async () => (await h.facts(id)).state === 'RUNNING');
+    // RUNNING is set on spawn. The init event proves the CLI fixture has
+    // already started its pipe holder before the test requests PAUSE.
+    await wait(async () => Boolean((await h.facts(id)).nativeSessionId));
     const p = await h.call(`/local/v1/tasks/${id}/commands`, { requestKey: 'rk-p1', intent: 'PAUSE' });
     assert.equal(p.status, 200, p.text);
     // SIGTERM killed the fixture, but a survivor holds its pipes ~1.5s —
@@ -202,6 +204,7 @@ test('§2 resume during wind-down is refused; after close it runs cleanly', asyn
     assert.equal(early.status, 409);
     assert.equal(early.body.code, 'NATIVE_ACTION_UNSUPPORTED');
     assert.equal((await h.facts(id)).state, 'PAUSED');
+    rmSync(hold);
     await h.quiescent(id);
     h.setConf({});
     const ok = await h.call(`/local/v1/tasks/${id}/commands`, { requestKey: 'rk-r2', intent: 'RESUME' });
