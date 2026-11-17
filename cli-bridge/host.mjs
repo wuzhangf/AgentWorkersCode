@@ -2240,6 +2240,13 @@ const routes = (method, seg, taskId, body, query) => {
         if (prior.taskId !== t.taskId || prior.hash !== intent.toLowerCase()) fail('IDEMPOTENCY_PAYLOAD_MISMATCH', 409);
         return receipt(prior);
       }
+      const pins = [['generation', 'generation'], ['nativeSessionId', 'nativeSessionId'],
+        ['nativeTurnId', 'nativeTurnId'], ['targetCommandId', 'currentCommandId']];
+      if (pins.some(([field]) => field in body)) {
+        for (const [field, fact] of pins) {
+          if ((body[field] ?? null) !== (t[fact] ?? null)) fail('NATIVE_TARGET_CHANGED', 409);
+        }
+      }
       if (intent === 'PAUSE' && !live.has(t.taskId)) fail('NATIVE_ACTION_UNSUPPORTED', 409);
       if (intent === 'RESUME' && t.state !== 'PAUSED') fail('NATIVE_ACTION_UNSUPPORTED', 409);
       if (intent === 'PAUSE') pauseTask(t); else if (intent === 'STOP') stopTask(t);
