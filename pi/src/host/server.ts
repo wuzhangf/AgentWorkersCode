@@ -49,6 +49,7 @@ const TASK_DEADLINE_DEFAULT_MS = 600000; const TASK_DEADLINE_MIN_MS = 60000; con
 /** Durable terminal verdicts. PAUSED is deliberately absent (a recoverable
  *  boundary, not an end); UNKNOWN is a reconciliation verdict, not terminal. */
 const TASK_TERMINAL_STATES = ['SUCCEEDED', 'FAILED', 'CANCELLED', 'BUDGET_EXCEEDED', 'BINDING_UNAVAILABLE'];
+const UPDATE_HOLD_MS = 30_000;
 const COLLAB_MAX_CHILDREN = 8; const COLLAB_MAX_PER_TASK = 4; const COLLAB_MAX_GOAL = 16384; const COLLAB_MAX_PATHS = 256; const COLLAB_MAX_ADOPTIONS = 32; const COLLAB_CANDIDATE_MAX_FILES = 8192; const COLLAB_DEADLINE_MS = 600000; const COLLAB_CHILD_ID = /^[a-z0-9-]{1,64}$/;
 const COLLAB_PREFLIGHT_MAX = 32; const COLLAB_PREFLIGHT_TTL_MS = 300000; const COLLAB_PREVIEW_MAX = 16; const COLLAB_PREVIEW_TTL_MS = 300000; const CHILD_MSG_TEXT_MAX = 8192; const HANDOFF_EXPORT_MAX_LIMIT = 100; const HANDOFF_EXPORT_INLINE_TEXT = 4096; const HANDOFF_EXPORT_CHUNK_MAX = 65536;
 /** Git baseline export (GAP-04): layered patch payloads and bundles share the
@@ -66,6 +67,8 @@ export class PiHost {
   // persisted process-ownership evidence have separate lifetimes.
   private readonly activeTasks = new Set<string>();
   private readonly transitionsInFlight = new Set<string>();
+  private updateReservation?: { operationId: string; expiresAt: number };
+  private mutationsInFlight = 0;
   private get materials() { return this.materialsManager ??= new Materials(this.store, join(this.store.directory, 'materials')); }
   readonly engineBinding: ReturnType<typeof engineBinding>;
   readonly executionProfile: string;
@@ -2953,8 +2956,39 @@ export class PiHost {
     this.storageClosed = true;
     this.store.close();
   }
+  private currentUpdateReservation() {
+    if (this.updateReservation && this.updateReservation.expiresAt <= Date.now()) this.updateReservation = undefined;
+    return this.updateReservation;
+  }
+
+  private reserveUpdate(release: boolean, body: Row) {
+    const { operationId } = body;
+    if (typeof operationId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(operationId)) {
+      throw new Error('INVALID_UPDATE_OPERATION');
+    }
+    const current = this.currentUpdateReservation();
+    if (current && current.operationId !== operationId) throw new Error('UPDATE_RESERVED');
+    const response = { schemaVersion: 'worker-update-reservation/1', storeId: this.store.identity.storeId,
+      bootId: this.bootId, operationId };
+    if (release) {
+      this.updateReservation = undefined;
+      return { ...response, state: 'released' };
+    }
+    const occupied = this.mutationsInFlight > 0 || this.activeTasks.size > 0 ||
+      this.transitionsInFlight.size > 0 || this.auxLive.size > 0 || this.collabLive.size > 0 ||
+      this.terminals.size > 0 || this.store.tasks().some(task => task.quiescent !== true ||
+        (!TASK_TERMINAL_STATES.includes(task.state) && task.state !== 'PAUSED'));
+    if (occupied) {
+      this.updateReservation = undefined;
+      return { ...response, state: 'busy' };
+    }
+    this.updateReservation = { operationId, expiresAt: Date.now() + UPDATE_HOLD_MS };
+    return { ...response, state: 'held', expiresAt: this.updateReservation.expiresAt };
+  }
+
   private async http(req: IncomingMessage, res: ServerResponse) {
     const send = (status: number, body: any) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
+    let admittedMutation = false;
     try {
       const wanted = Buffer.from('Bearer ' + this.config.token), auth = Buffer.from(req.headers.authorization ?? '');
       let authed = auth.length === wanted.length && timingSafeEqual(auth, wanted);
@@ -2972,6 +3006,16 @@ export class PiHost {
       let body: Row = {}; let rawBody: Buffer | null = null;
       if (method === 'POST') { const bodyLimit = url.pathname.includes('/context-packages') ? 2097152 : url.pathname.includes('/collaborations') ? 262144 : 65536; let buffer = ''; for await (const chunk of req) { buffer += chunk; if (Buffer.byteLength(buffer) > bodyLimit) throw new Error('BODY_TOO_LARGE'); } try { body = JSON.parse(buffer); } catch { throw new Error('INVALID_JSON'); } if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('INVALID_JSON'); if (body.requestKey && url.pathname !== '/worker-host/v1/operations/lookup' && req.headers['idempotency-key'] !== body.requestKey) throw new Error('KEY_MISMATCH'); }
       if (method === 'PUT') { const parts: Buffer[] = []; let total = 0; for await (const chunk of req) { const b = chunk as Buffer; total += b.length; if (total > MATERIAL_CHUNK_MAX) throw new Error('MATERIAL_CHUNK_TOO_LARGE'); parts.push(b); } rawBody = Buffer.concat(parts); }
+      if (method === 'POST' && (url.pathname === '/local/v1/update-reservation' ||
+          url.pathname === '/local/v1/update-reservation/release')) {
+        send(200, this.reserveUpdate(url.pathname.endsWith('/release'), body));
+        return;
+      }
+      if (method !== 'GET' && url.pathname !== '/worker-host/v1/operations/lookup') {
+        if (this.currentUpdateReservation()) throw new Error('UPDATE_RESERVED');
+        this.mutationsInFlight++;
+        admittedMutation = true;
+      }
       let result: any; let status = 200;
       if (url.pathname === '/worker-host/v1/manifest' && method === 'GET') result = this.manifest();
       if (url.pathname === '/worker-host/v1/capabilities' && method === 'GET') result = this.capabilities();
@@ -3115,5 +3159,6 @@ export class PiHost {
       }
       if (result === undefined) throw new Error('FIXED_LOCAL_ROUTE_REQUIRED'); send(status, result);
     } catch (error) { let code = error instanceof Error ? error.message : ''; if (!/^[A-Z][A-Z0-9_]+$/.test(code)) code = 'LOCAL_SOURCE_UNAVAILABLE'; send(/NOT_FOUND|NOT_AVAILABLE|FIXED_LOCAL_ROUTE/.test(code) ? 404 : code === 'LOCAL_SOURCE_UNAVAILABLE' ? 502 : 409, { code, message: code }); }
+    finally { if (admittedMutation) this.mutationsInFlight--; }
   }
 }

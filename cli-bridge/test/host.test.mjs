@@ -198,6 +198,8 @@ test('§2 resume during wind-down is refused; after close it runs cleanly', asyn
     await wait(async () => Boolean((await h.facts(id)).nativeSessionId));
     const p = await h.call(`/local/v1/tasks/${id}/commands`, { requestKey: 'rk-p1', intent: 'PAUSE' });
     assert.equal(p.status, 200, p.text);
+    const update = { operationId: 'prepare-update' };
+    assert.equal((await h.call('/local/v1/update-reservation', update)).body.state, 'busy');
     // SIGTERM killed the fixture, but a survivor holds its pipes ~1.5s —
     // the old turn has not closed, so RESUME cannot start the next round.
     const early = await h.call(`/local/v1/tasks/${id}/commands`, { requestKey: 'rk-r1', intent: 'RESUME' });
@@ -207,6 +209,12 @@ test('§2 resume during wind-down is refused; after close it runs cleanly', asyn
     rmSync(hold);
     await h.quiescent(id);
     h.setConf({});
+    const reserved = (await h.call('/local/v1/update-reservation', update)).body;
+    assert.equal(reserved.state, 'held');
+    assert.equal(reserved.bootId, (await h.call('/local/v1/identity')).body.bootId);
+    assert.equal((await h.launch('blocked while reserved')).body.code, 'UPDATE_RESERVED');
+    assert.equal((await h.call('/local/v1/update-reservation/release', { operationId: 'other' })).status, 409);
+    assert.equal((await h.call('/local/v1/update-reservation/release', update)).body.state, 'released');
     const ok = await h.call(`/local/v1/tasks/${id}/commands`, { requestKey: 'rk-r2', intent: 'RESUME' });
     assert.equal(ok.status, 200, ok.text);
     await h.terminal(id);

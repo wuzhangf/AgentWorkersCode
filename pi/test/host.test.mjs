@@ -88,6 +88,30 @@ test('pending questions bind original generation and selection; steer has consum
 test('STOP accepted before dispatch durably closes intake', async () => {
   const s = await setup(); try { const pf = s.host.preflight({ projectId: 'demo', engineId: 'sage-pi' }); const c = s.host.create({ requestKey: 'early', engineId: 'sage-pi', projectId: 'demo', optionsRevision: pf.optionsRevision, instruction: 'waiting' }); const d = s.host.store.task(c.taskId); const stopped = await s.host.stop(c.taskId, { requestKey: 'early-stop', intent: 'STOP', ...guard(d) }); assert.equal(stopped.state, 'APPLIED'); await new Promise(r => setTimeout(r, 100)); assert.equal(s.host.store.task(c.taskId).state, 'CANCELLED'); assert.equal(s.host.store.task(c.taskId).pid, undefined); } finally { await s.host.close(); }
 });
+test('update reservation refuses a live task and prevents new launches after quiescence', async () => {
+  const s = await setup();
+  const update = { operationId: 'prepare-update' };
+  try {
+    const task = await create(s.call, 'waiting-never');
+    const facts = await wait(async () => {
+      const detail = (await s.call('/tasks/' + task.taskId)).body;
+      return detail.state === 'RUNNING' && detail.nativeSessionId && detail;
+    });
+    assert.equal((await s.call('/update-reservation', update)).body.state, 'busy');
+    const stop = await s.call(`/tasks/${task.taskId}/commands`, {
+      requestKey: 'stop-before-update', intent: 'STOP', ...guard(facts),
+    });
+    assert.equal(stop.body.state, 'APPLIED');
+    await wait(async () => (await s.call('/tasks/' + task.taskId)).body.quiescent === true);
+    const held = (await s.call('/update-reservation', update)).body;
+    assert.equal(held.state, 'held');
+    assert.equal(held.bootId, (await s.call('/identity')).body.bootId);
+    assert.equal((await s.call('/tasks', { ...task.request, requestKey: 'while-held' })).body.code, 'UPDATE_RESERVED');
+    assert.equal((await s.call('/update-reservation/release', { operationId: 'other' })).status, 409);
+    assert.equal((await s.call('/update-reservation/release', update)).body.state, 'released');
+    assert.equal((await s.call('/tasks', { ...task.request, requestKey: 'after-release' })).status, 202);
+  } finally { await s.host.close(); }
+});
 test('source seal requires main-task quiescence: RUNNING refuses, terminal or stop-proof seals', async () => {
   const s = await setup(); try {
     // A RUNNING owner still has turn/tool writes in flight — the fence refuses honestly.

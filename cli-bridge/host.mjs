@@ -1612,6 +1612,36 @@ const identity = () => ({
   capabilities: { items: [] },
 });
 const BOOT_ID = randomUUID();
+const UPDATE_HOLD_MS = 30_000;
+let updateReservation;
+
+function currentUpdateReservation() {
+  if (updateReservation?.expiresAt <= Date.now()) updateReservation = undefined;
+  return updateReservation;
+}
+
+function reserveUpdate(path, body) {
+  const { operationId } = body ?? {};
+  if (typeof operationId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(operationId)) {
+    fail('INVALID_UPDATE_OPERATION', 400);
+  }
+  const current = currentUpdateReservation();
+  if (current && current.operationId !== operationId) fail('UPDATE_RESERVED', 409);
+  const response = { schemaVersion: 'worker-update-reservation/1', storeId: ledger.storeId,
+    bootId: BOOT_ID, operationId };
+  if (path === 'update-reservation/release') {
+    updateReservation = undefined;
+    return { ...response, state: 'released' };
+  }
+  const occupied = live.size > 0 || liveQuestions.size > 0 || Object.values(ledger.tasks).some(task =>
+    task.quiescent !== true || (!TERMINAL.has(task.state) && task.state !== 'PAUSED'));
+  if (occupied) {
+    updateReservation = undefined;
+    return { ...response, state: 'busy' };
+  }
+  updateReservation = { operationId, expiresAt: Date.now() + UPDATE_HOLD_MS };
+  return { ...response, state: 'held', expiresAt: updateReservation.expiresAt };
+}
 
 // ---- HTTP ---------------------------------------------------------------------
 
@@ -1624,6 +1654,11 @@ const routes = (method, seg, taskId, body, query) => {
   }
   if (seg[0] !== 'local' || seg[1] !== 'v1') fail('NOT_FOUND', 404);
   const rest = seg.slice(2);
+  const path = rest.join('/');
+  if (method === 'POST' && (path === 'update-reservation' || path === 'update-reservation/release')) {
+    return reserveUpdate(path, body);
+  }
+  if (method !== 'GET' && currentUpdateReservation()) fail('UPDATE_RESERVED', 409);
   if (method === 'GET' && rest[0] === 'identity') return identity();
   if (method === 'GET' && rest[0] === 'projects' && rest.length === 1) {
     return { ...identity(), items: [{ projectId: PROJECT_ID, displayName: opt['project-name'] ?? PROJECT_ID,
