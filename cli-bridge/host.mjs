@@ -1031,7 +1031,7 @@ const facts = (t) => ({
   taskId: t.taskId, projectId: t.projectId, engineId: t.engineId, engineVersion,
   profileId: 'MANAGED', storeId: ledger.storeId,
   state: t.state, launchState: t.launchState ?? t.state, reasonCode: t.reasonCode ?? '',
-  quiescent: t.quiescent === true,
+  quiescent: t.quiescent === true, draft: t.draft === true,
   generation: t.generation, segmentId: t.segmentId,
   nativeSessionId: t.nativeSessionId ?? null, nativeTurnId: t.nativeTurnId ?? null,
   currentCommandId: t.currentCommandId ?? null,
@@ -1826,9 +1826,14 @@ const routes = (method, seg, taskId, body, query) => {
   }
   if (method === 'POST' && rest[0] === 'tasks' && rest.length === 1) {
     if (!body || typeof body.requestKey !== 'string' || body.projectId !== PROJECT_ID
-        || body.engineId !== ENGINE || typeof body.instruction !== 'string' || !body.instruction.trim()) {
+        || body.engineId !== ENGINE
+        || (body.instruction !== undefined && typeof body.instruction !== 'string')) {
       fail('INVALID_REQUEST', 400);
     }
+    // Empty/absent instruction creates a draft task: PREPARING + quiescent,
+    // no engine spawn. The first NATIVE_FOLLOW_UP message is what dispatches —
+    // until then the backend/scope pick stays cheap to discard and recreate.
+    const instruction = typeof body.instruction === 'string' ? body.instruction : '';
     // Read-only store engines (devin) serve history/questions/adopt-source
     // only — there is no CLI to spawn a turn on.
     if (!engine) fail('ENGINE_READ_ONLY', 409);
@@ -1906,7 +1911,7 @@ const routes = (method, seg, taskId, body, query) => {
       if (cwd) adoption.cwd = cwd;
       }
     }
-    const launchSelection = { i: body.instruction, p: body.projectId, e: body.engineId, m: body.model, f: body.effort };
+    const launchSelection = { i: instruction, p: body.projectId, e: body.engineId, m: body.model, f: body.effort };
     const launchHash = adoptId
       ? digest({ ...launchSelection, sessionId: adoptId, source: adoption.from }) : digest(launchSelection);
     const prior = ledger.requests[body.requestKey];
@@ -1924,12 +1929,14 @@ const routes = (method, seg, taskId, body, query) => {
       projectId: PROJECT_ID, engineId: ENGINE,
       state: adoptId ? 'SUCCEEDED' : 'PREPARING',
       launchState: adoptId ? 'COMPLETED' : 'PREPARING',
-      reasonCode: adoptId ? 'ADOPTED' : '', quiescent: adoptId !== null,
+      reasonCode: adoptId ? 'ADOPTED' : '',
+      quiescent: adoptId !== null || !instruction.trim(),
+      draft: !adoptId && !instruction.trim(),
       generation: randomUUID(), segmentId: randomUUID(),
       nativeSessionId: adoption && adoption.from === ENGINE ? adoptId : null,
       nativeTurnId: null, currentCommandId: body.requestKey,
       createdAt: now(), updatedAt: now(),
-      instruction: body.instruction, output: '',
+      instruction, output: '',
       publicMessages: adoptedMessages ?? [], inputRequests: {},
       ...(adoption ? { adoption, ...(adoption.cwd ? { cwd: adoption.cwd } : {}) } : {}),
       ...(body.model !== undefined ? { model: body.model } : {}),
@@ -1943,7 +1950,7 @@ const routes = (method, seg, taskId, body, query) => {
       hash: launchHash,
     };
     save();
-    if (!adoptId) dispatch(t, body.instruction, body.requestKey);
+    if (!adoptId && instruction.trim()) dispatch(t, instruction, body.requestKey);
     return { ...receipt(ledger.requests[body.requestKey]), taskId: t.taskId, engineId: ENGINE, engineVersion, state: 'ACCEPTED' };
   }
   if (rest[0] === 'tasks' && rest.length >= 2) {
@@ -2179,6 +2186,12 @@ const routes = (method, seg, taskId, body, query) => {
         const lines = mats.map((u) => `- ${u.name} (${u.mediaType}, ${u.sizeBytes} bytes): ${u.path}`).join('\n');
         spawned = `The user attached ${mats.length} file(s) to this message, staged locally — `
           + `open them with your file tools:\n${lines}\n\n${spawned}`;
+      }
+      // A draft's first message is the launch instruction — it becomes the
+      // task goal and the non-resume engine argv (no nativeSessionId yet).
+      if (t.draft) {
+        t.instruction = body.content;
+        delete t.draft;
       }
       save();
       dispatch(t, spawned, body.requestKey, spawned !== body.content ? body.content : undefined);
