@@ -36,7 +36,7 @@ const wait = async (fn, n = 400, gap = 25) => {
   throw last ?? new Error('WAIT_TIMEOUT');
 };
 
-async function serve(env = {}, executableOverride = null) {
+async function serve(env = {}, executableOverride = null, engine = 'claude') {
   const state = mkdtempSync(join(tmpdir(), 'cb-state-'));
   const project = mkdtempSync(join(tmpdir(), 'cb-project-'));
   const home = mkdtempSync(join(tmpdir(), 'cb-home-'));
@@ -47,7 +47,7 @@ async function serve(env = {}, executableOverride = null) {
   const executable = executableOverride ?? (process.platform === 'win32' ? FIXTURE_CMD : FIXTURE);
   if (process.platform !== 'win32') chmodSync(FIXTURE, 0o755);
   const child = spawn(process.execPath, [HOST, 'serve',
-    '--engine', 'claude', '--state', state, '--port', String(port),
+    '--engine', engine, '--state', state, '--port', String(port),
     '--project', project, '--executable', executable], {
     env: { ...process.env, WORKER_LOCAL_TOKEN: TOKEN, HOME: home, USERPROFILE: home,
       FIXTURE_CONF: conf, CLI_BRIDGE_WATCH_TICK_MS: '60', ...env },
@@ -74,7 +74,7 @@ async function serve(env = {}, executableOverride = null) {
     setConf: (o) => writeFileSync(conf, JSON.stringify({ argvLog, ...o })),
     facts: async (id) => (await call(`/local/v1/tasks/${id}`)).body,
     launch: (instruction, extra = {}) => call('/local/v1/tasks',
-      { requestKey: 'rk-' + randomUUID(), projectId: 'workspace', engineId: 'claude', instruction, ...extra }),
+      { requestKey: 'rk-' + randomUUID(), projectId: 'workspace', engineId: engine, instruction, ...extra }),
     terminal: (id) => wait(async () => TERMINAL.has((await h.facts(id)).state)),
     quiescent: (id) => wait(async () => (await h.facts(id)).quiescent === true),
     waitEvent: (id, kind) => wait(async () =>
@@ -104,6 +104,32 @@ const writeCodexSession = (home, uuid) => {
   writeFileSync(join(dir, `rollout-${uuid}.jsonl`),
     JSON.stringify({ payload: { type: 'message', role: 'user', content: [{ type: 'text', text: 'codex original question' }] } }) + '\n');
 };
+
+test('shared Codex history stays in the registered workspace and supports incremental messages', async () => {
+  const h = await serve({}, null, 'codex');
+  try {
+    const inside = randomUUID();
+    const outside = randomUUID();
+    const sessions = join(h.home, '.codex', 'sessions');
+    mkdirSync(sessions, { recursive: true });
+    for (const [id, cwd] of [[inside, h.project], [outside, h.home]]) {
+      writeFileSync(join(sessions, `rollout-${id}.jsonl`), [
+        { type: 'session_meta', payload: { cwd } },
+        { payload: { type: 'message', role: 'user', content: [{ text: 'first' }] } },
+        { payload: { type: 'message', role: 'assistant', content: [{ text: 'second' }] } },
+      ].map(row => JSON.stringify(row)).join('\n'));
+    }
+    const query = 'engine=codex&projectId=workspace&limit=20';
+    const listed = await h.call('/local/v1/history?' + query);
+    assert.equal(listed.body.projectId, 'workspace');
+    assert.deepEqual(listed.body.items.map(item => item.id), [inside]);
+    const delta = await h.call(`/local/v1/history/sessions/${inside}?${query}&after=1`);
+    assert.deepEqual(delta.body.items.map(item => [item.id, item.text]), [['2', 'second']]);
+    assert.equal((await h.call(`/local/v1/history/sessions/${outside}?${query}`)).status, 404);
+    assert.equal((await h.launch('reject out of scope', { sharedSession: true, adoptSessionId: outside })).status, 404);
+    assert.equal((await h.call('/local/v1/history?engine=codex&projectId=other&limit=20')).status, 400);
+  } finally { h.close(); }
+});
 
 // §5 — plain CLI never had in-turn input: declare it, refuse the op, and
 // never relaunch a steer as a new round.

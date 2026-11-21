@@ -19,7 +19,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, readdirSync, lstatSync, realpathSync, openSync, readSync, closeSync, rmSync, copyFileSync, appendFileSync } from 'node:fs';
-import { join, resolve, relative, sep, dirname, basename } from 'node:path';
+import { join, resolve, relative, isAbsolute, sep, dirname, basename } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -640,6 +640,16 @@ const sessionCwd = (file, data) => {
   return '';
 };
 
+const sharedSessionsSupported = ENGINE === 'codex';
+
+function inRegisteredProject(cwd) {
+  if (!cwd || !PROJECT_DIR || !isAbsolute(cwd)) return false;
+  try {
+    const path = relative(realpathSync(PROJECT_DIR), realpathSync(cwd));
+    return path !== '..' && !path.startsWith('..' + sep) && !isAbsolute(path);
+  } catch { return false; }
+}
+
 /** CLI processes the USER started (desktop app or terminal) — these own live
  * sessions worth offering for adoption. Our own spawned headless turns are
  * filtered out: they carry -p / exec argv markers.
@@ -1149,6 +1159,7 @@ const facts = (t) => ({
   quiescent: t.quiescent === true,
   generation: t.generation, segmentId: t.segmentId,
   nativeSessionId: t.nativeSessionId ?? null, nativeTurnId: t.nativeTurnId ?? null,
+  ...(t.sharedSession === true ? { sharedSession: true } : {}),
   currentCommandId: t.currentCommandId ?? null,
   createdAt: t.createdAt, updatedAt: t.updatedAt,
   goal: t.instruction, displayName: t.instruction.split(/\r?\n/, 1)[0].slice(0, 128),
@@ -1672,6 +1683,7 @@ const routes = (method, seg, taskId, body, query) => {
     return { ...identity(), items: [engine ? { engineId: ENGINE, engineVersion, version: engineVersion,
       availability: 'AVAILABLE', profileId: 'MANAGED', sourceKind: 'cli',
       capabilities: { executionModes: ['WORKSPACE_TASK'], steer: false, followUp: true,
+                      ...(sharedSessionsSupported ? { sharedSessions: true } : {}),
                       stop: true, pause: true, resume: true } }
     : STORES[ENGINE] ? { engineId: ENGINE, engineVersion, version: engineVersion,
       availability: 'AVAILABLE', available: false, reasonCode: 'ENGINE_READ_ONLY',
@@ -1683,29 +1695,35 @@ const routes = (method, seg, taskId, body, query) => {
   if (method === 'GET' && rest[0] === 'history' && rest[1] === 'sessions' && rest.length === 3) {
     const id = rest[2];
     const engine = query.get('engine') ?? ENGINE;
+    const projectId = query.get('projectId');
+    const after = query.has('after') ? Number(query.get('after')) : undefined;
     // SQLite stores are shared local data — any bridge may serve a read;
     // only the store's own bridge REPORTS them (see /local/v1/history).
-    if (!validSessionID(id) || !(engine === ENGINE || STORES[engine])) {
+    if (!validSessionID(id) || !(engine === ENGINE || STORES[engine])
+        || projectId !== null && (!sharedSessionsSupported || projectId !== PROJECT_ID || engine !== ENGINE)) {
       fail('INVALID_REQUEST', 400);
     }
     const limit = Number(query.get('limit') ?? 15);
     const before = query.has('before') ? Number(query.get('before')) : undefined;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20
-        || before !== undefined && (!Number.isSafeInteger(before) || before < 1)) fail('INVALID_REQUEST', 400);
+        || before !== undefined && (!Number.isSafeInteger(before) || before < 1)
+        || after !== undefined && (projectId === null || before !== undefined || !Number.isSafeInteger(after) || after < 0)) fail('INVALID_REQUEST', 400);
     const file = !STORES[engine] ? vendorFile(engine, id) : undefined;
     const stored = STORES[engine]?.row(id);
     if (!file && !stored) fail('SESSION_NOT_FOUND', 404);
+    if (projectId !== null && !inRegisteredProject(sessionCwd(file))) fail('SESSION_NOT_FOUND', 404);
     const messages = file ? transcriptMessages(file) : STORES[engine].transcript(id);
     if (!messages) fail('LOCAL_SOURCE_UNAVAILABLE', 503);
-    const end = Math.min(messages.length, before === undefined ? messages.length : before - 1);
-    const start = Math.max(0, end - limit);
+    const end = Math.min(messages.length, after !== undefined ? after + limit : before === undefined ? messages.length : before - 1);
+    const start = after === undefined ? Math.max(0, end - limit) : Math.min(after, end);
     return {
       schemaVersion: 'worker-vendor-transcript/1', sessionId: id, engine,
+      ...(projectId !== null ? { projectId } : {}),
       items: messages.slice(start, end).map((m, index) => ({
         id: String(start + index + 1), role: m.role, text: m.text.slice(0, 4000),
         truncated: m.text.length > 4000,
       })),
-      ...(start > 0 ? { before: String(start + 1) } : {}),
+      ...(start > 0 && after === undefined ? { before: String(start + 1) } : {}),
     };
   }
 
@@ -1713,12 +1731,15 @@ const routes = (method, seg, taskId, body, query) => {
     const paged = query.has('limit');
     const limit = Number(query.get('limit') ?? 40);
     const selected = query.get('engine');
+    const projectId = query.get('projectId');
+    const shared = projectId !== null;
     // Each bridge reports only its own session surface — file-store engines
     // their session roots, sqlite-store engines their db. Reporting a shared
     // store from every bridge would duplicate rows on the phone.
     const engines = Object.hasOwn(SESSION_ROOTS, ENGINE) || STORES[ENGINE] ? [ENGINE] : [];
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50
-        || selected && !engines.includes(selected)) fail('INVALID_REQUEST', 400);
+        || selected && !engines.includes(selected)
+        || shared && (!sharedSessionsSupported || projectId !== PROJECT_ID || selected !== ENGINE)) fail('INVALID_REQUEST', 400);
     const needle = (query.get('q') ?? '').trim().toLowerCase();
     const cursor = query.get('cursor');
     let before;
@@ -1726,6 +1747,7 @@ const routes = (method, seg, taskId, body, query) => {
       try { before = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')); }
       catch { fail('INVALID_REQUEST', 400); }
       if (!selected || !before || before.engine !== selected || before.q !== needle
+          || (before.projectId ?? null) !== projectId
           || !validSessionID(before.id) || !['number', 'string'].includes(typeof before.at)) fail('INVALID_REQUEST', 400);
     }
     const matches = (record) => !needle || [record.title, record.cwd, record.id]
@@ -1743,7 +1765,7 @@ const routes = (method, seg, taskId, body, query) => {
         }
       } else {
         const own = new Set(Object.values(ledger.tasks).map(t => t.nativeSessionId).filter(Boolean));
-        const phoneIds = new Set();
+        const phoneIds = new Set(own);
         try {
           const parent = join(STATE_DIR, '..');
           for (const worker of readdirSync(parent)) {
@@ -1760,11 +1782,13 @@ const routes = (method, seg, taskId, body, query) => {
         }).sort((a, b) => b.at - a.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
         const seen = new Set();
         for (const { file, id, at } of files) {
-          if (!validSessionID(id) || seen.has(id) || own.has(id)) continue;
+          if (!validSessionID(id) || seen.has(id) || !shared && own.has(id)) continue;
           seen.add(id);
           if (before && (at > before.at || (at === before.at && id <= before.id))) continue;
           try {
             const data = decodeSession(file);
+            const cwd = sessionCwd(file, data);
+            if (shared && !inRegisteredProject(cwd)) continue;
             const first = transcriptMessages(file, data).find(m => m.role === 'user' && !m.text.startsWith('# AGENTS.md'));
             if (first?.text.startsWith(SIDE_QUESTION_MARK)) continue;
             let title = first?.text.slice(0, 80) ?? '';
@@ -1772,7 +1796,6 @@ const routes = (method, seg, taskId, body, query) => {
               const custom = JSON.parse(readFileSync(join(dirname(file), basename(file, '.jsonl'), 'custom-title.json'), 'utf8'));
               if (typeof custom?.customTitle === 'string' && custom.customTitle) title = custom.customTitle.slice(0, 512);
             } catch { /* No user title. */ }
-            const cwd = sessionCwd(file, data);
             const desktop = /"entrypoint"\s*:\s*"claude-desktop/.test(data.split('\n', 80).join('\n'));
             const source = phoneIds.has(id) ? 'phone' : desktop ? 'desktop' : 'cli';
             const item = { id, title, at: new Date(at).toISOString(), engine, source, cwd,
@@ -1786,11 +1809,11 @@ const routes = (method, seg, taskId, body, query) => {
       const last = visible.at(-1);
       items.push(...visible.map(row => row.item));
       pages.push({ engine, ...(records.length > pageLimit && last ? {
-        cursor: Buffer.from(JSON.stringify({ engine, q: needle, at: last.at, id: last.item.id })).toString('base64url'),
+        cursor: Buffer.from(JSON.stringify({ engine, q: needle, ...(shared ? { projectId } : {}), at: last.at, id: last.item.id })).toString('base64url'),
       } : {}) });
     }
     return { schemaVersion: paged ? 'worker-local-history/2' : 'worker-local-history/1',
-      engineId: ENGINE, items, ...(paged ? { pages } : {}) };
+      engineId: ENGINE, items, ...(shared ? { projectId } : {}), ...(paged ? { pages } : {}) };
   }
   // /local/v1/material-uploads — task-bound attachments (material-upload/1).
   // Begin creates a staged upload keyed by uploadKey; chunks must arrive in
@@ -2002,6 +2025,9 @@ const routes = (method, seg, taskId, body, query) => {
     // Adopted turns spawn in the SESSION's own working directory (read from
     // the file's cwd stamps) — continuing in our project dir would strip the
     // agent of the codebase the session was actually about.
+    const sharedSession = body.sharedSession === true;
+    if (body.sharedSession !== undefined && (!sharedSession || !sharedSessionsSupported
+        || body.adoptEngine !== undefined && body.adoptEngine !== ENGINE)) fail('SHARED_SESSION_UNSUPPORTED', 409);
     let adoptId = null, adoptedMessages = null, adoption = null;
     if (body.adoptSessionId !== undefined) {
       if (typeof body.adoptSessionId !== 'string' || !validSessionID(body.adoptSessionId))
@@ -2044,8 +2070,9 @@ const routes = (method, seg, taskId, body, query) => {
       if (!Object.keys(SESSION_ROOTS).includes(source)) fail('ADOPT_UNSUPPORTED', 400);
       const file = vendorFile(source, body.adoptSessionId);
       if (!file) fail('ADOPT_SESSION_NOT_FOUND', 404);
+      if (sharedSession && !inRegisteredProject(sessionCwd(file))) fail('ADOPT_SESSION_NOT_FOUND', 404);
       adoptId = body.adoptSessionId;
-      const imported = transcriptMessages(file).slice(-300);
+      const imported = sharedSession ? [] : transcriptMessages(file).slice(-300);
       const at = new Date(lstatSync(file).mtimeMs).toISOString();
       adoptedMessages = imported.map((m, i) => ({
         messageId: 'adopted-' + (i + 1), sequence: String(i + 1), revision: '0',
@@ -2061,7 +2088,8 @@ const routes = (method, seg, taskId, body, query) => {
       if (cwd) adoption.cwd = cwd;
       }
     }
-    const launchSelection = { i: body.instruction, p: body.projectId, e: body.engineId, m: body.model, f: body.effort };
+    const launchSelection = { i: body.instruction, p: body.projectId, e: body.engineId, m: body.model, f: body.effort,
+      ...(sharedSession ? { sharedSession: true } : {}) };
     const launchHash = adoptId
       ? digest({ ...launchSelection, sessionId: adoptId, source: adoption.from }) : digest(launchSelection);
     const prior = ledger.requests[body.requestKey];
@@ -2074,6 +2102,8 @@ const routes = (method, seg, taskId, body, query) => {
       }
       return receipt(prior);
     }
+    if (sharedSession && adoptId && Object.values(ledger.tasks).some(t => t.nativeSessionId === adoptId
+        && (live.has(t.taskId) || t.quiescent !== true))) fail('SHARED_SESSION_BUSY', 409);
     const t = {
       taskId: 'native-' + randomUUID(), requestKey: body.requestKey,
       projectId: PROJECT_ID, engineId: ENGINE,
@@ -2086,6 +2116,7 @@ const routes = (method, seg, taskId, body, query) => {
       reasonCode: '', quiescent: false,
       generation: randomUUID(), segmentId: randomUUID(),
       nativeSessionId: adoption && adoption.from === ENGINE ? adoptId : null,
+      ...(sharedSession ? { sharedSession: true } : {}),
       nativeTurnId: null, currentCommandId: body.requestKey,
       createdAt: now(), updatedAt: now(),
       instruction: body.instruction, output: '',
