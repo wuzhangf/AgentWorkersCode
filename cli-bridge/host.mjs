@@ -504,8 +504,8 @@ const historyFiles = (engine, root) => {
 /** Where each engine keeps its on-disk sessions. Gemini mirrors codex here —
  * its `chats/` trees live under tmp and carry no user prompts in filenames. */
 const SESSION_ROOTS = {
-  codex: () => join(homedir(), '.codex', 'sessions'),
-  claude: () => join(homedir(), '.claude', 'projects'),
+  codex: () => join(isAbsolute(process.env.CODEX_HOME ?? '') ? process.env.CODEX_HOME : join(homedir(), '.codex'), 'sessions'),
+  claude: () => join(isAbsolute(process.env.CLAUDE_CONFIG_DIR ?? '') ? process.env.CLAUDE_CONFIG_DIR : join(homedir(), '.claude'), 'projects'),
   gemini: () => join(homedir(), '.gemini', 'tmp'),
 };
 
@@ -640,7 +640,7 @@ const sessionCwd = (file, data) => {
   return '';
 };
 
-const sharedSessionsSupported = ENGINE === 'codex';
+const sharedSessionsSupported = ENGINE === 'codex' || ENGINE === 'claude';
 
 function inRegisteredProject(cwd) {
   if (!cwd || !PROJECT_DIR || !isAbsolute(cwd)) return false;

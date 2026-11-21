@@ -131,6 +131,34 @@ test('shared Codex history stays in the registered workspace and supports increm
   } finally { h.close(); }
 });
 
+test('shared Claude history and continuation use the registered workspace and original session', async () => {
+  const h = await serve();
+  try {
+    const inside = randomUUID();
+    const outside = randomUUID();
+    writeClaudeSession(h.home, inside, h.project);
+    writeClaudeSession(h.home, outside, h.home);
+    assert.equal((await h.call('/local/v1/engines')).body.items[0].capabilities.sharedSessions, true);
+    const query = 'engine=claude&projectId=workspace';
+    const history = await h.call('/local/v1/history?' + query);
+    assert.deepEqual(history.body.items.map(item => item.id), [inside]);
+    const delta = await h.call(`/local/v1/history/sessions/${inside}?${query}&after=1`);
+    assert.deepEqual(delta.body.items.map(item => item.text), ['original assistant turn']);
+    assert.equal((await h.call(`/local/v1/history/sessions/${outside}?${query}`)).status, 404);
+    assert.equal((await h.launch('out of scope', { sharedSession: true, adoptSessionId: outside })).status, 404);
+    h.setConf({ sessionId: inside });
+    const continuation = await h.launch('continue on phone', { sharedSession: true, adoptSessionId: inside });
+    assert.equal(continuation.status, 200, continuation.text);
+    await h.terminal(continuation.body.taskId);
+    const facts = await h.facts(continuation.body.taskId);
+    assert.equal(facts.nativeSessionId, inside);
+    assert.equal(facts.state, 'SUCCEEDED');
+    assert.equal(facts.sharedSession, true);
+    const args = h.argvLines()[0];
+    assert.equal(args[args.indexOf('--resume') + 1], inside);
+  } finally { h.close(); }
+});
+
 // §5 — plain CLI never had in-turn input: declare it, refuse the op, and
 // never relaunch a steer as a new round.
 test('§5 steer is declared false and rejected at engine, task and route level', async () => {
